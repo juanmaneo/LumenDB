@@ -1,0 +1,12 @@
+[package]
+name = "proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(kani)"] }
+
+[dependencies]
+raft = { path = "../crates/raft" }
+flashkv = { path = "../crates/flashkv" }

@@ -1,0 +1,11 @@
+[package]
+name = "tsvdb"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Columnar time-series database on top of flashkv, inspired by InfluxDB v3: line protocol, columnar chunks, time partitioning, aggregation/downsampling"
+
+[dependencies]
+flashkv = { path = "../flashkv" }
+pcapfast = { path = "../pcapfast" }
+parking_lot = "0.12"
