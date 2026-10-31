@@ -178,4 +178,14 @@ The same properties run as unit tests in every build.
 2. `cargo xtask kani`: the proofs.
 3. `cargo build --release --workspace`.
 
-This code was written entirely by Le chonk.
+## Authorship
+
+This code was initially written with the help of **Le Chonk**, aka
+[Mistral Large 4](https://mistral.ai) from Mistral.ai. Le Chonk is a
+large language model, and the entire codebase — crates, tests, proofs and
+CI — was generated through conversations with it, then reviewed and edited
+by a human.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
