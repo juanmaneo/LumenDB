@@ -279,6 +279,12 @@ fn flow_point(k: &FlowKey, s: &FlowStats) -> Point {
         .at(i64::try_from(s.first_ts_ns).unwrap_or(i64::MAX))
 }
 
+/// The points [`Db::ingest_capture`] writes: one `flows` point per flow and
+/// one `traffic` point per timeline bucket.
+pub fn capture_points(stats: &ParseStats) -> Vec<Point> {
+    [flow_points(&stats.flows), timeline_points(&stats.timeline)].concat()
+}
+
 pub struct Db {
     pub(crate) kv: flashkv::Db,
     pub(crate) opts: DbOptions,
@@ -471,11 +477,47 @@ impl Db {
 
     /// Flows and timeline of a parsed capture; returns the points written.
     pub fn ingest_capture(&self, stats: &ParseStats) -> Result<usize> {
-        self.write_all(&[flow_points(&stats.flows), timeline_points(&stats.timeline)].concat())
+        self.write_all(&capture_points(stats))
     }
 
     pub fn measurements(&self) -> Vec<String> {
         self.state.lock().index.measurements()
+    }
+
+    /// The fields of `measurement` and their types (empty if unknown).
+    pub fn fields(&self, measurement: &str) -> BTreeMap<String, FieldType> {
+        let st = self.state.lock();
+        let fields = st.schema.get(measurement);
+        fields
+            .map(|m| m.iter().map(|(k, &t)| (k.clone(), t)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every point of the database as line protocol, one line per series
+    /// and timestamp, which holds the fields that have a value then. Writing
+    /// the text to an empty database gives one with the same data. The whole
+    /// database is built in memory.
+    pub fn dump(&self) -> Result<String> {
+        let mut points: BTreeMap<(String, i64), Point> = BTreeMap::new();
+        for m in self.measurements() {
+            for f in self.fields(&m).into_keys() {
+                for row in self.query(&Query::new(&m, &f))? {
+                    let key = (row.series.clone(), row.ts);
+                    let point = points.entry(key).or_insert_with(|| {
+                        let mut p = Point::new(&m).at(row.ts);
+                        p.tags = row.tags.clone();
+                        p
+                    });
+                    point.fields.insert(f.clone(), row.value);
+                }
+            }
+        }
+        let mut text = String::new();
+        for p in points.values() {
+            lineproto::write_line(&mut text, p, p.timestamp);
+            text.push('\n');
+        }
+        Ok(text)
     }
 
     pub fn tag_values(&self, measurement: &str, key: &str) -> BTreeSet<String> {
@@ -531,6 +573,41 @@ pub(crate) mod tests {
 
     fn values(db: &Db, q: &Query) -> Vec<(i64, FieldValue)> {
         db.query(q).unwrap().into_iter().map(|r| (r.ts, r.value)).collect()
+    }
+
+    #[test]
+    fn a_dump_rebuilds_the_same_database() {
+        let (a, b) = (tmpdir("dump-a"), tmpdir("dump-b"));
+        let db = Db::open(&a, opts()).unwrap();
+        db.write_lines(
+            "cpu,host=a usage=1.5,cores=4i 10\ncpu,host=a usage=2.5 20\ncpu,host=b\\ x=y usage=9 10\n\
+             mem,host=a free=7u,up=true,note=\"hi, \\\"you\\\"\" 10\n",
+        )
+        .unwrap();
+        db.flush().unwrap();
+        // Later writes (a rewrite, a new field) live in the buffer.
+        db.write_lines("cpu,host=a usage=3.5 20\nmem,host=a free=8u 30\n")
+            .unwrap();
+        let text = db.dump().unwrap();
+        assert_eq!(text.lines().count(), 5, "{text}");
+        let fresh = Db::open(&b, opts()).unwrap();
+        assert_eq!(fresh.write_lines(&text).unwrap(), 5);
+        assert_eq!(fresh.measurements(), db.measurements());
+        for m in db.measurements() {
+            let fields = db.fields(&m);
+            assert_eq!(fresh.fields(&m), fields);
+            for f in fields.keys() {
+                let q = Query::new(&m, f);
+                assert_eq!(fresh.query(&q).unwrap(), db.query(&q).unwrap(), "{m}.{f}");
+            }
+        }
+        assert_eq!(fresh.dump().unwrap(), text, "stable");
+        assert_eq!(db.fields("cpu").len(), 2);
+        assert!(db.fields("nothing").is_empty());
+        assert_eq!(Db::open(&tmpdir("dump-c"), opts()).unwrap().dump().unwrap(), "");
+        for d in [a, b, tmpdir("dump-c")] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]
@@ -650,6 +727,12 @@ pub(crate) mod tests {
         let stats = pcapfast::parse_bytes(&pcap, &pcapfast::ParseOptions::default()).unwrap();
         let n = db.ingest_capture(&stats).unwrap();
         assert_eq!(n, stats.flows.len() + stats.timeline.len());
+        let points = capture_points(&stats);
+        assert_eq!(points.len(), n);
+        assert_eq!(
+            points.iter().filter(|p| p.measurement == "flows").count(),
+            stats.flows.len()
+        );
         assert_eq!(db.ingest_timeline(&stats.timeline).unwrap(), stats.timeline.len());
         let top = query::top_flows(&db, i64::MIN, i64::MAX, 3).unwrap();
         assert_eq!(top.len(), 3.min(stats.flows.len()));

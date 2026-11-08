@@ -74,6 +74,8 @@ pub enum Error {
     Timeout,
     /// The [`crate::Server`] was shut down, or stopped on a storage error.
     Stopped,
+    /// The application's state machine failed: the server stops.
+    App(String),
 }
 
 impl fmt::Display for Error {
@@ -90,6 +92,7 @@ impl fmt::Display for Error {
             Error::BadMessage(why) => write!(f, "malformed message: {why}"),
             Error::Timeout => write!(f, "timed out"),
             Error::Stopped => write!(f, "the server has stopped"),
+            Error::App(m) => write!(f, "state machine: {m}"),
         }
     }
 }
@@ -132,6 +135,7 @@ mod tests {
         );
         assert_eq!(Error::Timeout.to_string(), "timed out");
         assert_eq!(Error::Stopped.to_string(), "the server has stopped");
+        assert_eq!(Error::App("disk".into()).to_string(), "state machine: disk");
         assert_eq!(
             Error::BadConfig("one at a time").to_string(),
             "membership change refused: one at a time"

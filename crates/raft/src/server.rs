@@ -34,20 +34,26 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// The replicated state machine of an application.
+///
+/// The methods may fail, but only for reasons that are local to this node,
+/// such as a full disk: an entry that is bad in itself must be rejected the
+/// same way on every node, which is the state machine's business. An `Err`
+/// stops the server (see [`Server::failure`]), as this node's state can no
+/// longer follow the log.
 pub trait StateMachine: Send + 'static {
     /// Applies a committed entry that carries application data. Entries
     /// arrive in index order, once per run of the process: after a restart
     /// they are replayed from the snapshot, so a state machine that keeps
     /// its state on disk must skip what it has (`entry.index` says).
-    fn apply(&mut self, entry: &LogEntry);
+    fn apply(&mut self, entry: &LogEntry) -> std::result::Result<(), String>;
 
     /// Replaces the state with the one in `snapshot`. Called before the
     /// entries after it, at the start of a run when there is a stored
     /// snapshot, and when the leader sends one.
-    fn restore(&mut self, snapshot: &Snapshot);
+    fn restore(&mut self, snapshot: &Snapshot) -> std::result::Result<(), String>;
 
     /// The state after every entry applied so far, serialized.
-    fn snapshot(&mut self) -> Vec<u8>;
+    fn snapshot(&mut self) -> std::result::Result<Vec<u8>, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,12 +268,12 @@ impl Inner {
         let mut app = self.app.lock();
         let mut applied = None;
         if let Some(snapshot) = &out.snapshot {
-            app.restore(snapshot);
+            app.restore(snapshot).map_err(Error::App)?;
             applied = Some(snapshot.index);
         }
         for e in &out.committed {
             if (e.kind == EntryKind::Normal) & !e.data.is_empty() {
-                app.apply(e);
+                app.apply(e).map_err(Error::App)?;
             }
             applied = Some(e.index);
         }
@@ -286,7 +292,7 @@ impl Inner {
         self.changed.notify_all();
         let since = applied_now.saturating_sub(self.node.snapshot_index());
         if (self.opts.snapshot_every > 0) & (since >= self.opts.snapshot_every) {
-            let data = app.snapshot();
+            let data = app.snapshot().map_err(Error::App)?;
             self.node.compact(applied_now, data)?;
         }
         Ok(())
@@ -325,18 +331,44 @@ mod tests {
     }
 
     impl StateMachine for Counter {
-        fn apply(&mut self, e: &LogEntry) {
+        fn apply(&mut self, e: &LogEntry) -> std::result::Result<(), String> {
             let mut t = self.totals.lock();
             t.sum += u64::from_le_bytes(e.data[..8].try_into().unwrap());
             t.applied.push(e.index);
+            Ok(())
         }
-        fn restore(&mut self, s: &Snapshot) {
+        fn restore(&mut self, s: &Snapshot) -> std::result::Result<(), String> {
             let mut t = self.totals.lock();
             t.sum = u64::from_le_bytes(s.data[..8].try_into().unwrap());
             t.restores += 1;
+            Ok(())
         }
-        fn snapshot(&mut self) -> Vec<u8> {
-            self.totals.lock().sum.to_le_bytes().to_vec()
+        fn snapshot(&mut self) -> std::result::Result<Vec<u8>, String> {
+            Ok(self.totals.lock().sum.to_le_bytes().to_vec())
+        }
+    }
+
+    /// A state machine that fails where it is told to.
+    #[derive(Default, Clone)]
+    struct Fails {
+        apply: bool,
+        restore: bool,
+        snapshot: bool,
+    }
+
+    impl StateMachine for Fails {
+        fn apply(&mut self, _: &LogEntry) -> std::result::Result<(), String> {
+            self.apply.then_some(()).map_or(Ok(()), |()| Err("apply failed".into()))
+        }
+        fn restore(&mut self, _: &Snapshot) -> std::result::Result<(), String> {
+            self.restore
+                .then_some(())
+                .map_or(Ok(()), |()| Err("restore failed".into()))
+        }
+        fn snapshot(&mut self) -> std::result::Result<Vec<u8>, String> {
+            self.snapshot
+                .then_some(())
+                .map_or(Ok(Vec::new()), |()| Err("snapshot failed".into()))
         }
     }
 
@@ -633,7 +665,7 @@ mod tests {
         Member { server, counter }
     }
 
-    fn stopped_by(server: &Member) -> String {
+    fn stopped_by(server: &Server) -> String {
         wait_until("the server to fail", || server.failure())
     }
 
@@ -666,6 +698,52 @@ mod tests {
             s.failure()
         });
         assert_eq!(s.node().term(), 0, "memory kept the old term");
+    }
+
+    #[test]
+    fn a_state_machine_that_fails_stops_the_server() {
+        let run = |fails: Fails, snapshot_every: u64, preload: &dyn Fn(&Node)| {
+            let node = Node::new(Config::single(1), MemoryStorage::new()).unwrap();
+            preload(&node);
+            let s = Server::start(node, transport(), fails, opts(snapshot_every));
+            wait_until("leadership", || (s.node().role() == NodeState::Leader).then_some(()));
+            // Something with data to apply, which also takes a snapshot.
+            let _ = s.propose(number(1));
+            let why = stopped_by(&s);
+            assert_eq!(s.propose(number(2)), Err(Error::Stopped));
+            why
+        };
+        let nothing = |_: &Node| {};
+        let fails = Fails::default();
+        let apply = Fails {
+            apply: true,
+            ..fails.clone()
+        };
+        assert_eq!(run(apply, 0, &nothing), "state machine: apply failed");
+        let snapshot = Fails {
+            snapshot: true,
+            ..fails.clone()
+        };
+        assert_eq!(run(snapshot, 2, &nothing), "state machine: snapshot failed");
+        // A stored snapshot is restored by the first tick.
+        let restore = Fails { restore: true, ..fails };
+        let storage = MemoryStorage::new();
+        let node = Node::new(Config::single(1), storage.clone()).unwrap();
+        wait_for_leader(&node);
+        node.propose(number(1)).unwrap();
+        node.tick().unwrap();
+        node.compact(2, number(1)).unwrap();
+        let node = Node::new(Config::single(1), storage).unwrap();
+        let s = Server::start(node, transport(), restore, opts(0));
+        assert_eq!(stopped_by(&s), "state machine: restore failed");
+    }
+
+    /// Ticks `node` until it leads.
+    fn wait_for_leader(node: &Node) {
+        while node.role() != NodeState::Leader {
+            node.tick().unwrap();
+        }
+        node.tick().unwrap();
     }
 
     #[test]

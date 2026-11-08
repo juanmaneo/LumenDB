@@ -22,7 +22,7 @@ pub mod partition;
 pub mod query;
 pub mod tags;
 
-pub use db::{Db, DbOptions, DbStats};
+pub use db::{capture_points, Db, DbOptions, DbStats};
 pub use error::{Error, Result};
 pub use lineproto::{FieldType, FieldValue, Point};
 pub use query::{Agg, Query, Row};

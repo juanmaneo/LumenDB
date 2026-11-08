@@ -13,6 +13,7 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 | [`raft`](crates/raft) | Raft consensus, SWIM membership, Lamport clocks | Raft paper, CockroachDB, Serf/dkron |
 | [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
 | [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli |
+| [`cluster`](crates/cluster) | tsvdb replicated by raft: writes through the leader, every node holds a copy | TigerBeetle, CockroachDB |
 | [`bench`](crates/bench) | command line: generate, ingest, query, benchmark | — |
 | [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `bench` | cargo-xtask |
 | [`proofs`](proofs) | kani model-checking harnesses | — |
@@ -259,6 +260,43 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
   per series and optional time window, and top-N (for example the heaviest
   flows of a capture).
 
+### cluster: a tsvdb replicated by Raft
+
+```text
+  client --write_lines--> leader                          every node
+                            |                     +--------------------------+
+                            | stamp timestamps    | raft log   (FileStorage) |
+                            | propose, as text    |    |                     |
+                            v                     |    v commit              |
+                       Raft log ---replicated---> | tsvdb   (apply, in order)|
+                                                  +--------------------------+
+```
+
+Every node keeps a full copy. The leader parses a write, gives each point
+without a timestamp its own clock, and proposes it as line protocol; when it
+commits, every node applies it to its own `tsvdb`, in log order. `write_lines`
+returns once the leader has applied it, and `query_consistent` is a
+linearizable read on the leader (`query` reads the local copy, which may lag).
+
+- **Replaying is harmless.** Two writes of one point leave the last, and a
+  replayed log writes the same points in the same order, so applying an entry
+  twice changes no query result. A node notes how far it has applied (after
+  the database made the write durable, so the note never runs ahead of the
+  data), which saves the replay, but losing the note only costs disk.
+- **Refused writes are refused everywhere.** A field that already has another
+  type is accepted by the leader's parser and refused by the database when the
+  entry is applied, on every node alike; the writer gets `Error::Rejected`.
+  Anything else, such as a failing disk, stops the node: it can no longer
+  follow the log.
+- **Snapshots are dumps.** `Node::compact` stores a compressed dump of the
+  database (`tsvdb::Db::dump`), and a node that is new or far behind is
+  restored from it. A snapshot lives in memory and travels in one message, so
+  raise `snapshot_every` for a large database (0 never compacts).
+- **Adding a server**: start it with no voters, `add_learner` it on the leader,
+  and `add_voter` it once it has caught up (from the snapshot). Addresses are
+  static: every node is told where every other node lives, the ones that are
+  not in the cluster yet included.
+
 ## Usage
 
 ```sh
@@ -275,6 +313,8 @@ echo 'cpu,host=a usage=0.5 1700000000000000000' > /tmp/m.lp
 $B write /tmp/m.lp --db /tmp/lumendb
 $B kv-bench --db /tmp/kv --ops 1000000 --sync 0                   # flashkv throughput
 $B parse-bench /tmp/cap.pcapng --runs 5 --min-mpps 5              # pcapfast throughput
+$B cluster-demo --packets 1000000 --flows 5000                    # 3 replicated nodes, then a failover
+$B vopr --seeds 200                                               # Raft simulation: faults and membership
 ```
 
 Every storage-backed command accepts `--sync 0|1`, `--background 0|1` and
@@ -292,6 +332,19 @@ let rows = db.query(&Query::new("cpu", "usage").filter("host", "a").agg(Agg::Mea
 let stats = pcapfast::parse_file("cap.pcap".as_ref(), &Default::default())?;
 db.ingest_capture(&stats)?;
 let top = tsvdb::query::top_flows(&db, i64::MIN, i64::MAX, 10)?;
+```
+
+A replicated database (three of these, each with its own `dir`, `id` and
+`listen`, and the others in `peers`):
+
+```rust
+use cluster::{ClusterOptions, ReplicatedDb};
+use std::time::Duration;
+
+let node = ReplicatedDb::open("node1".as_ref(), 1, listen, &[1, 2, 3], &peers, ClusterOptions::default())?;
+// On the leader (a follower says who is, with Error::Raft(NotLeader(hint))):
+node.write_lines("cpu,host=a usage=0.5", Duration::from_secs(5))?;
+let rows = node.query_consistent(&Query::new("cpu", "usage"), Duration::from_secs(5))?;
 ```
 
 ## xtask

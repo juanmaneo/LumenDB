@@ -6,6 +6,7 @@ license.workspace = true
 description = "CLI: generate pcaps, ingest pcap into tsvdb, run queries and KV benchmarks"
 
 [dependencies]
+cluster = { path = "../cluster" }
 flashkv = { path = "../flashkv" }
 pcapfast = { path = "../pcapfast" }
 raft = { path = "../raft" }

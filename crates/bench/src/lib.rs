@@ -5,15 +5,18 @@
 //! N-th filesystem operation (and all later ones) fail through flashkv's
 //! fault-injecting `Env` — a quick way to watch crash handling from a shell.
 
+use cluster::{ClusterOptions, ReplicatedDb};
 use flashkv::env::{FaultEnv, OsEnv};
 use flashkv::WriteBatch;
 use pcapfast::synth::{self, SynthOptions};
-use pcapfast::{parse_file, Format, ParseOptions};
+use pcapfast::{parse_bytes, parse_file, Format, ParseOptions};
+use raft::{NetOptions, NodeId, ServerOptions, Transport};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::Path;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,6 +53,14 @@ commands:
       the replicas are voters at the start, default: the seed picks), with
       the safety properties checked after every event. A failing seed
       replays exactly with `--start SEED --seeds 1`
+  cluster-demo [--nodes N] [--packets N] [--flows N] [--dir DIR] [--timeout-ms N]
+      a tsvdb replicated by Raft, in this process: N nodes (default 3) on
+      loopback ports ingest a synthetic capture through the leader, and every
+      node must end up with the same data; then the leader is stopped, and the
+      others elect a new one and carry on. `--dir` keeps the nodes' files
+      (default: a temporary directory, removed afterwards); `--timeout-ms` is
+      how long to wait for an election, a write to be applied or the nodes to
+      catch up (default 10000)
 
 storage options (ingest, write, query, kv-bench):
   --sync 0|1        fsync every write (default 1)
@@ -425,6 +436,158 @@ fn vopr(a: &Args) -> Res<String> {
     Err(out.into())
 }
 
+/// Polls `f` for up to `limit`.
+fn wait_for<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    loop {
+        match f() {
+            Some(v) => return Some(v),
+            None if start.elapsed() >= limit => return None,
+            None => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+}
+
+/// The only leader among `nodes`, once there is one.
+fn sole_leader(nodes: &[ReplicatedDb], limit: Duration) -> Option<&ReplicatedDb> {
+    wait_for(limit, || {
+        let mut leaders = nodes.iter().filter(|n| n.is_leader());
+        let first = leaders.next()?;
+        leaders.next().is_none().then_some(first)
+    })
+}
+
+fn cluster_demo(a: &Args) -> Res<String> {
+    a.check(&["nodes", "packets", "flows", "dir", "timeout-ms"])?;
+    let n = a.num::<u64>("nodes", 3)?;
+    if !(1..=7).contains(&n) {
+        return Err("--nodes must be between 1 and 7".into());
+    }
+    let o = SynthOptions {
+        packets: a.num("packets", 20_000)?,
+        flows: u32::try_from(a.num::<u64>("flows", 64)?)?,
+        ..SynthOptions::default()
+    };
+    let limit = Duration::from_millis(a.num("timeout-ms", 10_000)?);
+    let dir = match a.get("dir") {
+        Some(d) => PathBuf::from(d),
+        None => std::env::temp_dir().join(format!("lumendb-cluster-demo-{}", std::process::id())),
+    };
+    let mut capture = Vec::new();
+    synth::generate(&o, &mut capture).expect("writing to memory cannot fail");
+    let stats = parse_bytes(&capture, &ParseOptions::default()).expect("a synthetic capture parses");
+    let points = tsvdb::capture_points(&stats);
+
+    let ids: Vec<NodeId> = (1..=n).collect();
+    let loopback: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let transports: Vec<Transport> = (ids.iter())
+        .map(|_| Transport::bind(loopback, NetOptions::default()).expect("a loopback port"))
+        .collect();
+    let addrs: Vec<(NodeId, SocketAddr)> = ids
+        .iter()
+        .zip(&transports)
+        .map(|(&id, t)| (id, t.local_addr()))
+        .collect();
+    let opts = ClusterOptions {
+        raft: ServerOptions {
+            tick: Duration::from_millis(5),
+            snapshot_every: 0,
+            ..ServerOptions::default()
+        },
+        election_timeout: (20, 40),
+        ..ClusterOptions::default()
+    };
+    let nodes = (ids.iter().zip(transports))
+        .map(|(&id, t)| ReplicatedDb::open_on(&dir.join(id.to_string()), id, t, &ids, &addrs, opts.clone()))
+        .collect::<Result<Vec<_>, _>>();
+    let result = nodes.map_err(Box::from).and_then(|nodes| {
+        let report = demo_run(&nodes, &points, limit);
+        drop(nodes);
+        report
+    });
+    if a.get("dir").is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let report = result?;
+    Ok(format!(
+        "{n} nodes on loopback, {} packets in {} flows: {} points to replicate\n{report}",
+        stats.packets,
+        stats.flows.len(),
+        points.len()
+    ))
+}
+
+/// The demo proper, on nodes that are up; nothing waits longer than `limit`.
+fn demo_run(nodes: &[ReplicatedDb], points: &[tsvdb::Point], limit: Duration) -> Res<String> {
+    let mut out = String::new();
+    let leader = sole_leader(nodes, limit).ok_or("no leader was elected in time")?;
+    let _ = writeln!(out, "node {} is the leader", leader.id());
+    let t = Instant::now();
+    let batches: Vec<&[tsvdb::Point]> = points.chunks(2_000).collect();
+    let written: usize = (batches.iter())
+        .map(|b| leader.write_points(b, limit).unwrap_or(0))
+        .sum();
+    let _ = writeln!(
+        out,
+        "wrote {written} of {} points in {} batches through node {} in {:.0} ms",
+        points.len(),
+        batches.len(),
+        leader.id(),
+        secs(t.elapsed()) * 1e3
+    );
+    let applied = leader.stats().applied_index;
+    let caught_up = wait_for(limit, || {
+        nodes.iter().all(|n| n.stats().applied_index >= applied).then_some(())
+    });
+    let _ = writeln!(
+        out,
+        "every node applied the log up to entry {applied}: {}; same data on all: {}",
+        caught_up.is_some(),
+        same_data(nodes.iter())
+    );
+    for node in nodes {
+        let top = query::top_flows(node.db(), i64::MIN, i64::MAX, 1);
+        let heaviest = top.map(|rows| rows.first().map(|r| (r.series.clone(), r.value.clone())));
+        let _ = writeln!(out, "node {}: heaviest flow {heaviest:?}", node.id());
+    }
+    if nodes.len() < 3 {
+        let _ = writeln!(out, "(a failover needs at least 3 nodes)");
+        return Ok(out);
+    }
+    let old = leader.id();
+    let _ = leader.shutdown();
+    let survivors: Vec<&ReplicatedDb> = nodes.iter().filter(|n| n.id() != old).collect();
+    let next = wait_for(limit, || survivors.iter().copied().find(|n| n.is_leader()));
+    let _ = writeln!(
+        out,
+        "stopped node {old}; the new leader is {:?}",
+        next.map(ReplicatedDb::id)
+    );
+    let marker = tsvdb::Point::new("demo").field("failover", tsvdb::FieldValue::UInt(1));
+    let written = next.map(|l| l.write_points(&[marker], limit).ok());
+    let _ = writeln!(out, "points written after the failover: {written:?}");
+    let target = next.map_or(0, |l| l.stats().applied_index);
+    let _ = wait_for(limit, || {
+        survivors
+            .iter()
+            .all(|n| n.stats().applied_index >= target)
+            .then_some(())
+    });
+    let _ = writeln!(
+        out,
+        "the {} survivors hold the same data: {}",
+        survivors.len(),
+        same_data(survivors.iter().copied())
+    );
+    Ok(out)
+}
+
+/// Whether the databases of `nodes` hold exactly the same points.
+fn same_data<'a>(nodes: impl Iterator<Item = &'a ReplicatedDb>) -> bool {
+    let dumps: Vec<String> = nodes.map(|n| n.db().dump().unwrap_or_default()).collect();
+    dumps.windows(2).all(|w| w[0] == w[1])
+}
+
 /// Runs the command line `args` (without the program name); returns the
 /// text to print on success.
 pub fn run(args: &[String]) -> Res<String> {
@@ -438,6 +601,7 @@ pub fn run(args: &[String]) -> Res<String> {
         Some("kv-bench") => kv_bench(&a),
         Some("parse-bench") => parse_bench(&a),
         Some("vopr") => vopr(&a),
+        Some("cluster-demo") => cluster_demo(&a),
         Some(other) => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
@@ -638,6 +802,65 @@ mod tests {
         std::fs::write(&cap, b"not a capture").unwrap();
         assert!(cmd(&format!("parse-bench {}", cap.display())).is_err());
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_cluster_demo_replicates_fails_over_and_reports_problems() {
+        // Three nodes: replicate, then lose the leader.
+        let dir = tmp("demo");
+        let kept = dir.join("kept");
+        let out = cmd(&format!(
+            "cluster-demo --packets 2000 --flows 8 --dir {}",
+            kept.display()
+        ))
+        .unwrap();
+        assert!(
+            out.starts_with("3 nodes on loopback, 2000 packets in 8 flows: "),
+            "{out}"
+        );
+        assert!(out.contains("is the leader\nwrote "), "{out}");
+        assert!(out.contains("batches through node "), "{out}");
+        assert!(out.contains("; same data on all: true\n"), "{out}");
+        assert!(out.contains("every node applied the log up to entry "), "{out}");
+        assert_eq!(out.matches("heaviest flow Ok(Some((").count(), 3, "{out}");
+        assert!(out.contains("the new leader is Some("), "{out}");
+        assert!(
+            out.contains("points written after the failover: Some(Some(1))"),
+            "{out}"
+        );
+        assert!(out.contains("the 2 survivors hold the same data: true\n"), "{out}");
+        assert!(kept.join("1").join("raft").exists(), "--dir keeps the files");
+        // One node has nobody to fail over to; the files go when no --dir is given.
+        let out = cmd("cluster-demo --nodes 1 --packets 200 --flows 2").unwrap();
+        assert!(out.starts_with("1 nodes on loopback"), "{out}");
+        assert!(out.contains("(a failover needs at least 3 nodes)"), "{out}");
+        assert!(!std::env::temp_dir()
+            .join(format!("lumendb-cluster-demo-{}", std::process::id()))
+            .exists());
+        // Problems are reported: arguments, the directory, and no time to elect.
+        assert_eq!(err("cluster-demo --nodes 0"), "--nodes must be between 1 and 7");
+        assert_eq!(err("cluster-demo --nodes 8"), "--nodes must be between 1 and 7");
+        assert_eq!(
+            err("cluster-demo --flows 99999999999"),
+            "number too large to fit in target type"
+        );
+        assert!(err("cluster-demo --nodes x").contains("--nodes: invalid number"));
+        assert_eq!(err("cluster-demo --x 1"), "unknown flag --x");
+        for flag in ["packets", "flows", "timeout-ms"] {
+            let message = err(&format!("cluster-demo --{flag} x"));
+            assert!(message.contains(&format!("--{flag}: invalid number")), "{message}");
+        }
+        // (a path below a file cannot be made into a directory)
+        let note = kept.join("1").join("applied");
+        assert!(note.is_file());
+        let blocked = format!("cluster-demo --dir {}", note.join("x").display());
+        let message = err(&blocked);
+        assert!(message.starts_with("io: "), "{message}");
+        assert_eq!(
+            err("cluster-demo --timeout-ms 1 --packets 100"),
+            "no leader was elected in time"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
