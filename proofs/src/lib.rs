@@ -14,6 +14,12 @@
 //! 4. any two majority quorums of the same voters intersect;
 //! 5. the Lamport clock never goes backwards and `observe` orders receipt
 //!    after send.
+//!
+//! Property 3 is the exception: it is checked by *exhaustive enumeration* of
+//! a finite domain (the `log_append_exhaustive` test), which is a proof for
+//! that domain. Kani cannot check it: with a symbolic entry index, the
+//! truncate-and-extend of the log's `Vec` makes CBMC exhaust memory (over
+//! 35 GB) even for a one-entry prefix and a one-entry batch.
 
 use flashkv::crc::{crc32c, mask, unmask};
 use flashkv::varint::{decode_uvarint64, put_uvarint64};
@@ -128,18 +134,6 @@ mod harnesses {
     }
 
     #[kani::proof]
-    #[kani::unwind(5)]
-    fn raft_log_append_preserves_invariants() {
-        let prefix: [Term; 2] = [kani::any(), kani::any()];
-        let batch: [(Index, Term); 3] = [kani::any(), kani::any(), kani::any()];
-        let (np, nb): (usize, usize) = (kani::any(), kani::any());
-        kani::assume(np <= 2 && nb <= 3);
-        kani::assume(prefix.iter().all(|&t| t <= 3));
-        kani::assume(batch.iter().all(|&(i, t)| i <= 4 && t <= 3));
-        assert!(log_append_is_safe(&prefix[..np], &batch[..nb]));
-    }
-
-    #[kani::proof]
     fn majority_quorums_intersect() {
         let n: u32 = kani::any();
         kani::assume((1..=64).contains(&n));
@@ -174,26 +168,45 @@ mod tests {
         }
     }
 
+    /// Every sequence of at most `max_len` elements of `alphabet`.
+    fn sequences<T: Copy>(alphabet: &[T], max_len: usize) -> Vec<Vec<T>> {
+        let mut all = vec![Vec::new()];
+        let mut last = vec![Vec::new()];
+        for _ in 0..max_len {
+            last = last
+                .iter()
+                .flat_map(|s| {
+                    alphabet.iter().map(move |&x| {
+                        let mut s = s.clone();
+                        s.push(x);
+                        s
+                    })
+                })
+                .collect();
+            all.extend(last.iter().cloned());
+        }
+        all
+    }
+
     #[test]
-    fn log_append_exhaustive_small() {
-        // Every prefix of up to 2 entries and batch of up to 2 entries over
-        // indices 0..=3 and terms 0..=2 (the kani harness goes further).
-        let terms = [0u64, 1, 2];
-        let mut prefixes: Vec<Vec<Term>> = vec![vec![]];
-        for &a in &terms {
-            prefixes.push(vec![a]);
-            for &b in &terms {
-                prefixes.push(vec![a, b]);
-            }
-        }
-        let singles: Vec<(Index, Term)> = (0..=3).flat_map(|i| terms.map(|t| (i, t))).collect();
-        let mut batches: Vec<Vec<(Index, Term)>> = vec![vec![]];
-        for &x in &singles {
-            batches.push(vec![x]);
-            for &y in &singles {
-                batches.push(vec![x, y]);
-            }
-        }
+    fn sequences_enumerates_everything_once() {
+        let s = sequences(&[0u8, 1], 2);
+        assert_eq!(
+            s,
+            [vec![], vec![0], vec![1], vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]
+        );
+    }
+
+    /// Property 3, proved by exhaustive enumeration: every prefix of up to 2
+    /// entries and every batch of up to 3 entries over indices 0..=4 and
+    /// terms 0..=3 (21 prefixes x 8421 batches).
+    #[test]
+    fn log_append_exhaustive() {
+        let terms: Vec<Term> = (0..=3).collect();
+        let singles: Vec<(Index, Term)> = (0..=4).flat_map(|i| terms.iter().map(move |&t| (i, t))).collect();
+        let prefixes = sequences(&terms, 2);
+        let batches = sequences(&singles, 3);
+        assert_eq!((prefixes.len(), batches.len()), (21, 8421));
         for p in &prefixes {
             for b in &batches {
                 assert!(log_append_is_safe(p, b), "{p:?} + {b:?}");

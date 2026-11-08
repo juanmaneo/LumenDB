@@ -142,7 +142,7 @@ pattern. The alias lives in `.cargo/config.toml`.
 |---|---|
 | `cargo xtask dev-check` | fails on the first failing step: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, then `cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100` |
 | `cargo xtask dev-check --no-coverage` | the same without the coverage gate (for machines without cargo-llvm-cov) |
-| `cargo xtask kani` | `cargo kani -p proofs` |
+| `cargo xtask kani` | `cargo kani -p proofs`, with virtual memory capped at 8 GiB (`ulimit -v`) so a runaway proof fails instead of triggering the OOM killer |
 
 
 A missing `cargo-llvm-cov` or `cargo-kani` fails with installation
@@ -162,11 +162,17 @@ following, within the bounds stated in each harness:
 
 - the flashkv varint round-trips every `u64`;
 - CRC32C matches its published check values, and CRC masking is a bijection;
-- raft `Log::append` keeps its invariants and is atomic on error;
 - any two majority quorums intersect;
 - the Lamport clock is monotonic.
 
 The same properties run as unit tests in every build.
+
+raft `Log::append` keeping its invariants and being atomic on error is
+checked by exhaustive enumeration in a unit test instead: every log of up to
+2 entries and every batch of up to 3 entries, over indices 0..=4 and terms
+0..=3. That is a proof for this finite domain. Kani cannot check it: with a
+symbolic entry index, CBMC runs out of memory on the log's `Vec` operations,
+even for a one-entry log and a one-entry batch.
 
 ## CI
 

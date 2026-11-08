@@ -13,7 +13,7 @@
 //! commit index is re-learned).
 
 use crate::clock::LamportClock;
-use crate::error::{Error, Result};
+use crate::error::{Error, LogError, Result};
 use crate::log::{Log, LogEntry};
 use crate::message::{Message, MsgType};
 use crate::quorum::{is_majority, quorum};
@@ -365,9 +365,7 @@ impl Node {
         }
         s.log.check_append(&msg.entries)?;
         if s.log.first_conflict(&msg.entries).unwrap_or(Index::MAX) <= s.commit_index {
-            return Err(Error::LogInconsistency(
-                "append would truncate committed entries".into(),
-            ));
+            return Err(Error::LogInconsistency(LogError::TruncatesCommitted));
         }
         self.storage.append_entries(&msg.entries)?;
         s.log.append(&msg.entries).expect("validated by check_append");

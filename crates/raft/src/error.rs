@@ -1,5 +1,48 @@
-use crate::NodeId;
+use crate::{Index, NodeId, Term};
 use std::fmt;
+
+/// Why a log operation was rejected.
+///
+/// Kept structured (formatted only in `Display`) so that error paths do no
+/// string formatting: this keeps the kani proof of `Log::append` tractable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogError {
+    /// `index` is past the last entry.
+    BeyondLast { index: Index, last: Index },
+    /// The range `(from, to]` is not inside the log.
+    InvalidRange { from: Index, to: Index, last: Index },
+    /// A batch starting at `index` would leave a gap (or starts at 0).
+    NotContiguous { index: Index, last: Index },
+    /// Entry `(index, term)` does not follow `(prev_index, prev_term)`.
+    DoesNotFollow {
+        index: Index,
+        term: Term,
+        prev_index: Index,
+        prev_term: Term,
+    },
+    /// Appending would truncate committed entries.
+    TruncatesCommitted,
+}
+
+impl fmt::Display for LogError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            LogError::BeyondLast { index, last } => write!(f, "index {index} beyond last {last}"),
+            LogError::InvalidRange { from, to, last } => write!(f, "range ({from},{to}] invalid, last={last}"),
+            LogError::NotContiguous { index, last } => write!(f, "entry index {index} not contiguous (last={last})"),
+            LogError::DoesNotFollow {
+                index,
+                term,
+                prev_index,
+                prev_term,
+            } => write!(
+                f,
+                "entry ({index}, term {term}) does not follow ({prev_index}, term {prev_term})"
+            ),
+            LogError::TruncatesCommitted => write!(f, "append would truncate committed entries"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -8,7 +51,7 @@ pub enum Error {
     /// Message from a node that is not a peer of this one.
     UnknownPeer(u64),
     /// Entries that would break the log invariants or a committed prefix.
-    LogInconsistency(String),
+    LogInconsistency(LogError),
     /// This node is not in its own voter set.
     NotConfigured,
     /// Proposal sent to a non-leader; carries the known leader, if any.
@@ -50,9 +93,45 @@ mod tests {
     fn display() {
         assert!(format!("{}", Error::Storage("s".into())).contains('s'));
         assert!(format!("{}", Error::UnknownPeer(7)).contains("7"));
-        assert!(format!("{}", Error::LogInconsistency("l".into())).contains('l'));
+        let e = Error::LogInconsistency(LogError::TruncatesCommitted);
+        assert_eq!(
+            e.to_string(),
+            "log inconsistency: append would truncate committed entries"
+        );
         assert!(format!("{}", Error::NotConfigured).contains("not in peer set"));
         assert!(format!("{}", Error::NotLeader(Some(3))).contains("Some(3)"));
+    }
+
+    #[test]
+    fn log_error_display() {
+        let cases = [
+            (LogError::BeyondLast { index: 5, last: 3 }, "index 5 beyond last 3"),
+            (
+                LogError::InvalidRange {
+                    from: 1,
+                    to: 9,
+                    last: 3,
+                },
+                "range (1,9] invalid, last=3",
+            ),
+            (
+                LogError::NotContiguous { index: 7, last: 3 },
+                "entry index 7 not contiguous (last=3)",
+            ),
+            (
+                LogError::DoesNotFollow {
+                    index: 4,
+                    term: 1,
+                    prev_index: 3,
+                    prev_term: 2,
+                },
+                "entry (4, term 1) does not follow (3, term 2)",
+            ),
+            (LogError::TruncatesCommitted, "append would truncate committed entries"),
+        ];
+        for (e, want) in cases {
+            assert_eq!(e.to_string(), want);
+        }
     }
 
     #[test]

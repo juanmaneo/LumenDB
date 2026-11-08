@@ -7,7 +7,9 @@
 //!   (`cargo llvm-cov --fail-under-lines 100 --fail-under-regions 100`).
 //!   `--no-coverage` skips the gate; without it a missing cargo-llvm-cov is an
 //!   error. CI runs it without flags.
-//! - `kani`: proves the harnesses of the `proofs` crate (`cargo kani -p proofs`).
+//! - `kani`: proves the harnesses of the `proofs` crate (`cargo kani -p proofs`),
+//!   with virtual memory capped at [`KANI_MEMORY_KIB`] (`ulimit -v`): a proof
+//!   that blows up fails instead of driving the machine into the OOM killer.
 //!
 //! xtask never installs or touches git hooks.
 //!
@@ -22,8 +24,12 @@ usage: cargo xtask <task>
 
 tasks:
   dev-check [--no-coverage]  fmt --check, clippy -D warnings, test, 100% coverage gate
-  kani                       run the kani proofs (cargo kani -p proofs)
+  kani                       run the kani proofs (cargo kani -p proofs), memory capped at 8 GiB
 ";
+
+/// Virtual memory cap for `cargo kani` and everything it spawns (CBMC).
+/// Every harness verifies in well under 1 GiB.
+pub const KANI_MEMORY_KIB: u64 = 8 * 1024 * 1024;
 
 pub const NO_LLVM_COV: &str = "cargo-llvm-cov is not installed: run `rustup component add llvm-tools-preview && \
 cargo install cargo-llvm-cov`, or pass --no-coverage to skip the coverage gate";
@@ -55,9 +61,17 @@ impl Ctx {
         }
     }
 
-    fn cargo(&self, args: &[&str]) -> Result<bool, String> {
-        Command::new(&self.cargo)
-            .args(args)
+    /// Runs cargo with `args`, under `ulimit -v memory_kib` if given.
+    fn cargo(&self, args: &[&str], memory_kib: Option<u64>) -> Result<bool, String> {
+        let mut cmd = match memory_kib {
+            None => Command::new(&self.cargo),
+            Some(kib) => {
+                let mut sh = Command::new("sh");
+                sh.args(["-c", &format!("ulimit -v {kib} && exec \"$0\" \"$@\""), &self.cargo]);
+                sh
+            }
+        };
+        cmd.args(args)
             .current_dir(&self.root)
             .status()
             .map(|s| s.success())
@@ -66,16 +80,22 @@ impl Ctx {
 
     /// Runs one step, failing with the command line.
     fn step(&self, args: &[&str]) -> Result<(), String> {
-        println!("xtask: cargo {}", args.join(" "));
-        match self.cargo(args)? {
+        self.step_limited(args, None)
+    }
+
+    /// Like [`Ctx::step`], with virtual memory capped at `memory_kib`.
+    fn step_limited(&self, args: &[&str], memory_kib: Option<u64>) -> Result<(), String> {
+        let limit = memory_kib.map_or(String::new(), |kib| format!(" (memory limit {kib} KiB)"));
+        println!("xtask: cargo {}{limit}", args.join(" "));
+        match self.cargo(args, memory_kib)? {
             true => Ok(()),
-            false => Err(format!("`cargo {}` failed", args.join(" "))),
+            false => Err(format!("`cargo {}` failed{limit}", args.join(" "))),
         }
     }
 
     /// Whether the cargo subcommand `sub` is installed.
     fn has(&self, sub: &str) -> Result<bool, String> {
-        self.cargo(&[sub, "--version"])
+        self.cargo(&[sub, "--version"], None)
     }
 }
 
@@ -104,7 +124,7 @@ pub fn kani(ctx: &Ctx) -> Result<String, String> {
     if !ctx.has("kani")? {
         return Err(NO_KANI.into());
     }
-    ctx.step(&["kani", "-p", "proofs"])?;
+    ctx.step_limited(&["kani", "-p", "proofs"], Some(KANI_MEMORY_KIB))?;
     Ok("kani: all proof harnesses verified\n".into())
 }
 
@@ -230,7 +250,30 @@ pub(crate) mod tests {
         );
         assert_eq!(log(&d), "kani --version\nkani -p proofs\n");
         assert_eq!(run(&args("kani"), &ctx(&d, "kani\\ --version")).unwrap_err(), NO_KANI);
-        assert!(run(&args("kani"), &ctx(&d, "kani\\ -p*")).is_err());
+        assert_eq!(
+            run(&args("kani"), &ctx(&d, "kani\\ -p*")).unwrap_err(),
+            "`cargo kani -p proofs` failed (memory limit 8388608 KiB)"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn kani_runs_under_the_memory_limit() {
+        let _serial = serial();
+        let d = tmp("kani-limit");
+        let limits = d.join("limits");
+        let cargo = script(
+            &d,
+            "cargo",
+            &format!("echo \"$* $(ulimit -v)\" >> {}", limits.display()),
+        );
+        let c = Ctx { cargo, root: d.clone() };
+        run(&args("kani"), &c).unwrap();
+        let limits = fs::read_to_string(limits).unwrap();
+        let lines: Vec<&str> = limits.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("kani --version "));
+        assert_eq!(lines[1], format!("kani -p proofs {KANI_MEMORY_KIB}"));
         fs::remove_dir_all(&d).unwrap();
     }
 

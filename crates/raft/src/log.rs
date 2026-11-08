@@ -8,7 +8,7 @@
 //! - `term_at(0) == Some(0)` (sentinel) and `term_at(i) == None` iff
 //!   `i > last_index()`.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, LogError, Result};
 use crate::{Index, Term};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,8 +48,10 @@ impl Log {
 
     /// Like [`Log::term_at`], but past-the-end is a `LogInconsistency` error.
     pub fn term(&self, index: Index) -> Result<Term> {
-        self.term_at(index)
-            .ok_or_else(|| Error::LogInconsistency(format!("index {} beyond last {}", index, self.last_index())))
+        self.term_at(index).ok_or(Error::LogInconsistency(LogError::BeyondLast {
+            index,
+            last: self.last_index(),
+        }))
     }
 
     /// All entries, in index order (`entries()[i].index == i + 1`).
@@ -70,12 +72,11 @@ impl Log {
             return Ok(Vec::new());
         }
         if to > self.last_index() {
-            return Err(Error::LogInconsistency(format!(
-                "range ({},{}] invalid, last={}",
+            return Err(Error::LogInconsistency(LogError::InvalidRange {
                 from,
                 to,
-                self.last_index()
-            )));
+                last: self.last_index(),
+            }));
         }
         Ok(self.entries[from as usize..to as usize].to_vec())
     }
@@ -88,19 +89,20 @@ impl Log {
             return Ok(());
         };
         let mut prev_index = first.index.wrapping_sub(1);
-        let mut prev_term = self.term_at(prev_index).ok_or_else(|| {
-            Error::LogInconsistency(format!(
-                "entry index {} not contiguous (last={})",
-                first.index,
-                self.last_index()
-            ))
-        })?;
+        let mut prev_term = self
+            .term_at(prev_index)
+            .ok_or(Error::LogInconsistency(LogError::NotContiguous {
+                index: first.index,
+                last: self.last_index(),
+            }))?;
         for e in entries {
             if e.index != prev_index.wrapping_add(1) || e.term < prev_term {
-                return Err(Error::LogInconsistency(format!(
-                    "entry ({}, term {}) does not follow ({}, term {})",
-                    e.index, e.term, prev_index, prev_term
-                )));
+                return Err(Error::LogInconsistency(LogError::DoesNotFollow {
+                    index: e.index,
+                    term: e.term,
+                    prev_index,
+                    prev_term,
+                }));
             }
             prev_index = e.index;
             prev_term = e.term;

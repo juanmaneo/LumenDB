@@ -15,7 +15,7 @@ pub mod storage;
 pub mod swim;
 
 pub use clock::LamportClock;
-pub use error::{Error, Result};
+pub use error::{Error, LogError, Result};
 pub use log::{Log, LogEntry};
 pub use message::{Message, MsgType};
 pub use node::{Config, Node, NodeState, TickOutcome};
