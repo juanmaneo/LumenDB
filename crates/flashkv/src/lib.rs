@@ -8,7 +8,8 @@
 //!   after a hardware crash is an `Err`, never a SIGBUS, and there is no map
 //!   size to outgrow (LMDB's `MDB_MAP_FULL` crash).
 //! - **FoundationDB**: modular storage layer ([`env::Env`]) with deterministic
-//!   fault injection and power-loss simulation ([`env::FaultEnv`]), MVCC
+//!   fault injection and power-loss simulation ([`env::FaultEnv`], and the
+//!   in-memory [`memenv::MemEnv`] with torn writes and bit flips), MVCC
 //!   snapshots and optimistic serializable transactions.
 //! - **eguan/ibs, eblob, Akumuli**: flush and compaction write brand-new files
 //!   on a background thread and publish them with one pointer swap, so they
@@ -26,6 +27,7 @@ pub mod error;
 pub mod log;
 pub mod lz;
 pub mod manifest;
+pub mod memenv;
 pub mod memtable;
 pub mod merge;
 pub mod sstable;

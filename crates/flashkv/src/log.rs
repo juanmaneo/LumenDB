@@ -60,8 +60,10 @@ pub enum Tail {
 /// record (or zeros where the file system extended the file before the data
 /// landed). So a bad record whose declared length fits in the file, or any
 /// intact record further on, means corruption. A bit flip in a length field
-/// can make a damaged record look incomplete; the forward scan for an intact
-/// record still catches it unless it hit the very last record.
+/// can make a damaged record look incomplete: further records still give it
+/// away, and for the last record of the file the checksum is tried with the
+/// length of the bytes actually there. Only a flipped length in a last record
+/// followed by zero fill still passes for a torn write.
 pub fn tail(buf: &[u8], end: usize) -> Tail {
     let rest = &buf[end..];
     if rest.is_empty() {
@@ -70,8 +72,12 @@ pub fn tail(buf: &[u8], end: usize) -> Tail {
     if rest.iter().all(|&b| b == 0) {
         return Tail::Torn;
     }
-    let complete = rest.len() >= HEADER
-        && u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize <= rest.len() - HEADER;
+    let complete = rest.len() >= HEADER && {
+        let crc = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        let declared = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+        let actual = rest.len() - HEADER;
+        declared <= actual || masked_crc(&(actual as u32).to_le_bytes(), &rest[HEADER..]) == crc
+    };
     if complete || (1..rest.len()).any(|i| !parse(&rest[i..]).0.is_empty()) {
         Tail::Corrupt
     } else {
@@ -179,19 +185,21 @@ mod tests {
         assert_eq!(classify(&zeros), Tail::Torn);
         // A flipped bit anywhere, including the last record, is corruption.
         for i in 0..buf.len() {
-            let mut bad = buf.clone();
-            bad[i] ^= 0x10;
-            let t = classify(&bad);
-            let last_len_field = (buf.len() - 5 - 4..buf.len() - 5).contains(&i);
-            assert!(t == Tail::Corrupt || last_len_field, "byte {i}: {t:?}");
+            for bit in 0..8 {
+                let mut bad = buf.clone();
+                bad[i] ^= 1 << bit;
+                assert_eq!(classify(&bad), Tail::Corrupt, "byte {i} bit {bit}");
+            }
         }
-        // A length flipped beyond the end of the file in the last record
-        // looks exactly like a torn write.
+        // The one blind spot: the last record's length flipped beyond the end
+        // of the file, then zero fill. That looks exactly like a torn write.
         let mut last = buf.clone();
         let n = last.len();
         last[n - 5 - 2] ^= 0x10;
+        assert_eq!(classify(&last), Tail::Corrupt);
+        last.extend_from_slice(&[0; 16]);
         assert_eq!(classify(&last), Tail::Torn);
-        // ... but not in an earlier record: the intact record after it is found.
+        // An earlier record's length: the intact record after it is found.
         let mut first = buf.clone();
         first[6] ^= 0x10;
         assert_eq!(classify(&first), Tail::Corrupt);

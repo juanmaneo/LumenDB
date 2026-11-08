@@ -81,7 +81,9 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   `FaultEnv` injects a failure at the N-th operation and simulates power loss:
   unsynced bytes, files and renames disappear. Tests sweep every fault point
   and check that every acknowledged write survives. The same harness covers
-  raft's storage, tsvdb and the CLI.
+  raft's storage, tsvdb and the CLI. `MemEnv` is an in-memory `Env` for
+  simulation: a power loss keeps each file's synced bytes plus a torn prefix
+  of the rest, and a bit can be flipped in place.
 - **Compaction never slows reads** (eguan/ibs, eblob). Flush and compaction
   write new files on a background thread and publish them with one pointer
   swap. Readers hold immutable snapshots, and live snapshots pin the versions
@@ -103,6 +105,19 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   single-node cluster stays stuck: there is no one to copy from, and
   stopping is safer than guessing. The state file (term, vote) holds two
   checksummed copies; either one is enough, and two intact copies must agree.
+- **Deterministic simulation** (TigerBeetle's VOPR). One seed fixes a whole
+  run of a 3 to 5 replica cluster, each replica on its own `MemEnv` with the
+  real `FileStorage`: message loss, duplication and reordering, partitions,
+  crashes, power loss with torn writes, bit flips in the Raft log, and I/O
+  errors. After every event the simulator checks election safety (one leader
+  per term), leader completeness, state machine safety (no two replicas
+  commit or apply different entries at an index), and log matching. Then
+  faults stop and the cluster must converge: one leader, nobody recovering,
+  identical logs. Corruption hits a minority of replicas at a time, which is
+  what the protocol can survive. A failing seed replays exactly. The check
+  is real: with the recovery rule removed, 9 of 300 seeds fail with `leader
+  lacks committed entry`. `cargo test` runs a fixed set of seeds, and
+  `cargo xtask vopr` runs many.
 - **SWIM** membership: round-robin probes, indirect `PingReq` probes,
   suspicion, death, incarnation-based refutation, and piggybacked gossip.
 - **Lamport clocks** stamp every message. Ordering never depends on wall
@@ -197,6 +212,7 @@ pattern. The alias lives in `.cargo/config.toml`.
 | `cargo xtask dev-check` | fails on the first failing step: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, then `cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100` |
 | `cargo xtask dev-check --no-coverage` | the same without the coverage gate (for machines without cargo-llvm-cov) |
 | `cargo xtask kani` | `cargo kani -p proofs`, with virtual memory capped at 8 GiB (`ulimit -v`) so a runaway proof fails instead of triggering the OOM killer |
+| `cargo xtask vopr [--seeds N] [--start N] [--replicas N]` | in release mode, runs the Raft cluster simulation for `N` seeds (default 200, about 0.1 s each) and checks the safety properties after every event. A failing seed is printed with the command that replays it, for example `bench vopr --start 42 --seeds 1` |
 | `cargo xtask bench [--packets N] [--min-mpps X]` | in release mode, writes a synthetic capture (default 4.8 million packets, about 3.6 GB) to `target/bench/capture.pcap`, then runs `bench parse-bench` on it: one warm-up pass and 5 timed runs. With `--min-mpps`, it fails if the best wall-clock rate is below `X` Mpkt/s |
 
 

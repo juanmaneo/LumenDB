@@ -8,4 +8,5 @@ description = "CLI: generate pcaps, ingest pcap into tsvdb, run queries and KV b
 [dependencies]
 flashkv = { path = "../flashkv" }
 pcapfast = { path = "../pcapfast" }
+raft = { path = "../raft" }
 tsvdb = { path = "../tsvdb" }

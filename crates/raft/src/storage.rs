@@ -269,7 +269,13 @@ impl FileStorage {
         // Compact into a fresh generation: drops any torn tail, and a damaged
         // log is replaced together with setting the recovering flag.
         let writer = write_log(&*env, dir, &state, gen + 1)?;
-        let _ = env.remove(&dir.join(log_name(gen)));
+        // Every other generation is garbage, including ones a crash brought
+        // back because their removal was never made durable.
+        for name in env.list(dir)? {
+            if name.starts_with("raft-") & name.ends_with(".log") & (name != log_name(gen + 1)) {
+                let _ = env.remove(&dir.join(name));
+            }
+        }
         Ok(Arc::new(FileStorage {
             env,
             dir: dir.to_path_buf(),
@@ -435,9 +441,26 @@ mod tests {
         assert_eq!(st.log.entries(), &[e(1, 7), e(2, 7), e(3, 7)]);
         assert_eq!(s.generation(), 2);
         assert!(!log.exists(), "old generation removed");
+        drop(s);
+        // Leftover generations (e.g. resurrected by a crash) are removed too;
+        // other files are left alone.
+        fs::write(dir.join(log_name(1)), b"stale").unwrap();
+        fs::write(dir.join("raft-notes.txt"), b"keep").unwrap();
+        fs::write(dir.join("other.log"), b"keep").unwrap();
+        let s = FileStorage::open(&dir).unwrap();
+        assert_eq!(s.generation(), 3);
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["LOCK", "other.log", "raft-000003.log", "raft-notes.txt", "raft.state"]
+        );
         // Conflict rewrites the log into a new generation.
         s.append_entries(&[e(2, 8)]).unwrap();
-        assert_eq!(s.generation(), 3);
+        assert_eq!(s.generation(), 4);
         drop(s);
         let s = FileStorage::open(&dir).unwrap();
         assert_eq!(s.load().unwrap().log.entries(), &[e(1, 7), e(2, 8)]);

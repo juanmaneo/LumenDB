@@ -42,6 +42,12 @@ commands:
       into the page cache. `wall` is the whole parse_file call (open, mmap,
       parse, munmap), `parse` excludes mapping and unmapping. Fails if the
       best wall-clock rate is below X Mpkt/s
+  vopr [--seeds N] [--start N] [--replicas N] [--ticks N] [--heal-ticks N]
+      deterministic Raft cluster simulation (in the style of TigerBeetle's
+      VOPR): per seed, message loss, duplication, reordering, partitions,
+      crashes, power loss with torn writes, log bit flips and I/O errors,
+      with the safety properties checked after every event. A failing seed
+      replays exactly with `--start SEED --seeds 1`
 
 storage options (ingest, write, query, kv-bench):
   --sync 0|1        fsync every write (default 1)
@@ -369,6 +375,73 @@ fn parse_bench(a: &Args) -> Res<String> {
     }
 }
 
+fn vopr(a: &Args) -> Res<String> {
+    a.check(&["seeds", "start", "replicas", "ticks", "heal-ticks"])?;
+    let defaults = raft::sim::SimConfig::default();
+    let cfg = raft::sim::SimConfig {
+        replicas: a.num("replicas", defaults.replicas)?,
+        ticks: a.num("ticks", defaults.ticks)?,
+        heal_ticks: a.num("heal-ticks", defaults.heal_ticks)?,
+        ..defaults
+    };
+    if !(1..=64).contains(&cfg.replicas) {
+        return Err("--replicas must be between 1 and 64".into());
+    }
+    let start = a.num::<u64>("start", 0)?;
+    let seeds = a.num::<u64>("seeds", 100)?;
+    let t = Instant::now();
+    let mut failures = Vec::new();
+    let mut total = raft::sim::Report::default();
+    for seed in start..start.saturating_add(seeds) {
+        match raft::sim::run(seed, &cfg) {
+            Ok(r) => {
+                total.committed += r.committed;
+                total.elections += r.elections;
+                total.crashes += r.crashes;
+                total.corruptions += r.corruptions;
+                total.recoveries += r.recoveries;
+                total.io_errors += r.io_errors;
+                total.partitions += r.partitions;
+                total.delivered += r.delivered;
+                total.dropped += r.dropped;
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+    let mut out = format!(
+        "{seeds} seeds from {start}, {} replicas, {} + {} ticks, in {:.1} s\n\
+         committed {}, elections {}, crashes {}, log corruptions {}, recoveries {}, io errors {}, \
+         partitions {}, messages {} delivered / {} dropped\n",
+        cfg.replicas,
+        cfg.ticks,
+        cfg.heal_ticks,
+        secs(t.elapsed()),
+        total.committed,
+        total.elections,
+        total.crashes,
+        total.corruptions,
+        total.recoveries,
+        total.io_errors,
+        total.partitions,
+        total.delivered,
+        total.dropped
+    );
+    if failures.is_empty() {
+        let _ = writeln!(out, "all safety properties held");
+        return Ok(out);
+    }
+    for f in &failures {
+        let _ = writeln!(out, "FAILED {f}");
+    }
+    let _ = write!(
+        out,
+        "{} of {seeds} seeds failed; replay one with `bench vopr --start SEED --seeds 1 --replicas {}`",
+        failures.len(),
+        cfg.replicas
+    );
+    Err(out.into())
+}
+
 /// Runs the command line `args` (without the program name); returns the
 /// text to print on success.
 pub fn run(args: &[String]) -> Res<String> {
@@ -381,6 +454,7 @@ pub fn run(args: &[String]) -> Res<String> {
         Some("query") => run_query(&a),
         Some("kv-bench") => kv_bench(&a),
         Some("parse-bench") => parse_bench(&a),
+        Some("vopr") => vopr(&a),
         Some(other) => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
@@ -459,6 +533,14 @@ mod tests {
             ("parse-bench c --threads z", "--threads: invalid number \"z\""),
             ("parse-bench c --runs z", "--runs: invalid number \"z\""),
             ("parse-bench c --min-mpps z", "--min-mpps: invalid number \"z\""),
+            ("vopr --x 1", "unknown flag --x"),
+            ("vopr --seeds z", "--seeds: invalid number \"z\""),
+            ("vopr --start z", "--start: invalid number \"z\""),
+            ("vopr --replicas z", "--replicas: invalid number \"z\""),
+            ("vopr --ticks z", "--ticks: invalid number \"z\""),
+            ("vopr --heal-ticks z", "--heal-ticks: invalid number \"z\""),
+            ("vopr --replicas 0", "--replicas must be between 1 and 64"),
+            ("vopr --replicas 65", "--replicas must be between 1 and 64"),
         ] {
             assert_eq!(err(args), want, "{args}");
         }
@@ -572,6 +654,33 @@ mod tests {
         std::fs::write(&cap, b"not a capture").unwrap();
         assert!(cmd(&format!("parse-bench {}", cap.display())).is_err());
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn vopr_runs_seeds_and_reports_failures() {
+        let out = cmd("vopr --seeds 3 --start 10 --replicas 3 --ticks 300 --heal-ticks 300").unwrap();
+        assert!(
+            out.starts_with("3 seeds from 10, 3 replicas, 300 + 300 ticks, in "),
+            "{out}"
+        );
+        assert!(
+            out.contains("\ncommitted ") && out.ends_with("all safety properties held\n"),
+            "{out}"
+        );
+        // Defaults: 100 seeds would be slow in a debug build, so run none.
+        let out = cmd("vopr --seeds 0").unwrap();
+        assert!(
+            out.starts_with("0 seeds from 0, 5 replicas, 2000 + 600 ticks, in "),
+            "{out}"
+        );
+        // No time to elect a leader and nothing to heal in: every seed fails.
+        let e = err("vopr --seeds 2 --start 4 --replicas 3 --ticks 5 --heal-ticks 0");
+        assert!(e.contains("FAILED seed 4, tick 5: no convergence after healing"), "{e}");
+        assert!(e.contains("FAILED seed 5, tick 5: "), "{e}");
+        assert!(
+            e.ends_with("2 of 2 seeds failed; replay one with `bench vopr --start SEED --seeds 1 --replicas 3`"),
+            "{e}"
+        );
     }
 
     /// Sweeps `--fail-after` over a command until it succeeds: every storage

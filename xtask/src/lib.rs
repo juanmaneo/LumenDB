@@ -13,6 +13,10 @@
 //! - `bench`: generates a synthetic capture under `target/bench` and runs
 //!   `bench parse-bench` on it in release mode; `--min-mpps` turns it into a
 //!   regression gate.
+//! - `vopr`: runs `bench vopr` in release mode: the deterministic Raft
+//!   cluster simulation over many seeds, with crashes, torn writes, log bit
+//!   flips, partitions and message faults, checking the safety properties
+//!   after every event.
 //!
 //! xtask never installs or touches git hooks.
 //!
@@ -31,7 +35,13 @@ tasks:
   bench [--packets N] [--min-mpps X]
                              generate a synthetic capture (default 4800000 packets, about
                              3.6 GB) in target/bench and benchmark parsing it (release build)
+  vopr [--seeds N] [--start N] [--replicas N]
+                             simulate Raft clusters under faults for N seeds (default 200,
+                             release build); a failing seed prints how to replay it
 ";
+
+/// Default number of seeds of `cargo xtask vopr`.
+pub const VOPR_SEEDS: u64 = 200;
 
 /// Default capture size of `cargo xtask bench`: about 3.6 GB.
 pub const BENCH_PACKETS: u64 = 4_800_000;
@@ -165,6 +175,27 @@ pub fn bench(ctx: &Ctx, args: &[&str]) -> Result<String, String> {
     Ok("bench: done\n".into())
 }
 
+pub fn vopr(ctx: &Ctx, args: &[&str]) -> Result<String, String> {
+    let seeds = VOPR_SEEDS.to_string();
+    let mut flags = vec![("--seeds", seeds.as_str()), ("--start", "0")];
+    let mut it = args.iter();
+    while let Some(&flag) = it.next() {
+        let value = it.next().ok_or(format!("{flag} needs a value"))?;
+        if value.parse::<u64>().is_err() {
+            return Err(format!("{flag}: invalid number {value:?}"));
+        }
+        match flags.iter_mut().find(|(f, _)| *f == flag) {
+            Some(slot) => slot.1 = value,
+            None if flag == "--replicas" => flags.push((flag, value)),
+            None => return Err(format!("unknown vopr flag {flag}\n\n{USAGE}")),
+        }
+    }
+    let mut cmd = vec!["run", "--release", "-q", "-p", "bench", "--", "vopr"];
+    cmd.extend(flags.iter().flat_map(|&(f, v)| [f, v]));
+    ctx.step(&cmd)?;
+    Ok("vopr: all safety properties held\n".into())
+}
+
 /// Runs `args` (without the program name); returns the text to print.
 pub fn run(args: &[String], ctx: &Ctx) -> Result<String, String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -174,6 +205,7 @@ pub fn run(args: &[String], ctx: &Ctx) -> Result<String, String> {
         ["dev-check", "--no-coverage"] => dev_check(ctx, true),
         ["kani"] => kani(ctx),
         ["bench", rest @ ..] => bench(ctx, rest),
+        ["vopr", rest @ ..] => vopr(ctx, rest),
         _ => Err(format!("unknown task {args:?}\n\n{USAGE}")),
     }
 }
@@ -367,6 +399,37 @@ pub(crate) mod tests {
         fs::write(&file, "").unwrap();
         let c = Ctx { root: file, ..c };
         assert!(run(&args("bench"), &c).unwrap_err().starts_with("cannot create"));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn vopr_runs_the_simulator_in_release_mode() {
+        let _serial = serial();
+        let d = tmp("vopr");
+        let r = "run --release -q -p bench -- vopr";
+        assert_eq!(
+            run(&args("vopr"), &ctx(&d, "never")).unwrap(),
+            "vopr: all safety properties held\n"
+        );
+        assert_eq!(log(&d), format!("{r} --seeds {VOPR_SEEDS} --start 0\n"));
+        fs::remove_dir_all(&d).unwrap();
+        let d = tmp("vopr-flags");
+        run(&args("vopr --replicas 3 --start 40 --seeds 7"), &ctx(&d, "never")).unwrap();
+        assert_eq!(log(&d), format!("{r} --seeds 7 --start 40 --replicas 3\n"));
+        assert_eq!(
+            run(&args("vopr"), &ctx(&d, "*vopr*")).unwrap_err(),
+            format!("`cargo {r} --seeds {VOPR_SEEDS} --start 0` failed")
+        );
+        for (a, want) in [
+            ("vopr --seeds", "--seeds needs a value"),
+            ("vopr --seeds x", "--seeds: invalid number \"x\""),
+            ("vopr --replicas -1", "--replicas: invalid number \"-1\""),
+        ] {
+            assert_eq!(run(&args(a), &ctx(&d, "never")).unwrap_err(), want);
+        }
+        assert!(run(&args("vopr --ticks 3"), &ctx(&d, "never"))
+            .unwrap_err()
+            .starts_with("unknown vopr flag --ticks"));
         fs::remove_dir_all(&d).unwrap();
     }
 
