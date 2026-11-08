@@ -1,5 +1,8 @@
 # LumenDB
 
+[![CI](https://github.com/juanmaneo/LumenDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/juanmaneo/LumenDB/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Parse packet captures at "the speed of light" into a crash-safe, columnar
 time-series database. LumenDB is written entirely in Rust and depends only on
 `memmap2` and `parking_lot`.
