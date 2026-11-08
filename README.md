@@ -14,7 +14,7 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 | [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
 | [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli |
 | [`bench`](crates/bench) | command line: generate, ingest, query, benchmark | — |
-| [`xtask`](xtask) | `cargo xtask dev-check` / `cargo xtask kani` | cargo-xtask |
+| [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `bench` | cargo-xtask |
 | [`proofs`](proofs) | kani model-checking harnesses | — |
 
 ## Architecture
@@ -104,9 +104,20 @@ database. pcapfast detects pcap vs pcapng (both byte orders, µs/ns
 resolution), cuts the file into record- or block-aligned chunks and parses
 them on scoped threads. Headers are read in place, so packets are never
 copied. Each thread fills its own flow table and timeline, and the results
-are merged. Torn tails are reported, not fatal. On a 16-thread machine, a
-3.7 GB synthetic capture in the page cache parsed in about 120 ms
-(around 40 Mpkt/s).
+are merged. Torn tails are reported, not fatal.
+
+`cargo xtask bench` measures it on a synthetic capture of 4.8 million
+packets (3.6 GB) that is already in the page cache. On a 16-thread machine,
+the best of 5 runs was:
+
+| what is timed | time | rate |
+|---|---|---|
+| parsing the mapped file | 134 ms | 36 Mpkt/s, 27 GB/s |
+| the whole `parse_file` call | 348 ms | 14 Mpkt/s, 10 GB/s |
+
+The gap is the kernel mapping and unmapping 3.6 GB (about 880,000 pages);
+the parse itself scales with threads. Medians are noisier, about 200 ms and
+470 ms.
 
 ### tsvdb: the time-series database
 
@@ -143,6 +154,7 @@ $B query --db /tmp/lumendb --where proto=udp --where dport=53 --agg count
 echo 'cpu,host=a usage=0.5 1700000000000000000' > /tmp/m.lp
 $B write /tmp/m.lp --db /tmp/lumendb
 $B kv-bench --db /tmp/kv --ops 1000000 --sync 0                   # flashkv throughput
+$B parse-bench /tmp/cap.pcapng --runs 5 --min-mpps 5              # pcapfast throughput
 ```
 
 Every storage-backed command accepts `--sync 0|1`, `--background 0|1` and
@@ -172,6 +184,7 @@ pattern. The alias lives in `.cargo/config.toml`.
 | `cargo xtask dev-check` | fails on the first failing step: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, then `cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100` |
 | `cargo xtask dev-check --no-coverage` | the same without the coverage gate (for machines without cargo-llvm-cov) |
 | `cargo xtask kani` | `cargo kani -p proofs`, with virtual memory capped at 8 GiB (`ulimit -v`) so a runaway proof fails instead of triggering the OOM killer |
+| `cargo xtask bench [--packets N] [--min-mpps X]` | in release mode, writes a synthetic capture (default 4.8 million packets, about 3.6 GB) to `target/bench/capture.pcap`, then runs `bench parse-bench` on it: one warm-up pass and 5 timed runs. With `--min-mpps`, it fails if the best wall-clock rate is below `X` Mpkt/s |
 
 
 A missing `cargo-llvm-cov` or `cargo-kani` fails with installation

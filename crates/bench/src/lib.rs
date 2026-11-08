@@ -37,6 +37,11 @@ commands:
       query tsvdb (default: raw `flows` bytes)
   kv-bench --db DIR [--ops N] [--value-size N] [--batch N]
       flashkv write / point-read / scan throughput
+  parse-bench <capture> [--threads N] [--runs N] [--min-mpps X]
+      parse a capture N times (default 5) after one warm-up pass that loads it
+      into the page cache. `wall` is the whole parse_file call (open, mmap,
+      parse, munmap), `parse` excludes mapping and unmapping. Fails if the
+      best wall-clock rate is below X Mpkt/s
 
 storage options (ingest, write, query, kv-bench):
   --sync 0|1        fsync every write (default 1)
@@ -303,6 +308,67 @@ fn kv_bench(a: &Args) -> Res<String> {
     ))
 }
 
+fn parse_bench(a: &Args) -> Res<String> {
+    a.check(&["threads", "runs", "min-mpps"])?;
+    let path = Path::new(a.pos(1, "capture file")?);
+    let opts = ParseOptions {
+        threads: a.num("threads", 0)?,
+        ..Default::default()
+    };
+    let runs = a.num::<usize>("runs", 5)?.max(1);
+    let min_mpps = a.opt::<f64>("min-mpps")?;
+    let size = std::fs::metadata(path)?.len() as f64;
+    let mut out = String::new();
+    let mut packets = 0;
+    // (wall, parse) seconds of each timed run.
+    let mut times = Vec::with_capacity(runs);
+    // Run 0 is the warm-up pass.
+    for run in 0..=runs {
+        let t = Instant::now();
+        let s = parse_file(path, &opts)?;
+        let wall = secs(t.elapsed());
+        let parse = secs(s.elapsed);
+        packets = s.packets;
+        let line = match run {
+            0 => format!(
+                "{}: {:.2} GB, {packets} packets, {:?}, {} chunks",
+                path.display(),
+                size / 1e9,
+                s.format,
+                s.chunks
+            ),
+            _ => {
+                times.push((wall, parse));
+                format!("run {run}: wall {:.1} ms, parse {:.1} ms", wall * 1e3, parse * 1e3)
+            }
+        };
+        let _ = writeln!(out, "{line}");
+    }
+    let rate = |t: f64| (packets as f64 / t / 1e6, size / t / 1e9);
+    let mut mpps = 0.0;
+    for (what, i) in [("wall ", 0), ("parse", 1)] {
+        let mut t: Vec<f64> = times.iter().map(|w| [w.0, w.1][i]).collect();
+        t.sort_by(f64::total_cmp);
+        let (best, median) = (t[0], t[t.len() / 2]);
+        let (m, gbs) = rate(best);
+        if i == 0 {
+            mpps = m;
+        }
+        let _ = writeln!(
+            out,
+            "best {what}: {:.1} ms, {m:.2} Mpkt/s, {gbs:.2} GB/s (median {:.1} ms)",
+            best * 1e3,
+            median * 1e3
+        );
+    }
+    match min_mpps {
+        Some(min) if mpps < min => {
+            Err(format!("{out}regression: best wall-clock {mpps:.2} Mpkt/s is below --min-mpps {min}").into())
+        }
+        _ => Ok(out),
+    }
+}
+
 /// Runs the command line `args` (without the program name); returns the
 /// text to print on success.
 pub fn run(args: &[String]) -> Res<String> {
@@ -314,6 +380,7 @@ pub fn run(args: &[String]) -> Res<String> {
         Some("write") => write_lp(&a),
         Some("query") => run_query(&a),
         Some("kv-bench") => kv_bench(&a),
+        Some("parse-bench") => parse_bench(&a),
         Some(other) => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
@@ -387,6 +454,11 @@ mod tests {
             ("kv-bench --batch z", "--batch: invalid number \"z\""),
             ("kv-bench", "missing --db"),
             ("kv-bench --db x --sync z", "--sync: invalid number \"z\""),
+            ("parse-bench", "missing capture file"),
+            ("parse-bench c --x 1", "unknown flag --x"),
+            ("parse-bench c --threads z", "--threads: invalid number \"z\""),
+            ("parse-bench c --runs z", "--runs: invalid number \"z\""),
+            ("parse-bench c --min-mpps z", "--min-mpps: invalid number \"z\""),
         ] {
             assert_eq!(err(args), want, "{args}");
         }
@@ -472,6 +544,33 @@ mod tests {
         .unwrap();
         assert!(out.contains("read:  500/500 found"), "{out}");
         assert!(out.contains("scan:  500 entries"), "{out}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn parse_bench_reports_runs_and_gates_on_min_rate() {
+        let d = tmp("parse-bench");
+        let cap = d.join("c.pcap");
+        cmd(&format!("gen-pcap {} --packets 3000", cap.display())).unwrap();
+        let out = cmd(&format!(
+            "parse-bench {} --runs 3 --threads 2 --min-mpps 0",
+            cap.display()
+        ))
+        .unwrap();
+        assert!(out.contains("3000 packets, Pcap"), "{out}");
+        assert!(out.contains("run 3: ") && !out.contains("run 4"), "{out}");
+        assert!(out.contains("best wall : ") && out.contains("best parse: "), "{out}");
+        assert!(out.contains("(median "), "{out}");
+        let out = cmd(&format!("parse-bench {} --runs 0", cap.display())).unwrap();
+        assert!(out.contains("run 1: ") && !out.contains("run 2"), "{out}");
+        let e = err(&format!("parse-bench {} --runs 1 --min-mpps 1e12", cap.display()));
+        assert!(
+            e.contains("best wall : ") && e.contains("is below --min-mpps 1000000000000"),
+            "{e}"
+        );
+        assert!(cmd(&format!("parse-bench {}", d.join("missing").display())).is_err());
+        std::fs::write(&cap, b"not a capture").unwrap();
+        assert!(cmd(&format!("parse-bench {}", cap.display())).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

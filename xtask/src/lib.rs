@@ -10,6 +10,9 @@
 //! - `kani`: proves the harnesses of the `proofs` crate (`cargo kani -p proofs`),
 //!   with virtual memory capped at [`KANI_MEMORY_KIB`] (`ulimit -v`): a proof
 //!   that blows up fails instead of driving the machine into the OOM killer.
+//! - `bench`: generates a synthetic capture under `target/bench` and runs
+//!   `bench parse-bench` on it in release mode; `--min-mpps` turns it into a
+//!   regression gate.
 //!
 //! xtask never installs or touches git hooks.
 //!
@@ -25,7 +28,17 @@ usage: cargo xtask <task>
 tasks:
   dev-check [--no-coverage]  fmt --check, clippy -D warnings, test, 100% coverage gate
   kani                       run the kani proofs (cargo kani -p proofs), memory capped at 8 GiB
+  bench [--packets N] [--min-mpps X]
+                             generate a synthetic capture (default 4800000 packets, about
+                             3.6 GB) in target/bench and benchmark parsing it (release build)
 ";
+
+/// Default capture size of `cargo xtask bench`: about 3.6 GB.
+pub const BENCH_PACKETS: u64 = 4_800_000;
+
+/// Where `cargo xtask bench` writes its capture, relative to the root.
+pub const BENCH_DIR: &str = "target/bench";
+pub const BENCH_CAPTURE: &str = "target/bench/capture.pcap";
 
 /// Virtual memory cap for `cargo kani` and everything it spawns (CBMC).
 /// Every harness verifies in well under 1 GiB.
@@ -128,6 +141,30 @@ pub fn kani(ctx: &Ctx) -> Result<String, String> {
     Ok("kani: all proof harnesses verified\n".into())
 }
 
+pub fn bench(ctx: &Ctx, args: &[&str]) -> Result<String, String> {
+    let mut packets = BENCH_PACKETS.to_string();
+    let mut min_mpps = None;
+    let mut it = args.iter();
+    while let Some(&flag) = it.next() {
+        let value = it.next().ok_or(format!("{flag} needs a value"))?;
+        match flag {
+            "--packets" if value.parse::<u64>().is_ok() => packets = value.to_string(),
+            "--min-mpps" if value.parse::<f64>().is_ok() => min_mpps = Some(*value),
+            "--packets" | "--min-mpps" => return Err(format!("{flag}: invalid number {value:?}")),
+            _ => return Err(format!("unknown bench flag {flag}\n\n{USAGE}")),
+        }
+    }
+    let dir = ctx.root.join(BENCH_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let run = ["run", "--release", "-q", "-p", "bench", "--"];
+    let gen = ["gen-pcap", BENCH_CAPTURE, "--packets", &packets, "--flows", "5000"];
+    ctx.step(&[&run[..], &gen].concat())?;
+    let mut parse = vec!["parse-bench", BENCH_CAPTURE, "--runs", "5"];
+    parse.extend(min_mpps.iter().flat_map(|m| ["--min-mpps", m]));
+    ctx.step(&[&run[..], &parse].concat())?;
+    Ok("bench: done\n".into())
+}
+
 /// Runs `args` (without the program name); returns the text to print.
 pub fn run(args: &[String], ctx: &Ctx) -> Result<String, String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -136,6 +173,7 @@ pub fn run(args: &[String], ctx: &Ctx) -> Result<String, String> {
         ["dev-check"] => dev_check(ctx, false),
         ["dev-check", "--no-coverage"] => dev_check(ctx, true),
         ["kani"] => kani(ctx),
+        ["bench", rest @ ..] => bench(ctx, rest),
         _ => Err(format!("unknown task {args:?}\n\n{USAGE}")),
     }
 }
@@ -274,6 +312,61 @@ pub(crate) mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("kani --version "));
         assert_eq!(lines[1], format!("kani -p proofs {KANI_MEMORY_KIB}"));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn bench_generates_then_parses() {
+        let _serial = serial();
+        let d = tmp("bench");
+        let r = "run --release -q -p bench --";
+        assert_eq!(run(&args("bench"), &ctx(&d, "never")).unwrap(), "bench: done\n");
+        assert!(d.join(BENCH_DIR).is_dir());
+        assert_eq!(
+            log(&d),
+            format!(
+                "{r} gen-pcap {BENCH_CAPTURE} --packets {BENCH_PACKETS} --flows 5000\n\
+                 {r} parse-bench {BENCH_CAPTURE} --runs 5\n"
+            )
+        );
+        fs::remove_dir_all(&d).unwrap();
+        let d = tmp("bench-flags");
+        run(&args("bench --packets 10 --min-mpps 2.5"), &ctx(&d, "never")).unwrap();
+        assert_eq!(
+            log(&d),
+            format!(
+                "{r} gen-pcap {BENCH_CAPTURE} --packets 10 --flows 5000\n\
+                 {r} parse-bench {BENCH_CAPTURE} --runs 5 --min-mpps 2.5\n"
+            )
+        );
+        for (fail, want) in [("*gen-pcap*", "gen-pcap"), ("*parse-bench*", "parse-bench")] {
+            let e = run(&args("bench"), &ctx(&d, fail)).unwrap_err();
+            assert!(e.starts_with("`cargo run") && e.contains(want), "{e}");
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn bench_argument_errors() {
+        let _serial = serial();
+        let d = tmp("bench-args");
+        let c = ctx(&d, "never");
+        for (a, want) in [
+            ("bench --packets", "--packets needs a value"),
+            ("bench --packets x", "--packets: invalid number \"x\""),
+            ("bench --min-mpps x", "--min-mpps: invalid number \"x\""),
+        ] {
+            assert_eq!(run(&args(a), &c).unwrap_err(), want);
+        }
+        assert!(run(&args("bench --runs 3"), &c)
+            .unwrap_err()
+            .starts_with("unknown bench flag --runs"));
+        assert_eq!(log(&d), "");
+        // The root is a file: the capture directory cannot be created.
+        let file = d.join("file");
+        fs::write(&file, "").unwrap();
+        let c = Ctx { root: file, ..c };
+        assert!(run(&args("bench"), &c).unwrap_err().starts_with("cannot create"));
         fs::remove_dir_all(&d).unwrap();
     }
 
