@@ -22,6 +22,8 @@ pub enum LogError {
     },
     /// Appending would truncate committed entries.
     TruncatesCommitted,
+    /// A snapshot at `index` does not move the base `base` forward.
+    NotAboveBase { index: Index, base: Index },
 }
 
 impl fmt::Display for LogError {
@@ -40,6 +42,7 @@ impl fmt::Display for LogError {
                 "entry ({index}, term {term}) does not follow ({prev_index}, term {prev_term})"
             ),
             LogError::TruncatesCommitted => write!(f, "append would truncate committed entries"),
+            LogError::NotAboveBase { index, base } => write!(f, "snapshot at {index} is not above the base {base}"),
         }
     }
 }
@@ -59,6 +62,8 @@ pub enum Error {
     /// A linearizable read needs an entry of the leader's own term to be
     /// committed first; one is on its way, retry shortly.
     NotReady,
+    /// A snapshot the node cannot take: the reason.
+    BadSnapshot(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -70,6 +75,7 @@ impl fmt::Display for Error {
             Error::NotConfigured => write!(f, "node not in peer set"),
             Error::NotLeader(hint) => write!(f, "not leader (leader hint: {hint:?})"),
             Error::NotReady => write!(f, "leader has not committed an entry of its term yet, retry"),
+            Error::BadSnapshot(why) => write!(f, "bad snapshot: {why}"),
         }
     }
 }
@@ -105,6 +111,7 @@ mod tests {
         assert!(format!("{}", Error::NotConfigured).contains("not in peer set"));
         assert!(format!("{}", Error::NotLeader(Some(3))).contains("Some(3)"));
         assert!(Error::NotReady.to_string().ends_with("retry"));
+        assert_eq!(Error::BadSnapshot("too new").to_string(), "bad snapshot: too new");
     }
 
     #[test]
@@ -133,6 +140,10 @@ mod tests {
                 "entry (4, term 1) does not follow (3, term 2)",
             ),
             (LogError::TruncatesCommitted, "append would truncate committed entries"),
+            (
+                LogError::NotAboveBase { index: 2, base: 5 },
+                "snapshot at 2 is not above the base 5",
+            ),
         ];
         for (e, want) in cases {
             assert_eq!(e.to_string(), want);

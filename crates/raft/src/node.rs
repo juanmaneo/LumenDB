@@ -36,16 +36,25 @@
 //! asks the caller to retry; applications that read must ignore entries with
 //! empty data.
 //!
+//! Snapshots and log compaction: the application owns the state machine, so
+//! it decides when to snapshot. [`Node::compact`] takes the serialized state
+//! machine as of an applied index, stores it durably and drops the log up to
+//! there. A leader whose follower needs entries it has dropped sends the
+//! snapshot instead (`InstallSnapshot`, in one message). The follower stores
+//! it, and `tick()` hands it to the application as [`TickOutcome::snapshot`]
+//! to restore the state machine from, before any entries after it. After a
+//! restart the first tick does the same with the stored snapshot.
+//!
 //! Committed entries are handed out by `tick()` in index order, exactly once
-//! per process lifetime (after a restart they are replayed from index 1 as the
-//! commit index is re-learned).
+//! per process lifetime (after a restart they are replayed from just after the
+//! snapshot, or from index 1 without one, as the commit index is re-learned).
 
 use crate::clock::LamportClock;
 use crate::error::{Error, LogError, Result};
 use crate::log::{Log, LogEntry};
 use crate::message::{Message, MsgType};
 use crate::quorum::{is_majority, quorum};
-use crate::storage::{DurableState, Storage};
+use crate::storage::{DurableState, Snapshot, Storage};
 use crate::{Index, NodeId, Term};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,6 +76,10 @@ pub enum NodeState {
 pub struct TickOutcome {
     /// Messages to deliver to peers.
     pub messages: Vec<Message>,
+    /// A snapshot to restore the state machine from, before applying
+    /// `committed`, which then follows it: set after a restart and when the
+    /// leader sent a snapshot. It replaces the state machine's state.
+    pub snapshot: Option<Arc<Snapshot>>,
     /// Newly committed entries, to apply to the state machine in order.
     pub committed: Vec<LogEntry>,
     /// Reads that are decided, see [`Node::read_index`].
@@ -160,6 +173,11 @@ struct Inner {
     reads_ready: Vec<(u64, Index)>,
     /// Reads abandoned because this node stopped being leader.
     reads_failed: Vec<u64>,
+    /// The snapshot at the log's base, which a leader sends to a follower
+    /// that needs entries below it.
+    snapshot: Option<Arc<Snapshot>>,
+    /// A snapshot the next tick hands to the application.
+    install: Option<Arc<Snapshot>>,
 }
 
 pub struct Node {
@@ -195,7 +213,11 @@ impl Node {
             voted_for,
             log,
             recovering,
+            snapshot,
         } = storage.load()?;
+        if log.base_index() != snapshot.as_ref().map_or(0, |s| s.index) {
+            return Err(Error::Storage("the log does not start after the snapshot".into()));
+        }
         let peers: BTreeSet<NodeId> = cfg.voters.iter().copied().filter(|&v| v != cfg.id).collect();
         let mut rng = (cfg.seed ^ cfg.id) | 1;
         let election_timeout = random_timeout(&cfg, &mut rng);
@@ -207,9 +229,9 @@ impl Node {
                 term,
                 voted_for,
                 leader_id: None,
+                commit_index: log.base_index(),
+                last_applied: log.base_index(),
                 log,
-                commit_index: 0,
-                last_applied: 0,
                 election_elapsed: 0,
                 election_timeout,
                 heartbeat_elapsed: 0,
@@ -226,6 +248,8 @@ impl Node {
                 reads: Vec::new(),
                 reads_ready: Vec::new(),
                 reads_failed: Vec::new(),
+                install: snapshot.clone(),
+                snapshot,
             }),
             cfg,
         })
@@ -261,10 +285,38 @@ impl Node {
         self.state.lock().recovering
     }
 
-    /// Current term and full log.
+    /// Index of the last entry the snapshot covers (0: no snapshot).
+    pub fn snapshot_index(&self) -> Index {
+        self.state.lock().log.base_index()
+    }
+
+    /// Current term and the log: the entries after the snapshot.
     pub fn log_snapshot(&self) -> (Term, Vec<LogEntry>) {
         let s = self.state.lock();
         (s.term, s.log.entries().to_vec())
+    }
+
+    /// Snapshots the state machine: `data` is its state after applying every
+    /// entry up to `index`, which must be above the current snapshot and not
+    /// beyond what [`Node::tick`] has handed out. The snapshot is stored
+    /// durably, then the log up to `index` is dropped.
+    pub fn compact(&self, index: Index, data: Vec<u8>) -> Result<()> {
+        let mut s = self.state.lock();
+        if index > s.last_applied {
+            return Err(Error::BadSnapshot("index is not applied yet"));
+        }
+        if index <= s.log.base_index() {
+            return Err(Error::BadSnapshot("index is not above the snapshot"));
+        }
+        let term = s.log.term_at(index).expect("applied entries are in the log");
+        let snapshot = Arc::new(Snapshot { index, term, data });
+        self.storage.install_snapshot(snapshot.clone())?;
+        s.log
+            .install_snapshot(index, term)
+            .expect("checked to be above the base");
+        s.snapshot = Some(snapshot);
+        s.clock.tick();
+        Ok(())
     }
 
     /// Appends `data` to the leader's log (durably); it commits once a
@@ -366,7 +418,7 @@ impl Node {
                     r.round = Some(round);
                 }
                 for &p in &self.peers {
-                    let mut m = self.append_for(&s, p);
+                    let mut m = self.replicate(&s, p);
                     m.read_ctx = round;
                     messages.push(Self::send(&mut s, m));
                 }
@@ -382,7 +434,10 @@ impl Node {
                 }
             }
         }
-        let committed = s.log.entries()[s.last_applied as usize..s.commit_index as usize].to_vec();
+        let snapshot = s.install.take();
+        let committed = (s.log)
+            .entries_after(s.last_applied, s.commit_index)
+            .expect("applied entries are in the log");
         s.last_applied = s.commit_index;
         // A confirmed read's index is a commit index from before this tick,
         // and the tick has just handed out everything up to the commit index.
@@ -392,6 +447,7 @@ impl Node {
         reads.extend(s.reads_failed.drain(..).map(|id| ReadState { id, index: None }));
         Ok(TickOutcome {
             messages,
+            snapshot,
             committed,
             reads,
         })
@@ -431,7 +487,14 @@ impl Node {
                     reply.read_ctx = msg.read_ctx;
                     vec![reply]
                 }
-                MsgType::AppendEntriesReply => self.on_append_reply(&mut s, &msg).into_iter().collect(),
+                MsgType::AppendEntriesReply | MsgType::InstallSnapshotReply => {
+                    self.on_append_reply(&mut s, &msg).into_iter().collect()
+                }
+                MsgType::InstallSnapshot => {
+                    let mut reply = self.on_install_snapshot(&mut s, &msg)?;
+                    reply.read_ctx = msg.read_ctx;
+                    vec![reply]
+                }
                 MsgType::PreVote => vec![self.on_pre_vote(&s, &msg)],
                 MsgType::PreVoteReply => self.on_pre_vote_reply(&mut s, &msg)?,
             }
@@ -450,7 +513,11 @@ impl Node {
             MsgType::RequestVote => Some(Message::request_vote_reply(self.cfg.id, msg.from, s.term, false)),
             MsgType::AppendEntries => Some(Message::append_entries_reply(self.cfg.id, msg.from, s.term, false, 0)),
             MsgType::PreVote => Some(Message::pre_vote_reply(self.cfg.id, msg.from, s.term, false)),
-            MsgType::RequestVoteReply | MsgType::AppendEntriesReply | MsgType::PreVoteReply => None,
+            MsgType::InstallSnapshot => Some(Message::install_snapshot_reply(self.cfg.id, msg.from, s.term, false, 0)),
+            MsgType::RequestVoteReply
+            | MsgType::AppendEntriesReply
+            | MsgType::PreVoteReply
+            | MsgType::InstallSnapshotReply => None,
         }
     }
 
@@ -548,11 +615,33 @@ impl Node {
         }
     }
 
+    /// What `peer` needs next: entries, or the snapshot when it needs
+    /// entries this log no longer has.
+    fn replicate(&self, s: &Inner, peer: NodeId) -> Message {
+        match &s.snapshot {
+            Some(snap) if s.next_index[&peer] <= snap.index => {
+                let mut m = Message::install_snapshot(
+                    self.cfg.id,
+                    peer,
+                    s.term,
+                    snap.index,
+                    snap.term,
+                    snap.data.clone(),
+                    s.commit_index,
+                );
+                m.leader_last_index = s.log.last_index();
+                m
+            }
+            _ => self.append_for(s, peer),
+        }
+    }
+
+    /// AppendEntries for `peer`; its `next_index` must be above the base.
     fn append_for(&self, s: &Inner, peer: NodeId) -> Message {
         let prev = s.next_index[&peer] - 1;
         let prev_term = s.log.term_at(prev).unwrap_or(0);
         let entries = s.log.entries();
-        let start = (prev as usize).min(entries.len());
+        let start = ((prev - s.log.base_index()) as usize).min(entries.len());
         let end = start.saturating_add(MAX_BATCH).min(entries.len());
         let mut m = Message::append_entries(
             self.cfg.id,
@@ -624,6 +713,39 @@ impl Node {
         ))
     }
 
+    /// Takes the leader's snapshot, unless this node already committed
+    /// everything it covers. The application gets it on the next tick.
+    fn on_install_snapshot(&self, s: &mut Inner, msg: &Message) -> Result<Message> {
+        s.role = NodeState::Follower;
+        s.leader_id = Some(msg.from);
+        s.election_elapsed = 0;
+        let (index, term) = (msg.last_log_index, msg.last_log_term);
+        let reply = |s: &Inner, matched| Message::install_snapshot_reply(self.cfg.id, msg.from, s.term, true, matched);
+        if index <= s.commit_index {
+            // Committed entries are the same on every node, so this log
+            // matches the leader's up to its commit index.
+            return Ok(reply(s, s.commit_index));
+        }
+        let snapshot = Arc::new(Snapshot {
+            index,
+            term,
+            data: msg.snapshot_data.clone(),
+        });
+        self.storage.install_snapshot(snapshot.clone())?;
+        s.log
+            .install_snapshot(index, term)
+            .expect("above the commit index, so above the base");
+        s.commit_index = index;
+        s.last_applied = index;
+        s.snapshot = Some(snapshot.clone());
+        s.install = Some(snapshot);
+        if s.recovering & (index >= msg.leader_last_index) {
+            self.storage.mark_repaired()?;
+            s.recovering = false;
+        }
+        Ok(reply(s, index))
+    }
+
     fn on_append_reply(&self, s: &mut Inner, msg: &Message) -> Option<Message> {
         if s.role != NodeState::Leader {
             return None;
@@ -649,7 +771,7 @@ impl Node {
         };
         s.next_index.insert(msg.from, next);
         let more = (next <= s.log.last_index()) | !msg.success;
-        more.then(|| self.append_for(s, msg.from))
+        more.then(|| self.replicate(s, msg.from))
     }
 }
 
@@ -697,6 +819,7 @@ mod tests {
         nodes: Vec<Node>,
         applied: Vec<Vec<LogEntry>>,
         reads: Vec<Vec<ReadState>>,
+        snapshots: Vec<Vec<Arc<Snapshot>>>,
     }
 
     impl Net {
@@ -719,6 +842,7 @@ mod tests {
             Net {
                 applied: vec![Vec::new(); nodes.len()],
                 reads: vec![Vec::new(); nodes.len()],
+                snapshots: vec![Vec::new(); nodes.len()],
                 nodes,
             }
         }
@@ -734,6 +858,7 @@ mod tests {
                     let out = n.tick().unwrap();
                     self.applied[i].extend(out.committed);
                     self.reads[i].extend(out.reads);
+                    self.snapshots[i].extend(out.snapshot);
                     q.extend(out.messages);
                 }
                 while let Some(m) = q.pop_front() {
@@ -877,6 +1002,7 @@ mod tests {
                 l
             },
             recovering: false,
+            snapshot: None,
         });
         let node = Node::new(Config::cluster(1, vec![1, 2, 3]), storage.clone()).unwrap();
         // Candidate log is behind (older last term / shorter): refused.
@@ -990,6 +1116,7 @@ mod tests {
             voted_for: None,
             log,
             recovering: false,
+            snapshot: None,
         });
         let node = Node::new(Config::single(1), storage).unwrap();
         leader_of(&node, 20);
@@ -1038,6 +1165,10 @@ mod tests {
         fn mark_repaired(&self) -> Result<()> {
             self.spend()?;
             self.inner.mark_repaired()
+        }
+        fn install_snapshot(&self, snapshot: Arc<Snapshot>) -> Result<()> {
+            self.spend()?;
+            self.inner.install_snapshot(snapshot)
         }
     }
 
@@ -1226,6 +1357,255 @@ mod tests {
         assert_eq!(net.node(old).role(), NodeState::Follower);
     }
 
+    fn snapshot_of(index: Index, term: Term, data: &[u8]) -> Snapshot {
+        Snapshot {
+            index,
+            term,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn compaction_drops_the_log_and_a_restart_restores_the_snapshot() {
+        let storage = MemoryStorage::new();
+        let node = Node::new(Config::single(1), storage.clone()).unwrap();
+        leader_of(&node, 20);
+        for i in 0..3u8 {
+            node.propose(vec![i]).unwrap();
+        }
+        let t = node.term();
+        assert_eq!(node.tick().unwrap().committed.len(), 3);
+        let cannot = |index, why| assert_eq!(node.compact(index, vec![]), Err(Error::BadSnapshot(why)));
+        cannot(9, "index is not applied yet");
+        cannot(0, "index is not above the snapshot");
+        node.compact(2, b"state at 2".to_vec()).unwrap();
+        assert_eq!(
+            (node.snapshot_index(), node.log_snapshot().1),
+            (2, vec![entry(3, t, &[2])])
+        );
+        cannot(2, "index is not above the snapshot");
+        cannot(1, "index is not above the snapshot");
+        // Taking a snapshot of its own state is not something to restore.
+        assert!(node.tick().unwrap().snapshot.is_none());
+        assert_eq!(
+            storage.load().unwrap().snapshot.as_deref(),
+            Some(&snapshot_of(2, t, b"state at 2"))
+        );
+        // After a restart the first tick hands out the snapshot, once, and
+        // the entries after it follow when the commit index is learned again.
+        drop(node);
+        let node = Node::new(Config::single(1), storage.clone()).unwrap();
+        assert_eq!((node.commit_index(), node.snapshot_index()), (2, 2));
+        let out = node.tick().unwrap();
+        assert_eq!(out.snapshot.as_deref(), Some(&snapshot_of(2, t, b"state at 2")));
+        assert!(out.committed.is_empty());
+        assert!(node.tick().unwrap().snapshot.is_none());
+        leader_of(&node, 20);
+        assert_eq!(node.propose(b"n".to_vec()).unwrap(), 4);
+        let committed: Vec<Index> = node.tick().unwrap().committed.iter().map(|e| e.index).collect();
+        assert_eq!(committed, vec![3, 4]);
+        // A snapshot that does not match the log is refused at start.
+        let bad = MemoryStorage::with_state(DurableState {
+            snapshot: Some(Arc::new(snapshot_of(5, 1, b"x"))),
+            ..DurableState::default()
+        });
+        let err = Node::new(Config::single(1), bad).err().unwrap();
+        assert_eq!(err, Error::Storage("the log does not start after the snapshot".into()));
+    }
+
+    #[test]
+    fn leader_sends_the_snapshot_to_a_follower_that_needs_compacted_entries() {
+        let (node, t) = committed_leader();
+        node.propose(b"y".to_vec()).unwrap();
+        node.propose(b"z".to_vec()).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, 3)).unwrap();
+        assert_eq!(node.tick().unwrap().committed.len(), 3);
+        node.compact(3, b"state at 3".to_vec()).unwrap();
+        // Peer 3 never got anything: it needs entry 1. Peer 2 is current.
+        let ask_read = node.read_index().unwrap();
+        let sent = (0..3).flat_map(|_| node.tick().unwrap().messages).collect::<Vec<_>>();
+        let to = |peer| sent.iter().find(|m| m.to == peer).unwrap();
+        let (snap, append) = (to(3), to(2));
+        assert_eq!(snap.msg_type, MsgType::InstallSnapshot);
+        assert_eq!((snap.term, snap.last_log_index, snap.last_log_term), (t, 3, t));
+        assert_eq!((snap.commit_index, snap.leader_last_index), (3, 3));
+        assert_eq!(snap.snapshot_data, b"state at 3");
+        assert_eq!((append.msg_type, append.last_log_index), (MsgType::AppendEntries, 3));
+        // The snapshot carries the read round too: its reply confirms the read.
+        assert_eq!((snap.read_ctx, append.read_ctx), (1, 1));
+        let mut reply = Message::install_snapshot_reply(3, 1, t, true, 3);
+        reply.read_ctx = 1;
+        assert!(
+            node.step(reply.clone()).unwrap().is_empty(),
+            "nothing after the snapshot yet"
+        );
+        assert_eq!(
+            node.tick().unwrap().reads,
+            vec![ReadState {
+                id: ask_read,
+                index: Some(3)
+            }]
+        );
+        // With an entry after it, the reply is answered with appends from there.
+        node.propose(b"w".to_vec()).unwrap();
+        reply.read_ctx = 0;
+        let next = node.step(reply).unwrap();
+        assert_eq!(next[0].msg_type, MsgType::AppendEntries);
+        assert_eq!((next[0].last_log_index, next[0].entries.len()), (3, 1));
+        // A follower that rejects an append is sent the snapshot again when
+        // it needs compacted entries.
+        let r = node.step(Message::append_entries_reply(3, 1, t, false, 0)).unwrap();
+        assert_eq!(r[0].msg_type, MsgType::InstallSnapshot);
+        // A snapshot message from a stale leader is answered with our term.
+        let stale = node
+            .step(Message::install_snapshot(2, 1, t - 1, 9, 9, vec![], 9))
+            .unwrap();
+        assert_eq!(
+            (stale[0].msg_type, stale[0].success, stale[0].term),
+            (MsgType::InstallSnapshotReply, false, t)
+        );
+        // ... and a reply of a stale term is ignored.
+        assert!(node
+            .step(Message::install_snapshot_reply(2, 1, t - 1, true, 9))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn follower_installs_a_snapshot_in_each_case() {
+        let node_with = |entries: &[LogEntry]| {
+            let storage = MemoryStorage::new();
+            let node = Node::new(classic(2, vec![1, 2, 3]), storage.clone()).unwrap();
+            node.step(Message::append_entries(1, 2, 1, 0, 0, entries.to_vec(), 0))
+                .unwrap();
+            (node, storage)
+        };
+        let install = |node: &Node, index, term, leader_last| {
+            let mut m = Message::install_snapshot(1, 2, 1, index, term, b"S".to_vec(), index);
+            m.leader_last_index = leader_last;
+            let r = node.step(m).unwrap();
+            (r[0].msg_type, r[0].success, r[0].match_index)
+        };
+        let log = |last: Index| (1..=last).map(|i| entry(i, 1, b"e")).collect::<Vec<_>>();
+        // The log agrees with the snapshot: the entries after it are kept.
+        let (node, storage) = node_with(&log(5));
+        assert_eq!(install(&node, 3, 1, 5), (MsgType::InstallSnapshotReply, true, 3));
+        assert_eq!((node.commit_index(), node.snapshot_index()), (3, 3));
+        assert_eq!(node.log_snapshot().1, vec![entry(4, 1, b"e"), entry(5, 1, b"e")]);
+        assert_eq!(
+            storage.load().unwrap().snapshot.as_deref(),
+            Some(&snapshot_of(3, 1, b"S"))
+        );
+        // The application gets it on the next tick, once, with nothing after.
+        let out = node.tick().unwrap();
+        assert_eq!(out.snapshot.as_deref(), Some(&snapshot_of(3, 1, b"S")));
+        assert!(out.committed.is_empty() && node.tick().unwrap().snapshot.is_none());
+        // One it already covers is acknowledged with its commit index.
+        for index in [1, 3] {
+            assert_eq!(install(&node, index, 1, 5), (MsgType::InstallSnapshotReply, true, 3));
+        }
+        assert!(node.tick().unwrap().snapshot.is_none());
+        // Entries after the snapshot commit as usual.
+        node.step(Message::append_entries(1, 2, 1, 5, 1, vec![], 5)).unwrap();
+        assert_eq!(node.tick().unwrap().committed.len(), 2);
+        // The log disagrees at the snapshot's index, or is shorter: replaced.
+        let (node, _) = node_with(&log(3));
+        assert_eq!(install(&node, 3, 2, 3), (MsgType::InstallSnapshotReply, true, 3));
+        assert!(node.log_snapshot().1.is_empty());
+        let (node, _) = node_with(&log(1));
+        install(&node, 5, 1, 5);
+        assert_eq!((node.snapshot_index(), node.log_snapshot().1.len()), (5, 0));
+        // An append after the snapshot continues from it; one that needs
+        // compacted entries is told where this log ends.
+        let r = node
+            .step(Message::append_entries(1, 2, 1, 5, 1, vec![entry(6, 1, b"f")], 6))
+            .unwrap();
+        assert!(r[0].success && r[0].match_index == 6);
+        let r = node.step(Message::append_entries(1, 2, 1, 2, 1, vec![], 6)).unwrap();
+        assert!(!r[0].success && r[0].match_index == 6);
+    }
+
+    #[test]
+    fn a_snapshot_ends_recovery_when_it_covers_the_leaders_log() {
+        let damaged_node = || {
+            let node = Node::new(Config::cluster(1, vec![1, 2, 3]), damaged(1, &[entry(1, 1, b"a")])).unwrap();
+            assert!(node.recovering());
+            node
+        };
+        let install = |node: &Node, leader_last| {
+            let mut m = Message::install_snapshot(2, 1, 1, 4, 1, b"S".to_vec(), 4);
+            m.leader_last_index = leader_last;
+            node.step(m).unwrap();
+        };
+        let node = damaged_node();
+        install(&node, 9);
+        assert!(node.recovering(), "the leader has more");
+        let node = damaged_node();
+        install(&node, 4);
+        assert!(!node.recovering());
+    }
+
+    #[test]
+    fn snapshot_storage_failures_leave_the_node_unchanged() {
+        let cfg = || Config::cluster(2, vec![1, 2, 3]);
+        let snapshot = || Message::install_snapshot(1, 2, 0, 4, 0, b"S".to_vec(), 4);
+        let n = Node::new(cfg(), Failing::new(1)).unwrap();
+        assert!(n.step(snapshot()).is_err());
+        assert_eq!((n.snapshot_index(), n.commit_index()), (0, 0));
+        assert!(n.tick().unwrap().snapshot.is_none());
+        // The snapshot is in, but leaving recovery failed: it stays recovering.
+        let recovering = DurableState {
+            recovering: true,
+            ..DurableState::default()
+        };
+        let n = Node::new(cfg(), Failing::with_state(2, recovering)).unwrap();
+        let mut m = snapshot();
+        m.leader_last_index = 4;
+        assert!(n.step(m).is_err());
+        assert!(n.recovering());
+        assert_eq!(n.snapshot_index(), 4);
+        // Compacting.
+        // (the budget covers load, the vote and two proposals)
+        let n = Node::new(Config::single(1), Failing::new(4)).unwrap();
+        leader_of(&n, 20);
+        n.propose(b"a".to_vec()).unwrap();
+        n.propose(b"b".to_vec()).unwrap();
+        n.tick().unwrap();
+        assert_eq!(n.compact(1, vec![]), Err(Error::Storage("disk gone".into())));
+        assert_eq!(n.snapshot_index(), 0);
+    }
+
+    #[test]
+    fn a_lagging_follower_catches_up_through_a_snapshot() {
+        let mut net = Net::new(3);
+        net.run(60, &[]);
+        let leader = net.leaders(&[])[0];
+        let lag = (1..=3).find(|&i| i != leader).unwrap();
+        for i in 0..10u8 {
+            net.node(leader).propose(vec![i]).unwrap();
+        }
+        net.run(20, &[lag]);
+        let applied = net.applied[(leader - 1) as usize].len() as Index;
+        assert!(applied >= 10 && net.node(lag).commit_index() == 0);
+        // The leader snapshots and drops its log: the entries the follower
+        // misses exist only in the snapshot now.
+        net.node(leader).compact(applied, b"state".to_vec()).unwrap();
+        assert!(net.node(leader).log_snapshot().1.is_empty());
+        net.run(30, &[]);
+        assert_eq!(net.node(lag).snapshot_index(), applied);
+        assert_eq!(net.snapshots[(lag - 1) as usize].len(), 1);
+        assert_eq!(net.snapshots[(lag - 1) as usize][0].data, b"state");
+        assert_eq!(net.node(lag).commit_index(), applied);
+        // It keeps replicating normally from there.
+        net.node(leader).propose(b"after".to_vec()).unwrap();
+        net.run(20, &[]);
+        let want = net.node(leader).log_snapshot().1;
+        assert_eq!(want.len(), 1);
+        assert_eq!(net.node(lag).log_snapshot().1, want);
+        assert_eq!(net.node(lag).commit_index(), applied + 1);
+        assert_eq!(net.applied[(lag - 1) as usize].last(), want.last());
+    }
+
     /// Ticks `node` until it asks for pre-votes; returns those messages.
     fn pre_campaign(node: &Node) -> Vec<Message> {
         loop {
@@ -1286,6 +1666,7 @@ mod tests {
             voted_for: Some(3),
             log: log.clone(),
             recovering,
+            snapshot: None,
         };
         let node = |recovering| {
             let s = MemoryStorage::with_state(state(recovering));
@@ -1356,6 +1737,7 @@ mod tests {
             voted_for: None,
             log,
             recovering: true,
+            snapshot: None,
         })
     }
 

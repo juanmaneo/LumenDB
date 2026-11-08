@@ -21,7 +21,7 @@ pub use log::{Log, LogEntry};
 pub use message::{Message, MsgType};
 pub use node::{Config, Node, NodeState, ReadState, TickOutcome};
 pub use quorum::{is_majority, quorum};
-pub use storage::{DurableState, FileStorage, MemoryStorage, Storage};
+pub use storage::{DurableState, FileStorage, MemoryStorage, Snapshot, Storage};
 pub use swim::{Gossip, Member, Status, Swim};
 
 pub type NodeId = u64;

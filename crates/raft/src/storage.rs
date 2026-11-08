@@ -5,10 +5,16 @@
 //! Raft persistence too. Layout of the storage directory:
 //!
 //! - `raft.state`: two identical CRC-framed copies of the record
-//!   `term | voted flag | voted | log gen | recovering flag`, replaced
-//!   atomically (write tmp, sync, rename, sync dir);
+//!   `term | voted flag | voted | log gen | recovering flag | snapshot index |
+//!   snapshot term`, replaced atomically (write tmp, sync, rename, sync dir);
 //! - `raft-<gen>.log`: CRC-framed batches of entries, each batch is one record
-//!   (all or nothing). Appends go to the tail with a single write + sync.
+//!   (all or nothing). Appends go to the tail with a single write + sync. It
+//!   holds only the entries after the snapshot;
+//! - `raft-snap-<index>.snap`: the snapshot of the state machine that covers
+//!   every entry up to `index`, one CRC-framed record, named by index so that
+//!   a log rewrite never copies it. It is written and synced before the state
+//!   file points at it. Any other `.log` or `.snap` file is garbage from an
+//!   interrupted rewrite or compaction and is removed at the next open.
 //!
 //! A batch that truncates the log (Raft conflict resolution), as well as every
 //! open, rewrites the whole log into `raft-<gen+1>.log` and only then points
@@ -28,11 +34,14 @@
 //! the state file holds two copies: either intact copy is used, and when both
 //! are intact they must agree. A state file with no intact copy fails the open.
 //! The copies guard against silent corruption, not unreadable sectors: both
-//! are read in one call.
+//! are read in one call. A snapshot file that fails its checksum loses the
+//! applied prefix, which only a leader can restore: the node starts from an
+//! empty log, marked recovering, and receives the leader's snapshot or log. A
+//! missing snapshot or log file fails the open instead.
 
 use crate::error::{Error, Result};
 use crate::log::{Log, LogEntry};
-use crate::{NodeId, Term};
+use crate::{Index, NodeId, Term};
 use flashkv::codec::Decoder;
 use flashkv::env::{Env, LockGuard, OsEnv};
 use flashkv::log::{frame, parse, tail, LogWriter, Tail};
@@ -42,14 +51,26 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// A snapshot of the state machine: the effect of every entry up to `index`
+/// (whose term was `term`). What `data` holds is up to the application.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub index: Index,
+    pub term: Term,
+    pub data: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DurableState {
     pub term: Term,
     pub voted_for: Option<NodeId>,
+    /// Entries after the snapshot, if there is one: `log.base_index()` and
+    /// `log.base_term()` are the snapshot's index and term.
     pub log: Log,
     /// The log was damaged and may miss entries this node acknowledged: it
     /// must not vote or campaign until it has caught up with a leader.
     pub recovering: bool,
+    pub snapshot: Option<Arc<Snapshot>>,
 }
 
 /// Persistence used by [`crate::Node`]. Implementations must make every
@@ -61,6 +82,10 @@ pub trait Storage: Send + Sync {
     fn append_entries(&self, entries: &[LogEntry]) -> Result<()>;
     /// Clears [`DurableState::recovering`].
     fn mark_repaired(&self) -> Result<()>;
+    /// Makes `snapshot` the base of the log, see [`Log::install_snapshot`]:
+    /// the entries after it are kept only if the log agrees with it. Fails
+    /// unless it is above the current base.
+    fn install_snapshot(&self, snapshot: Arc<Snapshot>) -> Result<()>;
 }
 
 /// Volatile storage for tests and simulations.
@@ -99,16 +124,57 @@ impl Storage for MemoryStorage {
         self.state.lock().recovering = false;
         Ok(())
     }
+    fn install_snapshot(&self, snapshot: Arc<Snapshot>) -> Result<()> {
+        let mut s = self.state.lock();
+        s.log.install_snapshot(snapshot.index, snapshot.term)?;
+        s.snapshot = Some(snapshot);
+        Ok(())
+    }
 }
 
 const STATE_FILE: &str = "raft.state";
 const STATE_TMP: &str = "raft.state.tmp";
-/// Payload of one state copy: term, voted flag, voted, gen, recovering flag.
-const STATE_LEN: usize = 8 + 1 + 8 + 8 + 1;
+/// Payload of one state copy: term, voted flag, voted, gen, recovering flag,
+/// snapshot index and term.
+const STATE_LEN: usize = 8 + 1 + 8 + 8 + 1 + 8 + 8;
 const STATE_COPY: usize = flashkv::log::HEADER + STATE_LEN;
 
 fn log_name(gen: u64) -> String {
     format!("raft-{gen:06}.log")
+}
+
+const SNAP_PREFIX: &str = "raft-snap-";
+
+fn snap_name(index: Index) -> String {
+    format!("{SNAP_PREFIX}{index:020}.snap")
+}
+
+fn encode_snapshot(s: &Snapshot) -> Vec<u8> {
+    let mut p = Vec::with_capacity(16 + s.data.len());
+    p.extend_from_slice(&s.index.to_le_bytes());
+    p.extend_from_slice(&s.term.to_le_bytes());
+    p.extend_from_slice(&s.data);
+    let mut out = Vec::with_capacity(p.len() + flashkv::log::HEADER);
+    frame(&mut out, &p);
+    out
+}
+
+/// The snapshot in `buf`, if it is one intact record and is the snapshot
+/// `(index, term)` the state file expects.
+fn decode_snapshot(buf: &[u8], index: Index, term: Term) -> Option<Snapshot> {
+    let (records, end) = parse(buf);
+    match records.as_slice() {
+        [p] if (end == buf.len()) & (p.len() >= 16) => {
+            let mut d = Decoder::new(p);
+            let (i, t) = (d.u64(), d.u64());
+            ((i, t) == (index, term)).then(|| Snapshot {
+                index: i,
+                term: t,
+                data: p[16..].to_vec(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Contents of `raft.state`.
@@ -118,6 +184,9 @@ struct StateRecord {
     voted_for: Option<NodeId>,
     gen: u64,
     recovering: bool,
+    /// Index and term of the snapshot (0, 0: none).
+    snap_index: Index,
+    snap_term: Term,
 }
 
 impl StateRecord {
@@ -127,6 +196,8 @@ impl StateRecord {
             voted_for: state.voted_for,
             gen,
             recovering: state.recovering,
+            snap_index: state.log.base_index(),
+            snap_term: state.log.base_term(),
         }
     }
 }
@@ -138,6 +209,8 @@ fn encode_state(r: &StateRecord) -> Vec<u8> {
     p.extend_from_slice(&r.voted_for.unwrap_or(0).to_le_bytes());
     p.extend_from_slice(&r.gen.to_le_bytes());
     p.push(r.recovering as u8);
+    p.extend_from_slice(&r.snap_index.to_le_bytes());
+    p.extend_from_slice(&r.snap_term.to_le_bytes());
     let mut out = Vec::with_capacity(2 * STATE_COPY);
     frame(&mut out, &p);
     frame(&mut out, &p);
@@ -154,11 +227,14 @@ fn decode_copy(copy: &[u8]) -> Option<StateRecord> {
             let voted = d.u64();
             let gen = d.u64();
             let recovering = d.u8() != 0;
+            let (snap_index, snap_term) = (d.u64(), d.u64());
             Some(StateRecord {
                 term,
                 voted_for: has_vote.then_some(voted),
                 gen,
                 recovering,
+                snap_index,
+                snap_term,
             })
         }
         _ => None,
@@ -251,7 +327,17 @@ impl FileStorage {
         };
         let (records, end) = parse(&log_buf);
         let mut damaged = tail(&log_buf, end) == Tail::Corrupt;
-        let mut log = Log::new();
+        let snapshot = match (rec.snap_index, read_opt(&*env, &dir.join(snap_name(rec.snap_index)))?) {
+            (0, _) => None,
+            (i, None) => return Err(Error::Storage(format!("missing {}", snap_name(i)))),
+            (i, Some(buf)) => decode_snapshot(&buf, i, rec.snap_term).map(Arc::new),
+        };
+        // A snapshot that fails its checksum takes the log after it along:
+        // those entries cannot follow anything. Start empty, as recovering.
+        damaged |= (rec.snap_index != 0) & snapshot.is_none();
+        let mut log = snapshot
+            .as_ref()
+            .map_or_else(Log::new, |s| Log::with_base(s.index, s.term));
         for record in records {
             // An intact checksum around a batch that does not decode or does
             // not follow the log is damage too: keep the prefix before it.
@@ -265,14 +351,19 @@ impl FileStorage {
             voted_for: rec.voted_for,
             log,
             recovering: rec.recovering | damaged,
+            snapshot,
         };
         // Compact into a fresh generation: drops any torn tail, and a damaged
         // log is replaced together with setting the recovering flag.
         let writer = write_log(&*env, dir, &state, gen + 1)?;
-        // Every other generation is garbage, including ones a crash brought
-        // back because their removal was never made durable.
+        // Every other generation and snapshot is garbage, including ones a
+        // crash brought back because their removal was never made durable.
+        let current = (log_name(gen + 1), state.snapshot.as_ref().map(|s| snap_name(s.index)));
         for name in env.list(dir)? {
-            if name.starts_with("raft-") & name.ends_with(".log") & (name != log_name(gen + 1)) {
+            let old_log = name.starts_with("raft-") & name.ends_with(".log") & (name != current.0);
+            let old_snap =
+                name.starts_with(SNAP_PREFIX) & name.ends_with(".snap") & (Some(&name) != current.1.as_ref());
+            if old_log | old_snap {
                 let _ = env.remove(&dir.join(name));
             }
         }
@@ -293,6 +384,15 @@ impl FileStorage {
     pub fn generation(&self) -> u64 {
         self.inner.lock().gen
     }
+}
+
+/// Writes and syncs the snapshot file. Its directory entry becomes durable
+/// with the `sync_dir` of the `write_log` that commits it.
+fn write_snapshot(env: &dyn Env, dir: &Path, snapshot: &Snapshot) -> Result<()> {
+    let mut f = env.create(&dir.join(snap_name(snapshot.index)))?;
+    f.append(&encode_snapshot(snapshot))?;
+    f.sync()?;
+    Ok(())
 }
 
 fn write_state(env: &dyn Env, dir: &Path, rec: &StateRecord) -> Result<()> {
@@ -376,6 +476,30 @@ impl Storage for FileStorage {
             }
         }
     }
+
+    fn install_snapshot(&self, snapshot: Arc<Snapshot>) -> Result<()> {
+        let mut g = self.inner.lock();
+        let mut next = g.state.clone();
+        next.log.install_snapshot(snapshot.index, snapshot.term)?;
+        next.snapshot = Some(snapshot.clone());
+        // The snapshot is durable before the state file points at it, and the
+        // state file switches log and snapshot together. A crash in between
+        // leaves the old pair in effect and the new snapshot as garbage.
+        write_snapshot(&*self.env, &self.dir, &snapshot)?;
+        let gen = g.gen + 1;
+        let writer = write_log(&*self.env, &self.dir, &next, gen)?;
+        let _ = self.env.remove(&self.dir.join(log_name(g.gen)));
+        if let Some(old) = &g.state.snapshot {
+            let _ = self.env.remove(&self.dir.join(snap_name(old.index)));
+        }
+        *g = Inner {
+            state: next,
+            gen,
+            writer,
+            dirty: false,
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +537,18 @@ mod tests {
         assert!(r.load().unwrap().recovering);
         r.mark_repaired().unwrap();
         assert_eq!(r.load().unwrap(), st);
+        // Snapshots replace the log prefix, and must move the base forward.
+        let snapshot = Arc::new(Snapshot {
+            index: 1,
+            term: 5,
+            data: b"x".to_vec(),
+        });
+        r.install_snapshot(snapshot.clone()).unwrap();
+        let after = r.load().unwrap();
+        assert_eq!((after.log.base_index(), after.log.last_index()), (1, 2));
+        assert_eq!(after.snapshot, Some(snapshot.clone()));
+        assert!(r.install_snapshot(snapshot).is_err());
+        assert_eq!(r.load().unwrap(), after);
     }
 
     #[test]
@@ -575,6 +711,8 @@ mod tests {
             voted_for: Some(u64::MAX),
             gen: 3,
             recovering: true,
+            snap_index: 9,
+            snap_term: 4,
         };
         let s = encode_state(&r);
         assert_eq!(s.len(), 2 * STATE_COPY);
@@ -664,6 +802,27 @@ mod tests {
                 acked.log.append(&[e(3, 1)]).unwrap();
                 s.append_entries(&[e(2, 2), e(3, 2)])?;
                 acked.log.append(&[e(2, 2), e(3, 2)]).unwrap();
+                // Compaction: the snapshot and the shortened log switch together.
+                let snap = Arc::new(Snapshot {
+                    index: 2,
+                    term: 2,
+                    data: b"state at 2".to_vec(),
+                });
+                s.install_snapshot(snap.clone())?;
+                acked.log.install_snapshot(2, 2).unwrap();
+                acked.snapshot = Some(snap);
+                s.append_entries(&[e(4, 2)])?;
+                acked.log.append(&[e(4, 2)]).unwrap();
+                // A snapshot ahead of the log replaces it, and replaces the
+                // previous snapshot file.
+                let snap = Arc::new(Snapshot {
+                    index: 6,
+                    term: 3,
+                    data: b"state at 6".to_vec(),
+                });
+                s.install_snapshot(snap.clone())?;
+                acked.log.install_snapshot(6, 3).unwrap();
+                acked.snapshot = Some(snap);
                 s.save_vote(2, None)?;
                 (acked.term, acked.voted_for) = (2, None);
                 drop(s);
@@ -679,10 +838,140 @@ mod tests {
             assert_eq!(recovered.term, acked.term, "fault at op {n}");
             assert_eq!(recovered.voted_for, acked.voted_for, "fault at op {n}");
             assert_eq!(recovered.log, acked.log, "fault at op {n}");
+            assert_eq!(recovered.snapshot, acked.snapshot, "fault at op {n}");
+            // Whatever the interruption, no file of an older pair is left.
+            let mut names = fs::read_dir(&dir).unwrap().count();
+            names -= usize::from(dir.join("LOCK").exists());
+            assert!(names <= 4, "{names} files, fault at op {n}");
             fs::remove_dir_all(&dir).unwrap();
             if done {
                 break;
             }
         }
+    }
+
+    fn snap(index: u64, term: u64, data: &[u8]) -> Arc<Snapshot> {
+        Arc::new(Snapshot {
+            index,
+            term,
+            data: data.to_vec(),
+        })
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn snapshots_replace_the_log_prefix_and_survive_reopening() {
+        let dir = tmpdir("snapshot");
+        let s = FileStorage::open(&dir).unwrap();
+        s.append_entries(&[e(1, 1), e(2, 1), e(3, 2), e(4, 2), e(5, 2)])
+            .unwrap();
+        // A snapshot the log agrees with keeps the entries after it.
+        s.install_snapshot(snap(3, 2, b"three")).unwrap();
+        let st = s.load().unwrap();
+        assert_eq!((st.log.base_index(), st.log.base_term()), (3, 2));
+        assert_eq!(st.log.entries(), &[e(4, 2), e(5, 2)]);
+        assert_eq!(st.snapshot.as_deref(), Some(&*snap(3, 2, b"three")));
+        // Appends continue after it, and so does a conflict rewrite.
+        s.append_entries(&[e(6, 2)]).unwrap();
+        s.append_entries(&[e(6, 3)]).unwrap();
+        assert_eq!(s.load().unwrap().log.entries(), &[e(4, 2), e(5, 2), e(6, 3)]);
+        // It must move the base forward, and nothing changes otherwise.
+        let before = s.load().unwrap();
+        for index in [1, 3] {
+            assert!(s.install_snapshot(snap(index, 2, b"old")).is_err());
+            assert_eq!(s.load().unwrap(), before);
+        }
+        assert_eq!(dir_names(&dir).iter().filter(|n| n.contains("snap")).count(), 1);
+        drop(s);
+        let s = FileStorage::open(&dir).unwrap();
+        let st = s.load().unwrap();
+        assert_eq!(st, before);
+        assert!(!st.recovering);
+        // One that disagrees with the log (or is beyond it) replaces it.
+        s.install_snapshot(snap(5, 9, b"five")).unwrap();
+        let st = s.load().unwrap();
+        assert_eq!(
+            (st.log.base_index(), st.log.last_index(), st.log.last_term()),
+            (5, 5, 9)
+        );
+        let mut want = vec![
+            "LOCK".to_string(),
+            snap_name(5),
+            log_name(s.generation()),
+            STATE_FILE.to_string(),
+        ];
+        want.sort();
+        assert_eq!(dir_names(&dir), want);
+        drop(s);
+        let st = FileStorage::open(&dir).unwrap().load().unwrap();
+        assert_eq!(st.snapshot.as_deref(), Some(&*snap(5, 9, b"five")));
+        assert_eq!(st.log.base_index(), 5);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn damaged_snapshots_reset_the_log_and_mark_the_node_recovering() {
+        let dir = tmpdir("snapshot-damage");
+        let build = || {
+            let _ = fs::remove_dir_all(&dir);
+            let s = FileStorage::open(&dir).unwrap();
+            s.save_vote(4, Some(2)).unwrap();
+            s.append_entries(&[e(1, 3), e(2, 3), e(3, 4)]).unwrap();
+            s.install_snapshot(snap(2, 3, b"state")).unwrap();
+            s.append_entries(&[e(4, 4)]).unwrap();
+        };
+        let path = dir.join(snap_name(2));
+        let reopened = || FileStorage::open(&dir).unwrap().load().unwrap();
+        // Bit rot in the snapshot: its data is gone, the log after it cannot
+        // follow anything, term and vote stay.
+        build();
+        let mut bytes = fs::read(&path).unwrap();
+        let n = bytes.len();
+        bytes[n - 2] ^= 0x10;
+        fs::write(&path, &bytes).unwrap();
+        let st = reopened();
+        assert!(st.recovering && st.snapshot.is_none() && st.log.is_empty());
+        assert_eq!((st.log.base_index(), st.term, st.voted_for), (0, 4, Some(2)));
+        assert!(!path.exists(), "the damaged file is garbage now");
+        assert!(reopened().recovering, "and it stays recovering");
+        // The same for trailing bytes, a snapshot of another index or term, and
+        // one that is too short.
+        for bad in [
+            [encode_snapshot(&snap(2, 3, b"state")), vec![0]].concat(),
+            encode_snapshot(&snap(2, 4, b"state")),
+            encode_snapshot(&snap(1, 3, b"state")),
+            {
+                let mut b = Vec::new();
+                frame(&mut b, &[0; 15]);
+                b
+            },
+        ] {
+            build();
+            fs::write(&path, &bad).unwrap();
+            let st = reopened();
+            assert!(st.recovering && st.snapshot.is_none(), "{bad:?}");
+        }
+        // A missing snapshot file fails the open instead.
+        build();
+        fs::remove_file(&path).unwrap();
+        let err = FileStorage::open(&dir).err().unwrap();
+        assert_eq!(err, Error::Storage(format!("missing {}", snap_name(2))));
+        // A snapshot file the state never pointed at (a crash before the
+        // switch) is removed, and one it points at is not.
+        build();
+        fs::write(dir.join(snap_name(7)), b"orphan").unwrap();
+        let st = reopened();
+        assert!(!st.recovering);
+        assert_eq!(st.snapshot.as_deref(), Some(&*snap(2, 3, b"state")));
+        assert!(!dir.join(snap_name(7)).exists() && path.exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

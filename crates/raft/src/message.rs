@@ -13,6 +13,11 @@ pub enum MsgType {
     /// vote, so a node that cannot win never disturbs the cluster.
     PreVote,
     PreVoteReply,
+    /// The follower needs entries the leader has compacted: the leader sends
+    /// its snapshot instead. `last_log_index` and `last_log_term` name the
+    /// last entry it covers, `snapshot_data` is the state machine.
+    InstallSnapshot,
+    InstallSnapshotReply,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +40,8 @@ pub struct Message {
     /// reply echoes it, proving the follower still accepted the leader after
     /// that round began; see [`crate::Node::read_index`].
     pub read_ctx: u64,
+    /// InstallSnapshot: the serialized state machine.
+    pub snapshot_data: Vec<u8>,
     /// Sender's Lamport clock at send time.
     pub lc: u64,
 }
@@ -55,7 +62,32 @@ impl Message {
             success: false,
             leader_last_index: 0,
             read_ctx: 0,
+            snapshot_data: Vec::new(),
             lc: 0,
+        }
+    }
+    /// The leader's snapshot, covering entries up to `(index, snapshot_term)`.
+    pub fn install_snapshot(
+        from: NodeId,
+        to: NodeId,
+        term: Term,
+        index: Index,
+        snapshot_term: Term,
+        data: Vec<u8>,
+        leader_commit: Index,
+    ) -> Self {
+        Message {
+            msg_type: MsgType::InstallSnapshot,
+            commit_index: leader_commit,
+            snapshot_data: data,
+            ..Self::request_vote(from, to, term, index, snapshot_term)
+        }
+    }
+    /// `match_index` is the last index known to match the leader's log.
+    pub fn install_snapshot_reply(from: NodeId, to: NodeId, term: Term, success: bool, match_index: Index) -> Self {
+        Message {
+            msg_type: MsgType::InstallSnapshotReply,
+            ..Self::append_entries_reply(from, to, term, success, match_index)
         }
     }
     /// A pre-vote asks for `term`, the term the sender would campaign in.
@@ -87,6 +119,7 @@ impl Message {
             success: false,
             leader_last_index: 0,
             read_ctx: 0,
+            snapshot_data: Vec::new(),
             lc: 0,
         }
     }
@@ -113,6 +146,7 @@ impl Message {
             success: false,
             leader_last_index: 0,
             read_ctx: 0,
+            snapshot_data: Vec::new(),
             lc: 0,
         }
     }
@@ -131,6 +165,7 @@ impl Message {
             success,
             leader_last_index: 0,
             read_ctx: 0,
+            snapshot_data: Vec::new(),
             lc: 0,
         }
     }
@@ -158,5 +193,14 @@ mod tests {
         assert_eq!((p.msg_type, p.term, p.last_log_index), (MsgType::PreVote, 4, 10));
         let p = Message::pre_vote_reply(2, 1, 4, true);
         assert_eq!((p.msg_type, p.vote_granted), (MsgType::PreVoteReply, true));
+        let s = Message::install_snapshot(1, 2, 4, 10, 3, vec![7], 9);
+        assert_eq!(s.msg_type, MsgType::InstallSnapshot);
+        assert_eq!((s.last_log_index, s.last_log_term, s.commit_index), (10, 3, 9));
+        assert_eq!(s.snapshot_data, vec![7]);
+        let s = Message::install_snapshot_reply(2, 1, 4, true, 10);
+        assert_eq!(
+            (s.msg_type, s.success, s.match_index),
+            (MsgType::InstallSnapshotReply, true, 10)
+        );
     }
 }

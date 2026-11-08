@@ -1,12 +1,18 @@
 //! Raft log: entries indexed from 1, virtual sentinel at 0 (term 0).
 //!
+//! After a snapshot the log starts at a *base* `(base_index, base_term)`, the
+//! last entry the snapshot covers: entries up to the base are gone, and the
+//! first entry held has index `base_index + 1`. The base plays the part of the
+//! sentinel, with `(0, 0)` for a log that was never compacted.
+//!
 //! Invariants, preserved by every mutating method (`append` is atomic: on
 //! `Err` the log is unchanged):
-//! - indices are contiguous starting at 1: `get(i).unwrap().index == i` for
-//!   every `1 <= i <= last_index()`, and `last_index() == len()`;
-//! - terms are non-decreasing: `term_at(i) <= term_at(i + 1)`;
-//! - `term_at(0) == Some(0)` (sentinel) and `term_at(i) == None` iff
-//!   `i > last_index()`.
+//! - indices are contiguous starting at `base_index + 1`:
+//!   `get(i).unwrap().index == i` for every `base_index < i <= last_index()`,
+//!   and `last_index() == base_index + len()`;
+//! - terms are non-decreasing: `term_at(i) <= term_at(i + 1)`, from the base on;
+//! - `term_at(base_index) == Some(base_term)` (sentinel), `term_at(i) == None`
+//!   for `i < base_index` (compacted) and for `i > last_index()`.
 
 use crate::error::{Error, LogError, Result};
 use crate::{Index, Term};
@@ -21,28 +27,51 @@ pub struct LogEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Log {
     entries: Vec<LogEntry>,
+    base_index: Index,
+    base_term: Term,
 }
 
 impl Log {
     pub fn new() -> Self {
-        Log { entries: Vec::new() }
+        Log::default()
     }
 
-    /// Index of the last entry (0 when empty); pure.
+    /// An empty log that starts after the snapshot `(base_index, base_term)`.
+    pub fn with_base(base_index: Index, base_term: Term) -> Self {
+        Log {
+            entries: Vec::new(),
+            base_index,
+            base_term,
+        }
+    }
+
+    /// Index of the last entry the log has dropped (0 if never compacted).
+    pub fn base_index(&self) -> Index {
+        self.base_index
+    }
+
+    /// Term of the entry at [`Log::base_index`].
+    pub fn base_term(&self) -> Term {
+        self.base_term
+    }
+
+    /// Index of the last entry (the base when no entry is held); pure.
     pub fn last_index(&self) -> Index {
-        self.entries.len() as Index
+        self.base_index + self.entries.len() as Index
     }
 
-    /// Term of the last entry (0 when empty); pure.
+    /// Term of the last entry (the base term when no entry is held); pure.
     pub fn last_term(&self) -> Term {
-        self.entries.last().map_or(0, |e| e.term)
+        self.entries.last().map_or(self.base_term, |e| e.term)
     }
 
-    /// Term at `index`: `Some(0)` for the sentinel 0, `None` past the end; pure.
+    /// Term at `index`: the base term at the base (`Some(0)` for 0 on a log
+    /// never compacted), `None` below it and past the end; pure.
     pub fn term_at(&self, index: Index) -> Option<Term> {
-        match index {
-            0 => Some(0),
-            i => self.get(i).map(|e| e.term),
+        if index == self.base_index {
+            Some(self.base_term)
+        } else {
+            self.get(index).map(|e| e.term)
         }
     }
 
@@ -54,36 +83,36 @@ impl Log {
         }))
     }
 
-    /// All entries, in index order (`entries()[i].index == i + 1`).
+    /// The entries held, in index order (`entries()[i].index == base_index + i + 1`).
     pub fn entries(&self) -> &[LogEntry] {
         &self.entries
     }
 
+    /// The entry at `index`; `None` at or below the base and past the end.
     pub fn get(&self, index: Index) -> Option<&LogEntry> {
-        if index == 0 {
-            None
-        } else {
-            self.entries.get((index - 1) as usize)
-        }
+        let offset = index.checked_sub(self.base_index + 1)?;
+        self.entries.get(offset as usize)
     }
 
+    /// The entries with index in `(from, to]`; `from` must not be below the base.
     pub fn entries_after(&self, from: Index, to: Index) -> Result<Vec<LogEntry>> {
         if from >= to {
             return Ok(Vec::new());
         }
-        if to > self.last_index() {
+        if (to > self.last_index()) | (from < self.base_index) {
             return Err(Error::LogInconsistency(LogError::InvalidRange {
                 from,
                 to,
                 last: self.last_index(),
             }));
         }
-        Ok(self.entries[from as usize..to as usize].to_vec())
+        let (lo, hi) = (from - self.base_index, to - self.base_index);
+        Ok(self.entries[lo as usize..hi as usize].to_vec())
     }
 
     /// Checks, without mutating, that `append(entries)` would succeed: entry
-    /// indices are consecutive, the first is in `1..=last_index() + 1`, and
-    /// terms are non-decreasing from `term_at(first - 1)` through the batch.
+    /// indices are consecutive, the first is in `base_index + 1..=last_index() + 1`,
+    /// and terms are non-decreasing from `term_at(first - 1)` through the batch.
     pub fn check_append(&self, entries: &[LogEntry]) -> Result<()> {
         let Some(first) = entries.first() else {
             return Ok(());
@@ -135,11 +164,35 @@ impl Log {
             .map(|e| e.index)
     }
 
-    /// Drops every entry with index `> index` (no-op if `index >= last_index()`).
+    /// Drops every entry with index `> index`, never past the base (no-op if
+    /// `index >= last_index()`).
     pub fn truncate_after(&mut self, index: Index) {
-        self.entries.truncate(index.min(self.last_index()) as usize);
+        let keep = index.min(self.last_index()).saturating_sub(self.base_index);
+        self.entries.truncate(keep as usize);
     }
 
+    /// Moves the base to the snapshot `(index, term)`, which must be above
+    /// the current base. If the log has the entry `index` with term `term`,
+    /// the entries after it are kept; otherwise the snapshot replaces the
+    /// whole log, which is left empty. Atomic.
+    pub fn install_snapshot(&mut self, index: Index, term: Term) -> Result<()> {
+        if index <= self.base_index {
+            return Err(Error::LogInconsistency(LogError::NotAboveBase {
+                index,
+                base: self.base_index,
+            }));
+        }
+        let kept = match self.term_at(index) == Some(term) {
+            true => self.entries.split_off((index - self.base_index) as usize),
+            false => Vec::new(),
+        };
+        self.entries = kept;
+        self.base_index = index;
+        self.base_term = term;
+        Ok(())
+    }
+
+    /// Number of entries held (not counting the compacted ones).
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -159,6 +212,21 @@ mod tests {
             term: t,
             data: vec![i as u8],
         }
+    }
+
+    /// The documented invariants, for any base.
+    fn invariants(l: &Log) -> bool {
+        let b = l.base_index();
+        l.entries()
+            .iter()
+            .enumerate()
+            .all(|(i, x)| x.index == b + i as Index + 1)
+            && l.entries().windows(2).all(|w| w[0].term <= w[1].term)
+            && l.entries().first().is_none_or(|x| x.term >= l.base_term())
+            && l.term_at(b) == Some(l.base_term())
+            && (b == 0 || l.term_at(b - 1).is_none())
+            && l.term_at(l.last_index() + 1).is_none()
+            && l.last_index() == b + l.len() as Index
     }
 
     #[test]
@@ -242,5 +310,113 @@ mod tests {
             assert_eq!(l.get(i).unwrap().index, i);
             assert!(l.term_at(i - 1) <= l.term_at(i));
         }
+    }
+
+    #[test]
+    fn snapshots_move_the_base() {
+        let mut l = Log::new();
+        l.append(&[e(1, 1), e(2, 1), e(3, 2), e(4, 2)]).unwrap();
+        // A snapshot the log agrees with keeps the suffix.
+        let mut a = l.clone();
+        a.install_snapshot(2, 1).unwrap();
+        assert_eq!((a.base_index(), a.base_term(), a.last_index(), a.len()), (2, 1, 4, 2));
+        assert_eq!(
+            (a.term_at(1), a.term_at(2), a.term_at(3), a.last_term()),
+            (None, Some(1), Some(2), 2)
+        );
+        assert!(a.get(2).is_none() && a.get(0).is_none());
+        assert_eq!(a.get(3).unwrap().index, 3);
+        assert_eq!(a.entries(), &[e(3, 2), e(4, 2)]);
+        assert!(invariants(&a));
+        // One that disagrees at the base term, or lies beyond the log,
+        // replaces the log.
+        for (index, term, last_term) in [(2, 9, 9), (7, 2, 2)] {
+            let mut b = l.clone();
+            b.install_snapshot(index, term).unwrap();
+            assert_eq!(
+                (b.base_index(), b.last_index(), b.last_term(), b.len()),
+                (index, index, last_term, 0)
+            );
+            assert!(invariants(&b));
+        }
+        // The base must move forward.
+        let before = a.clone();
+        for index in [0, 1, 2] {
+            let err = a.install_snapshot(index, 1).unwrap_err();
+            assert_eq!(err, Error::LogInconsistency(LogError::NotAboveBase { index, base: 2 }));
+            assert_eq!(a, before);
+        }
+        // Reading and appending past a base.
+        assert_eq!(a.entries_after(2, 4).unwrap(), vec![e(3, 2), e(4, 2)]);
+        assert_eq!(a.entries_after(3, 4).unwrap(), vec![e(4, 2)]);
+        assert!(a.entries_after(1, 4).is_err(), "below the base");
+        assert!(a.entries_after(2, 5).is_err());
+        assert!(a.entries_after(1, 1).unwrap().is_empty());
+        a.append(&[e(3, 2), e(4, 2), e(5, 3)]).unwrap();
+        assert_eq!(a.last_index(), 5);
+        // The base cannot be appended to or conflicted with.
+        assert!(a.append(&[e(2, 1)]).is_err());
+        assert!(a.append(&[e(1, 1)]).is_err());
+        // Truncation stops at the base.
+        a.truncate_after(0);
+        assert_eq!((a.base_index(), a.last_index()), (2, 2));
+        assert_eq!(Log::with_base(5, 3).last_term(), 3);
+        assert_eq!(Log::with_base(5, 3).term_at(5), Some(3));
+        assert_eq!(Log::with_base(5, 3).last_index(), 5);
+    }
+
+    /// Appending to a log with any base keeps the invariants, or fails and
+    /// changes nothing: every base up to 2, prefix of up to 2 entries and
+    /// batch of up to 3 entries over indices 0..=6 and terms 0..=2.
+    #[test]
+    fn append_with_a_base_is_exhaustively_safe() {
+        let items: Vec<(Index, Term)> = (0..=6).flat_map(|i| (0..=2).map(move |t| (i, t))).collect();
+        let mut batches: Vec<Vec<(Index, Term)>> = vec![vec![]];
+        for &a in &items {
+            batches.push(vec![a]);
+            for &b in &items {
+                batches.push(vec![a, b]);
+                for &c in &items {
+                    batches.push(vec![a, b, c]);
+                }
+            }
+        }
+        let mut checked = 0;
+        for base in 0..=2u64 {
+            for base_term in 0..=2 {
+                for prefix in [
+                    vec![],
+                    vec![0],
+                    vec![1],
+                    vec![2],
+                    vec![0, 1],
+                    vec![1, 1],
+                    vec![1, 2],
+                    vec![2, 2],
+                ] {
+                    let mut log = Log::with_base(base, base_term);
+                    let initial: Vec<LogEntry> = prefix.iter().zip(base + 1..).map(|(&t, i)| e(i, t)).collect();
+                    if log.append(&initial).is_err() {
+                        continue;
+                    }
+                    for batch in &batches {
+                        let batch: Vec<LogEntry> = batch.iter().map(|&(i, t)| e(i, t)).collect();
+                        let before = log.clone();
+                        let mut after = log.clone();
+                        match after.append(&batch) {
+                            Err(_) => assert_eq!(after, before),
+                            Ok(()) => {
+                                assert!(invariants(&after), "{before:?} + {batch:?}");
+                                assert!(batch.iter().all(|x| after.term_at(x.index) == Some(x.term)));
+                                // Nothing at or below the base is ever touched.
+                                assert_eq!((after.base_index(), after.base_term()), (base, base_term));
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 100_000);
     }
 }

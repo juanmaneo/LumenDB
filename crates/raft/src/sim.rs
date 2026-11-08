@@ -13,8 +13,14 @@
 //!   committed in a term below `T`;
 //! - state machine safety: no two replicas ever commit or apply different
 //!   entries at one index, and entries are applied in index order;
+//! - linearizable reads: an answered read, even from a stale leader that was
+//!   asked, includes everything committed when it was asked;
+//! - snapshots: every replica has a state machine (a hash of the entries it
+//!   applied) that it snapshots, compacting its log, and restores from the
+//!   snapshot after a restart or when a leader sends one. No two replicas
+//!   may ever have different state at the same index;
 //! - log matching (every few ticks): two logs with the same term at an index
-//!   are identical up to it.
+//!   are identical up to it, over the part both still have.
 //!
 //! Then faults stop, every replica restarts and the cluster must converge:
 //! one leader, nobody recovering, identical logs and commit indices.
@@ -24,9 +30,9 @@
 
 use crate::error::Error;
 use crate::log::LogEntry;
-use crate::message::Message;
+use crate::message::{Message, MsgType};
 use crate::node::{Config, Node, NodeState, ReadState};
-use crate::storage::FileStorage;
+use crate::storage::{FileStorage, Snapshot};
 use crate::{Index, NodeId, Term};
 use flashkv::env::Env;
 use flashkv::memenv::MemEnv;
@@ -60,6 +66,8 @@ pub struct Faults {
     pub propose: u32,
     /// Per tick: a client asks the leader for a linearizable read.
     pub read: u32,
+    /// Per replica and tick: snapshot the state machine and compact the log.
+    pub snapshot: u32,
 }
 
 impl Default for Faults {
@@ -75,6 +83,7 @@ impl Default for Faults {
             downtime: (5, 60),
             propose: 300_000,
             read: 150_000,
+            snapshot: 30_000,
         }
     }
 }
@@ -120,6 +129,13 @@ pub struct Report {
     pub reads_served: u64,
     /// Reads that failed because the leader lost its leadership first.
     pub reads_failed: u64,
+    /// Snapshots taken, each compacting a log.
+    pub snapshots: u64,
+    /// InstallSnapshot messages sent by leaders to followers behind their log.
+    pub snapshots_sent: u64,
+    /// Snapshots the state machine was restored from: after a restart, or
+    /// sent by a leader to a follower that needed compacted entries.
+    pub restores: u64,
 }
 
 impl Report {
@@ -136,13 +152,17 @@ impl Report {
         self.dropped += o.dropped;
         self.reads_served += o.reads_served;
         self.reads_failed += o.reads_failed;
+        self.snapshots += o.snapshots;
+        self.snapshots_sent += o.snapshots_sent;
+        self.restores += o.restores;
     }
 
     /// The counters, without the seed.
     pub fn summary(&self) -> String {
         format!(
             "committed {}, elections {}, crashes {}, corruptions {}, recoveries {}, io errors {}, \
-             partitions {}, reads {} served / {} failed, messages {} delivered / {} dropped",
+             partitions {}, reads {} served / {} failed, snapshots {} taken / {} sent / {} restored, \
+             messages {} delivered / {} dropped",
             self.committed,
             self.elections,
             self.crashes,
@@ -152,6 +172,9 @@ impl Report {
             self.partitions,
             self.reads_served,
             self.reads_failed,
+            self.snapshots,
+            self.snapshots_sent,
+            self.restores,
             self.delivered,
             self.dropped
         )
@@ -197,31 +220,62 @@ impl Rng {
     }
 }
 
+/// The state machine of a replica: a hash of every entry applied, in order.
+fn fold(digest: u64, e: &LogEntry) -> u64 {
+    let mut h = digest ^ e.index.rotate_left(21) ^ e.term.rotate_left(42);
+    for &b in &e.data {
+        h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    h.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (h >> 29)
+}
+
 /// The safety oracle: everything any replica ever reported.
 #[derive(Default)]
 struct Checker {
     leaders: BTreeMap<Term, NodeId>,
     /// Each committed entry, with the lowest term it was seen committed in.
     committed: BTreeMap<Index, (LogEntry, Term)>,
+    /// The state machine (digest) after each index, as first seen.
+    states: BTreeMap<Index, u64>,
 }
+
+/// A log as the simulator sees it: where it starts, and its entries.
+type LogView = (Index, Vec<LogEntry>);
 
 impl Checker {
     /// `id` leads `term`; returns whether that is news. A new leader must
     /// hold every entry committed in an earlier term.
-    fn leader(&mut self, id: NodeId, term: Term, log: &dyn Fn() -> Vec<LogEntry>) -> Result<bool, String> {
+    fn leader(&mut self, id: NodeId, term: Term, log: &dyn Fn() -> LogView) -> Result<bool, String> {
         match self.leaders.entry(term) {
             Entry::Occupied(o) if *o.get() == id => Ok(false),
             Entry::Occupied(o) => Err(format!("two leaders in term {term}: {} and {id}", o.get())),
             Entry::Vacant(v) => {
                 v.insert(id);
-                let log = log();
-                for (&i, (e, t)) in &self.committed {
-                    if (*t < term) & (log.get(i as usize - 1) != Some(e)) {
+                let (base, entries) = log();
+                // Entries a snapshot covers are checked through the states.
+                for (&i, (e, t)) in self.committed.range(base + 1..) {
+                    if (*t < term) & (entries.get((i - base - 1) as usize) != Some(e)) {
                         return Err(format!("leader {id} of term {term} lacks committed entry {i}"));
                     }
                 }
                 Ok(true)
             }
+        }
+    }
+
+    /// `id` has state `digest` after applying up to index `n`: every replica
+    /// must agree on it.
+    fn state(&mut self, id: NodeId, n: Index, digest: u64) -> Result<(), String> {
+        match self.states.entry(n) {
+            Entry::Vacant(v) => {
+                v.insert(digest);
+                Ok(())
+            }
+            Entry::Occupied(o) if *o.get() == digest => Ok(()),
+            Entry::Occupied(o) => Err(format!(
+                "replica {id} has state {digest:016x} at index {n}, others have {:016x}",
+                o.get()
+            )),
         }
     }
 
@@ -259,17 +313,27 @@ impl Checker {
     }
 }
 
-/// Log matching over every pair of `logs`.
-fn log_matching(logs: &[Vec<LogEntry>]) -> Result<(), String> {
+/// The entries of `log` after index `floor` (which is at least its base).
+fn after(log: &LogView, floor: Index) -> &[LogEntry] {
+    &log.1[(floor - log.0) as usize..]
+}
+
+/// Log matching over every pair of `logs`, on the part both still have.
+fn log_matching(logs: &[LogView]) -> Result<(), String> {
     for (a, x) in logs.iter().enumerate() {
         for y in &logs[a + 1..] {
-            let common = x.len().min(y.len());
-            let same = (0..common).rev().find(|&i| x[i].term == y[i].term);
-            if let Some(i) = same.filter(|&i| x[..=i] != y[..=i]) {
+            let floor = x.0.max(y.0);
+            let (xs, ys) = (
+                after(x, floor.min(x.0 + x.1.len() as Index)),
+                after(y, floor.min(y.0 + y.1.len() as Index)),
+            );
+            let common = xs.len().min(ys.len());
+            let same = (0..common).rev().find(|&i| xs[i].term == ys[i].term);
+            if let Some(i) = same.filter(|&i| xs[..=i] != ys[..=i]) {
                 return Err(format!(
                     "logs share term {} at index {} but differ up to it",
-                    x[i].term,
-                    i + 1
+                    xs[i].term,
+                    floor + i as Index + 1
                 ));
             }
         }
@@ -281,8 +345,11 @@ struct Replica {
     env: MemEnv,
     node: Option<Node>,
     down_until: u64,
-    /// Entries applied in this incarnation.
+    /// Index the state machine is at in this incarnation: entries applied,
+    /// or the snapshot it was restored from plus the entries after it.
     applied: Index,
+    /// The state machine: a hash of everything applied, see [`fold`].
+    digest: u64,
     /// Commit index already reported to the checker in this incarnation.
     seen_commit: Index,
     /// Corrupted and not yet caught up (counts against the minority bound).
@@ -319,6 +386,7 @@ impl Sim {
                 node: None,
                 down_until: 0,
                 applied: 0,
+                digest: 0,
                 seen_commit: 0,
                 damaged: false,
             })
@@ -365,13 +433,21 @@ impl Sim {
                 None => {}
                 Some(Ok(out)) => {
                     self.observe(i)?;
-                    let r = &mut self.replicas[i];
+                    if let Some(snapshot) = &out.snapshot {
+                        self.restore(i, snapshot)?;
+                    }
+                    let (id, r) = (i as NodeId + 1, &mut self.replicas[i]);
                     for e in &out.committed {
                         r.applied += 1;
-                        self.check.apply(i as NodeId + 1, r.applied, e)?;
+                        self.check.apply(id, r.applied, e)?;
+                        r.digest = fold(r.digest, e);
+                        self.check.state(id, r.applied, r.digest)?;
                     }
                     for read in &out.reads {
                         self.answered(i, read)?;
+                    }
+                    if self.rng.chance(self.cfg.faults.snapshot) {
+                        self.take_snapshot(i)?;
                     }
                     self.send(out.messages);
                 }
@@ -392,11 +468,45 @@ impl Sim {
         Ok(())
     }
 
-    fn logs(&self) -> Vec<Vec<LogEntry>> {
+    fn logs(&self) -> Vec<LogView> {
         self.replicas
             .iter()
-            .filter_map(|r| r.node.as_ref().map(|n| n.log_snapshot().1))
+            .filter_map(|r| r.node.as_ref().map(|n| (n.snapshot_index(), n.log_snapshot().1)))
             .collect()
+    }
+
+    /// Replica `i`'s state machine is replaced by the snapshot's.
+    fn restore(&mut self, i: usize, snapshot: &Snapshot) -> Result<(), String> {
+        let id = i as NodeId + 1;
+        let digest = <[u8; 8]>::try_from(&snapshot.data[..])
+            .map(u64::from_le_bytes)
+            .map_err(|_| {
+                format!(
+                    "replica {id} got a snapshot with {} bytes of state",
+                    snapshot.data.len()
+                )
+            })?;
+        let r = &mut self.replicas[i];
+        (r.applied, r.digest) = (snapshot.index, digest);
+        self.check.state(id, snapshot.index, digest)?;
+        self.report.restores += 1;
+        Ok(())
+    }
+
+    /// Replica `i` snapshots its state machine, which drops its log up to there.
+    fn take_snapshot(&mut self, i: usize) -> Result<(), String> {
+        let r = &self.replicas[i];
+        let node = r.node.as_ref().expect("a replica that just ticked is up");
+        if r.applied <= node.snapshot_index() {
+            return Ok(());
+        }
+        match node.compact(r.applied, r.digest.to_le_bytes().to_vec()) {
+            Ok(()) => {
+                self.report.snapshots += 1;
+                Ok(())
+            }
+            Err(e) => self.failed(i, e),
+        }
     }
 
     fn inject(&mut self) {
@@ -447,8 +557,9 @@ impl Sim {
         let r = &mut self.replicas[i];
         r.damaged = node.recovering();
         r.node = Some(node);
-        r.applied = 0;
-        r.seen_commit = 0;
+        // The state machine starts empty; a stored snapshot is restored by
+        // the node's first tick.
+        (r.applied, r.digest, r.seen_commit) = (0, 0, 0);
         Ok(())
     }
 
@@ -493,13 +604,16 @@ impl Sim {
         let r = &mut self.replicas[i];
         let node = r.node.as_ref().expect("observed replicas are up");
         let (id, term, commit) = (node.id(), node.term(), node.commit_index());
-        if (node.role() == NodeState::Leader) && self.check.leader(id, term, &|| node.log_snapshot().1)? {
+        let view = || (node.snapshot_index(), node.log_snapshot().1);
+        if (node.role() == NodeState::Leader) && self.check.leader(id, term, &view)? {
             self.report.elections += 1;
         }
         if commit > r.seen_commit {
-            let log = node.log_snapshot().1;
+            // Entries a snapshot covers were never in this log to see.
+            let log = view();
+            let from = r.seen_commit.max(log.0);
             self.check
-                .commit(id, term, &log[r.seen_commit as usize..commit as usize])?;
+                .commit(id, term, &log.1[(from - log.0) as usize..(commit - log.0) as usize])?;
             r.seen_commit = commit;
         }
         if r.damaged & !node.recovering() {
@@ -578,6 +692,7 @@ impl Sim {
     fn send(&mut self, messages: Vec<Message>) {
         let f = &self.cfg.faults;
         for m in messages {
+            self.report.snapshots_sent += (m.msg_type == MsgType::InstallSnapshot) as u64;
             let faulty = self.now < self.cfg.ticks;
             if faulty & self.rng.chance(f.drop) {
                 self.report.dropped += 1;
@@ -620,25 +735,29 @@ impl Sim {
     }
 
     /// After healing: every replica up and caught up, one leader, identical
-    /// logs and commit indices.
+    /// logs (past the newest snapshot), commit indices and state machines.
     fn converged(&mut self) -> Result<(), String> {
         let nodes: Vec<&Node> = self.replicas.iter().filter_map(|r| r.node.as_ref()).collect();
         let logs = self.logs();
         let leaders = nodes.iter().filter(|n| n.role() == NodeState::Leader).count();
         let commits: Vec<Index> = nodes.iter().map(|n| n.commit_index()).collect();
         let recovering = nodes.iter().filter(|n| n.recovering()).count();
+        let machines: Vec<(Index, u64)> = self.replicas.iter().map(|r| (r.applied, r.digest)).collect();
+        let floor = logs.iter().map(|l| l.0).max().unwrap_or(0);
+        let lasts: Vec<Index> = logs.iter().map(|l| l.0 + l.1.len() as Index).collect();
         let ok = (nodes.len() == self.replicas.len())
             & (leaders == 1)
             & (recovering == 0)
-            & logs.windows(2).all(|w| w[0] == w[1])
-            & commits.windows(2).all(|w| w[0] == w[1]);
+            & lasts.windows(2).all(|w| w[0] == w[1])
+            & logs.windows(2).all(|w| after(&w[0], floor) == after(&w[1], floor))
+            & commits.windows(2).all(|w| w[0] == w[1])
+            & machines.windows(2).all(|w| w[0] == w[1]);
         if !ok {
             return Err(format!(
                 "no convergence after healing: {} of {} up, {leaders} leaders, {recovering} recovering, \
-                 log lengths {:?}, commit indices {commits:?}",
+                 last indices {lasts:?}, commit indices {commits:?}, state machines {machines:x?}",
                 nodes.len(),
                 self.replicas.len(),
-                logs.iter().map(Vec::len).collect::<Vec<_>>()
             ));
         }
         self.report.committed = commits[0];
@@ -677,6 +796,10 @@ mod tests {
         assert!(total.corruptions > 5, "{total}");
         assert!(total.reads_served > 100, "{total}");
         assert!(total.reads_failed > 0, "{total}");
+        assert!(
+            total.snapshots > 100 && total.snapshots_sent > 10 && total.restores > 10,
+            "{total}"
+        );
         assert!(total.recoveries > 0, "{total}");
         assert!(total.io_errors > 0, "{total}");
         assert!(total.partitions > 0, "{total}");
@@ -725,17 +848,33 @@ mod tests {
     #[test]
     fn checker_catches_violations() {
         let mut c = Checker::default();
-        assert_eq!(c.leader(1, 1, &Vec::new), Ok(true));
-        assert_eq!(c.leader(1, 1, &Vec::new), Ok(false));
-        assert!(c.leader(2, 1, &Vec::new).unwrap_err().contains("two leaders in term 1"));
+        let empty = || (0, Vec::new());
+        assert_eq!(c.leader(1, 1, &empty), Ok(true));
+        assert_eq!(c.leader(1, 1, &empty), Ok(false));
+        assert!(c.leader(2, 1, &empty).unwrap_err().contains("two leaders in term 1"));
         c.commit(1, 2, &[e(1, 1), e(2, 2)]).unwrap();
         c.commit(2, 1, &[e(1, 1)]).unwrap();
         assert_eq!(c.committed[&1].1, 1, "lowest term kept");
         assert!(c.commit(3, 3, &[e(2, 3)]).unwrap_err().contains("different entry 2"));
         // Entry 2 was seen committed in term 2: a term-2 leader need not have it.
-        assert_eq!(c.leader(3, 2, &|| vec![e(1, 1)]), Ok(true));
-        let lacking = c.leader(3, 3, &|| vec![e(1, 1)]).unwrap_err();
+        assert_eq!(c.leader(3, 2, &|| (0, vec![e(1, 1)])), Ok(true));
+        let lacking = c.leader(3, 3, &|| (0, vec![e(1, 1)])).unwrap_err();
         assert!(lacking.contains("lacks committed entry 2"), "{lacking}");
+        // A leader whose snapshot covers the entries is not asked for them
+        // (the states are compared instead), but must have what follows.
+        assert_eq!(c.leader(3, 4, &|| (2, vec![])), Ok(true));
+        c.commit(1, 1, &[e(3, 1)]).unwrap();
+        let lacking = c.leader(3, 5, &|| (2, vec![e(3, 2)])).unwrap_err();
+        assert!(lacking.contains("lacks committed entry 3"), "{lacking}");
+        assert_eq!(c.leader(3, 6, &|| (2, vec![e(3, 1)])), Ok(true));
+        // States must agree at every index.
+        c.state(1, 5, 0xabc).unwrap();
+        c.state(2, 5, 0xabc).unwrap();
+        let diverged = c.state(3, 5, 0xdef).unwrap_err();
+        assert!(
+            diverged.contains("replica 3 has state 0000000000000def at index 5"),
+            "{diverged}"
+        );
         c.apply(1, 1, &e(1, 1)).unwrap();
         assert!(c.apply(1, 2, &e(1, 1)).is_err());
         assert!(c.apply(1, 2, &e(2, 9)).is_err());
@@ -747,9 +886,23 @@ mod tests {
         let a = vec![e(1, 1), e(2, 1), e(3, 2)];
         let mut b = a.clone();
         b[0].data = b"other".to_vec();
-        assert!(log_matching(&[a.clone(), a[..2].to_vec(), vec![e(1, 1), e(2, 3)]]).is_ok());
-        assert!(log_matching(&[a.clone(), vec![]]).is_ok());
-        assert!(log_matching(&[a, b]).unwrap_err().contains("term 2 at index 3"));
+        let whole = |entries: Vec<LogEntry>| (0, entries);
+        assert!(log_matching(&[whole(a.clone()), whole(a[..2].to_vec()), whole(vec![e(1, 1), e(2, 3)])]).is_ok());
+        assert!(log_matching(&[whole(a.clone()), whole(vec![])]).is_ok());
+        assert!(log_matching(&[whole(a.clone()), whole(b.clone())])
+            .unwrap_err()
+            .contains("term 2 at index 3"));
+        // Logs compare on the part both still have: the one that starts
+        // later has dropped the divergence below its base...
+        assert!(log_matching(&[whole(b.clone()), (1, a[1..].to_vec())]).is_ok());
+        assert!(log_matching(&[(2, a[2..].to_vec()), whole(b.clone())]).is_ok());
+        // ... but not one above it.
+        let mut c = a.clone();
+        c[1].data = b"other".to_vec();
+        let err = log_matching(&[whole(a.clone()), (1, c[1..].to_vec())]).unwrap_err();
+        assert!(err.contains("term 2 at index 3"), "{err}");
+        // A log that ends before the other starts has nothing to compare.
+        assert!(log_matching(&[whole(vec![e(1, 1)]), (5, vec![e(6, 9)])]).is_ok());
     }
 
     fn started(cfg: SimConfig) -> Sim {
@@ -928,6 +1081,90 @@ mod tests {
         node.read_index().unwrap();
         let err = sim.tick().unwrap_err();
         assert!(err.contains("that it was never asked"), "{err}");
+    }
+
+    /// A single replica that leads, driven by its node directly so that the
+    /// simulator has seen nothing of it, and that the simulator leaves alone.
+    fn idle_leader(faults: Faults) -> Sim {
+        let sim = started(SimConfig {
+            faults: Faults {
+                propose: 0,
+                read: 0,
+                crash: 0,
+                io_error: 0,
+                ..faults
+            },
+            ..quick(1)
+        });
+        let node = sim.replicas[0].node.as_ref().unwrap();
+        while node.role() != NodeState::Leader {
+            node.tick().unwrap();
+        }
+        sim
+    }
+
+    /// An [`idle_leader`] with one entry committed and handed out by its node.
+    fn leader_with_an_unseen_entry(faults: Faults) -> Sim {
+        let sim = idle_leader(faults);
+        let node = sim.replicas[0].node.as_ref().unwrap();
+        node.propose(b"a".to_vec()).unwrap();
+        assert_eq!(node.tick().unwrap().committed.len(), 1);
+        sim
+    }
+
+    #[test]
+    fn snapshot_errors_are_violations() {
+        let snapshot = |data: &[u8]| Snapshot {
+            index: 1,
+            term: 1,
+            data: data.to_vec(),
+        };
+        let mut sim = started(quick(1));
+        let err = sim.restore(0, &snapshot(&[1, 2, 3])).unwrap_err();
+        assert!(err.contains("replica 1 got a snapshot with 3 bytes of state"), "{err}");
+        // ... also when it is a stored snapshot restored by the first tick
+        // after a restart.
+        let mut sim = leader_with_an_unseen_entry(Faults::default());
+        sim.replicas[0]
+            .node
+            .as_ref()
+            .unwrap()
+            .compact(1, vec![1, 2, 3])
+            .unwrap();
+        sim.crash(0, false);
+        sim.replicas[0].down_until = 0;
+        let err = (0..5).find_map(|_| sim.tick().err()).unwrap();
+        assert!(err.contains("3 bytes of state"), "{err}");
+        // A replica that cannot store its snapshot fails the run, from
+        // `take_snapshot` and from the tick that takes one.
+        let faults = Faults {
+            snapshot: 1_000_000,
+            ..Faults::default()
+        };
+        let mut sim = leader_with_an_unseen_entry(faults);
+        sim.replicas[0].applied = 1;
+        sim.replicas[0].env.fail_after(0);
+        sim.replicas[0].env = MemEnv::new();
+        let err = sim.tick().unwrap_err();
+        assert!(err.starts_with("replica 1 failed: "), "{err}");
+        // Replicas with different state machines at one index: from the
+        // entries a tick applies, and from a snapshot restored.
+        let mut sim = idle_leader(Faults::default());
+        sim.replicas[0].node.as_ref().unwrap().propose(b"a".to_vec()).unwrap();
+        sim.check.states.insert(1, 0xbad);
+        let err = sim.tick().unwrap_err();
+        assert!(
+            err.contains("replica 1 has state") && err.contains("at index 1, others have 0000000000000bad"),
+            "{err}"
+        );
+        let mut sim = started(quick(1));
+        sim.check.states.insert(1, 5);
+        let err = sim.restore(0, &snapshot(&6u64.to_le_bytes())).unwrap_err();
+        assert!(err.contains("others have 0000000000000005"), "{err}");
+        // A replica that is already at its snapshot has nothing to take.
+        let mut sim = leader_with_an_unseen_entry(Faults::default());
+        assert_eq!(sim.take_snapshot(0), Ok(()));
+        assert_eq!(sim.report.snapshots, 0);
     }
 
     #[test]

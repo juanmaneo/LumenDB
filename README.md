@@ -113,6 +113,20 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   leader first needs an entry of its own term committed; the first read
   appends an empty entry for that and asks the caller to retry, so
   applications that read must ignore entries with empty data.
+- **Snapshots and log compaction.** The application owns the state machine,
+  so it decides when to snapshot: `Node::compact(index, data)` stores the
+  serialized state machine as of an applied index, durably, and drops the log
+  up to there. A leader whose follower needs entries it has dropped sends
+  the snapshot instead (`InstallSnapshot`, in one message, so a transport
+  must handle messages as large as a snapshot). The follower stores it, and
+  `tick()` hands it over as `TickOutcome::snapshot` to restore the state
+  machine from, before any entries after it. After a restart the first tick
+  does the same with the stored snapshot. On disk the snapshot is its own
+  file, named by index and written and synced before the state file points
+  at it, so a log rewrite never copies it and a crash leaves either the old
+  or the new pair. A snapshot that fails its checksum loses the applied
+  prefix: the node starts from an empty log, marked recovering, and is
+  caught up by the leader.
 - **Protocol-aware recovery** (TigerBeetle; Alagappan et al., FAST '18). A
   bit flip in the Raft log may have destroyed entries the node acknowledged,
   and so helped commit. The node keeps the intact prefix and is marked
@@ -130,13 +144,18 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   per term), leader completeness, state machine safety (no two replicas
   commit or apply different entries at an index), log matching, and
   linearizable reads (a read, even one sent to a stale leader, must include
-  everything committed when it was asked). Then
+  everything committed when it was asked), and snapshots (each replica has a
+  state machine, a hash of what it applied, that it snapshots, restores after
+  a restart and when a leader sends a snapshot; no two replicas may ever
+  differ in state at the same index). Then
   faults stop and the cluster must converge: one leader, nobody recovering,
   identical logs. Corruption hits a minority of replicas at a time, which is
   what the protocol can survive. A failing seed replays exactly. The check
   is real: with the recovery rule removed, 9 of 300 seeds fail with `leader
   lacks committed entry`, and a leader that confirms reads one acknowledgement
-  early fails within the first few seeds with `stale read`. `cargo test` runs a fixed set of seeds, and
+  early fails within the first few seeds with `stale read`; a snapshot that
+  never reaches the state machine, or a restart that skips the stored one,
+  fails on seed 0 with `applied entry ... not as committed`. `cargo test` runs a fixed set of seeds, and
   `cargo xtask vopr` runs many.
 - **SWIM** membership: round-robin probes, indirect `PingReq` probes,
   suspicion, death, incarnation-based refutation, and piggybacked gossip.
