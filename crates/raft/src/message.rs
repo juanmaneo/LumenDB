@@ -9,6 +9,10 @@ pub enum MsgType {
     RequestVoteReply,
     AppendEntries,
     AppendEntriesReply,
+    /// Would you vote for me in `term`? Asks without anyone changing term or
+    /// vote, so a node that cannot win never disturbs the cluster.
+    PreVote,
+    PreVoteReply,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +51,20 @@ impl Message {
             success: false,
             leader_last_index: 0,
             lc: 0,
+        }
+    }
+    /// A pre-vote asks for `term`, the term the sender would campaign in.
+    pub fn pre_vote(from: NodeId, to: NodeId, term: Term, last_idx: Index, last_term: Term) -> Self {
+        Message {
+            msg_type: MsgType::PreVote,
+            ..Self::request_vote(from, to, term, last_idx, last_term)
+        }
+    }
+    /// A grant carries the asked-for term, a refusal the sender's own term.
+    pub fn pre_vote_reply(from: NodeId, to: NodeId, term: Term, granted: bool) -> Self {
+        Message {
+            msg_type: MsgType::PreVoteReply,
+            ..Self::request_vote_reply(from, to, term, granted)
         }
     }
     pub fn request_vote_reply(from: NodeId, to: NodeId, term: Term, granted: bool) -> Self {
@@ -128,5 +146,9 @@ mod tests {
         assert_eq!(a.commit_index, 4);
         let r = Message::append_entries_reply(2, 1, 3, true, 5);
         assert!(r.success && r.match_index == 5);
+        let p = Message::pre_vote(1, 2, 4, 10, 2);
+        assert_eq!((p.msg_type, p.term, p.last_log_index), (MsgType::PreVote, 4, 10));
+        let p = Message::pre_vote_reply(2, 1, 4, true);
+        assert_eq!((p.msg_type, p.vote_granted), (MsgType::PreVoteReply, true));
     }
 }

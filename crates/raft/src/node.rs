@@ -8,6 +8,13 @@
 //! returned, so a node that crashes and restarts never votes twice in a term
 //! nor forgets an entry it acknowledged.
 //!
+//! Pre-vote (Raft thesis §9.6): a node whose election timer fires first asks
+//! its peers whether they would vote for it, without changing its term. Only
+//! with a majority of promises does it campaign. A node cut off from the
+//! cluster therefore never inflates its term, and does not depose a healthy
+//! leader when it comes back. A peer refuses while it hears from a leader, so
+//! a node that merely lost contact cannot win either.
+//!
 //! Protocol-aware recovery: if storage reports the log damaged
 //! ([`DurableState::recovering`]), entries this node acknowledged may be gone,
 //! and some of them may have been committed with its help. Such a node never
@@ -39,6 +46,8 @@ pub const MAX_BATCH: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeState {
     Follower,
+    /// Collecting pre-vote promises; the term has not changed yet.
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -59,6 +68,8 @@ pub struct Config {
     pub election_timeout_max: u64,
     pub heartbeat_interval: u64,
     pub seed: u64,
+    /// Ask for pre-votes before campaigning.
+    pub pre_vote: bool,
 }
 
 impl Config {
@@ -70,6 +81,7 @@ impl Config {
             election_timeout_max: 10,
             heartbeat_interval: 2,
             seed: 0x1234_5678_9abc_def0,
+            pre_vote: true,
         }
     }
 
@@ -81,6 +93,7 @@ impl Config {
             election_timeout_max: 20,
             heartbeat_interval: 3,
             seed: 0x0fed_cba9_8765_4321,
+            pre_vote: true,
         }
     }
 }
@@ -97,6 +110,7 @@ struct Inner {
     election_timeout: u64,
     heartbeat_elapsed: u64,
     votes: BTreeSet<NodeId>,
+    pre_votes: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, Index>,
     match_index: BTreeMap<NodeId, Index>,
     rng: u64,
@@ -156,6 +170,7 @@ impl Node {
                 election_timeout,
                 heartbeat_elapsed: 0,
                 votes: BTreeSet::new(),
+                pre_votes: BTreeSet::new(),
                 next_index: BTreeMap::new(),
                 match_index: BTreeMap::new(),
                 rng,
@@ -242,7 +257,7 @@ impl Node {
                 if s.recovering {
                     s.election_elapsed = 0;
                 } else {
-                    self.campaign(&mut s, &mut messages)?;
+                    self.start_election(&mut s, &mut messages)?;
                 }
             }
         }
@@ -258,27 +273,35 @@ impl Node {
         }
         let mut s = self.state.lock();
         s.clock.observe(msg.lc);
-        if msg.term > s.term {
+        // Asking for, or promising, a pre-vote is not a term change.
+        let pre = match msg.msg_type {
+            MsgType::PreVote => true,
+            MsgType::PreVoteReply => msg.vote_granted,
+            _ => false,
+        };
+        if (msg.term > s.term) & !pre {
             self.storage.save_vote(msg.term, None)?;
             s.term = msg.term;
             s.voted_for = None;
             s.leader_id = None;
             s.role = NodeState::Follower;
         }
-        let reply = if msg.term < s.term {
-            self.stale_reply(&s, &msg)
+        let replies: Vec<Message> = if msg.term < s.term {
+            self.stale_reply(&s, &msg).into_iter().collect()
         } else {
             match msg.msg_type {
-                MsgType::RequestVote => Some(self.on_request_vote(&mut s, &msg)?),
+                MsgType::RequestVote => vec![self.on_request_vote(&mut s, &msg)?],
                 MsgType::RequestVoteReply => {
                     self.on_vote_reply(&mut s, &msg);
-                    None
+                    Vec::new()
                 }
-                MsgType::AppendEntries => Some(self.on_append(&mut s, &msg)?),
-                MsgType::AppendEntriesReply => self.on_append_reply(&mut s, &msg),
+                MsgType::AppendEntries => vec![self.on_append(&mut s, &msg)?],
+                MsgType::AppendEntriesReply => self.on_append_reply(&mut s, &msg).into_iter().collect(),
+                MsgType::PreVote => vec![self.on_pre_vote(&s, &msg)],
+                MsgType::PreVoteReply => self.on_pre_vote_reply(&mut s, &msg)?,
             }
         };
-        Ok(reply.into_iter().map(|m| Self::send(&mut s, m)).collect())
+        Ok(replies.into_iter().map(|m| Self::send(&mut s, m)).collect())
     }
 
     fn send(s: &mut Inner, mut m: Message) -> Message {
@@ -290,8 +313,56 @@ impl Node {
         match msg.msg_type {
             MsgType::RequestVote => Some(Message::request_vote_reply(self.cfg.id, msg.from, s.term, false)),
             MsgType::AppendEntries => Some(Message::append_entries_reply(self.cfg.id, msg.from, s.term, false, 0)),
-            MsgType::RequestVoteReply | MsgType::AppendEntriesReply => None,
+            MsgType::PreVote => Some(Message::pre_vote_reply(self.cfg.id, msg.from, s.term, false)),
+            MsgType::RequestVoteReply | MsgType::AppendEntriesReply | MsgType::PreVoteReply => None,
         }
+    }
+
+    /// An election timeout: ask for pre-votes, or campaign right away when
+    /// pre-vote is off or there is nobody to ask.
+    fn start_election(&self, s: &mut Inner, out: &mut Vec<Message>) -> Result<()> {
+        if !self.cfg.pre_vote | self.peers.is_empty() {
+            return self.campaign(s, out);
+        }
+        s.role = NodeState::PreCandidate;
+        s.leader_id = None;
+        s.pre_votes.clear();
+        s.pre_votes.insert(self.cfg.id);
+        s.election_elapsed = 0;
+        s.election_timeout = random_timeout(&self.cfg, &mut s.rng);
+        let (term, last_index, last_term) = (s.term + 1, s.log.last_index(), s.log.last_term());
+        for &p in &self.peers {
+            let m = Message::pre_vote(self.cfg.id, p, term, last_index, last_term);
+            out.push(Self::send(s, m));
+        }
+        Ok(())
+    }
+
+    /// Promises a vote for `msg.from` in `msg.term` if it could win one, and
+    /// changes nothing: not the term, not the vote, not the election timer.
+    /// Refused while a leader is heard from (or this node is the leader), and
+    /// when this node is recovering.
+    fn on_pre_vote(&self, s: &Inner, msg: &Message) -> Message {
+        let up_to_date = (msg.last_log_term, msg.last_log_index) >= (s.log.last_term(), s.log.last_index());
+        // A follower forgets its leader when its own election timer fires,
+        // so a known leader means one heard from within a timeout.
+        let leased = s.leader_id.is_some();
+        let granted = (msg.term > s.term) & up_to_date & !leased & !s.recovering;
+        let term = if granted { msg.term } else { s.term };
+        Message::pre_vote_reply(self.cfg.id, msg.from, term, granted)
+    }
+
+    /// Counts a promise; with a majority, starts the real campaign.
+    fn on_pre_vote_reply(&self, s: &mut Inner, msg: &Message) -> Result<Vec<Message>> {
+        let mut out = Vec::new();
+        let current = (s.role == NodeState::PreCandidate) & msg.vote_granted & (msg.term == s.term + 1);
+        if current {
+            s.pre_votes.insert(msg.from);
+            if is_majority(s.pre_votes.len(), self.peers.len() + 1) {
+                self.campaign(s, &mut out)?;
+            }
+        }
+        Ok(out)
     }
 
     fn campaign(&self, s: &mut Inner, out: &mut Vec<Message>) -> Result<()> {
@@ -303,6 +374,7 @@ impl Node {
         s.role = NodeState::Candidate;
         s.votes.clear();
         s.votes.insert(self.cfg.id);
+        s.pre_votes.clear();
         s.election_elapsed = 0;
         s.election_timeout = random_timeout(&self.cfg, &mut s.rng);
         let (last_index, last_term) = (s.log.last_index(), s.log.last_term());
@@ -451,6 +523,14 @@ mod tests {
         }
     }
 
+    /// A cluster member that campaigns right away (no pre-vote phase).
+    fn classic(id: NodeId, voters: Vec<NodeId>) -> Config {
+        Config {
+            pre_vote: false,
+            ..Config::cluster(id, voters)
+        }
+    }
+
     /// Ticks until `node` starts an election; returns that tick's messages.
     fn campaign(node: &Node) -> Vec<Message> {
         let mut out = node.tick().unwrap();
@@ -475,10 +555,20 @@ mod tests {
 
     impl Net {
         fn new(n: u64) -> Self {
+            Self::with_pre_vote(n, true)
+        }
+
+        fn with_pre_vote(n: u64, pre_vote: bool) -> Self {
             let voters: Vec<NodeId> = (1..=n).collect();
             let nodes: Vec<Node> = voters
                 .iter()
-                .map(|&id| Node::new(Config::cluster(id, voters.clone()), MemoryStorage::new()).unwrap())
+                .map(|&id| {
+                    let cfg = Config {
+                        pre_vote,
+                        ..Config::cluster(id, voters.clone())
+                    };
+                    Node::new(cfg, MemoryStorage::new()).unwrap()
+                })
                 .collect();
             Net {
                 applied: vec![Vec::new(); nodes.len()],
@@ -656,7 +746,7 @@ mod tests {
 
     #[test]
     fn candidate_counts_votes() {
-        let node = Node::new(Config::cluster(1, vec![1, 2, 3, 4, 5]), MemoryStorage::new()).unwrap();
+        let node = Node::new(classic(1, vec![1, 2, 3, 4, 5]), MemoryStorage::new()).unwrap();
         // Vote replies to a follower are ignored.
         assert!(node
             .step(Message::request_vote_reply(2, 1, 0, true))
@@ -717,7 +807,7 @@ mod tests {
 
     #[test]
     fn leader_backs_off_and_resends() {
-        let node = Node::new(Config::cluster(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        let node = Node::new(classic(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
         node.step(Message::append_entries(2, 1, 1, 0, 0, vec![entry(1, 1, b"a")], 0))
             .unwrap();
         campaign(&node);
@@ -823,10 +913,15 @@ mod tests {
             .is_err());
         assert_eq!(n.log_snapshot().1.len(), 1);
         // Starting an election.
-        let n = Node::new(cfg(), Failing::new(1)).unwrap();
+        let n = Node::new(classic(1, vec![1, 2, 3]), Failing::new(1)).unwrap();
         let errs = (0..40).filter(|_| n.tick().is_err()).count();
         assert!(errs > 0);
         assert_eq!((n.term(), n.role()), (0, NodeState::Follower));
+        // A pre-vote majority whose campaign cannot save the vote.
+        let n = Node::new(cfg(), Failing::new(1)).unwrap();
+        pre_campaign(&n);
+        assert!(n.step(Message::pre_vote_reply(2, 1, 1, true)).is_err());
+        assert_eq!((n.term(), n.role()), (0, NodeState::PreCandidate));
         // Proposing.
         let n = Node::new(Config::single(1), Failing::new(2)).unwrap();
         leader_of(&n, 20);
@@ -845,6 +940,128 @@ mod tests {
         let n = Node::new(cfg(), Failing::with_state(3, damaged)).unwrap();
         assert!(n.step(catch_up()).unwrap()[0].success);
         assert!(!n.recovering());
+    }
+
+    /// Ticks `node` until it asks for pre-votes; returns those messages.
+    fn pre_campaign(node: &Node) -> Vec<Message> {
+        loop {
+            let out = node.tick().unwrap().messages;
+            if node.role() == NodeState::PreCandidate {
+                return out;
+            }
+        }
+    }
+
+    #[test]
+    fn pre_vote_changes_nothing_until_a_majority_promises() {
+        let storage = MemoryStorage::new();
+        let node = Node::new(Config::cluster(1, vec![1, 2, 3]), storage.clone()).unwrap();
+        let asks = pre_campaign(&node);
+        assert_eq!(asks.len(), 2);
+        assert!(asks.iter().all(|m| m.msg_type == MsgType::PreVote && m.term == 1));
+        // Asking changed neither the term nor the vote, in memory or on disk.
+        assert_eq!((node.term(), storage.load().unwrap().term), (0, 0));
+        assert_eq!(storage.load().unwrap().voted_for, None);
+        // Refusals (same term, or an older one) change nothing either.
+        assert!(node.step(Message::pre_vote_reply(2, 1, 0, false)).unwrap().is_empty());
+        assert_eq!(node.role(), NodeState::PreCandidate);
+        // A promise for a term that is not the one asked for is ignored.
+        assert!(node.step(Message::pre_vote_reply(2, 1, 7, true)).unwrap().is_empty());
+        assert_eq!(node.role(), NodeState::PreCandidate);
+        // One promise makes a majority of three: the real campaign starts.
+        let votes = node.step(Message::pre_vote_reply(2, 1, 1, true)).unwrap();
+        assert_eq!((node.role(), node.term()), (NodeState::Candidate, 1));
+        assert_eq!(votes.len(), 2);
+        assert!(votes.iter().all(|m| m.msg_type == MsgType::RequestVote && m.term == 1));
+        assert_eq!(storage.load().unwrap().voted_for, Some(1));
+        // A late promise from the other peer changes nothing.
+        assert!(node.step(Message::pre_vote_reply(3, 1, 1, true)).unwrap().is_empty());
+        // Promises to a node that is not asking are ignored.
+        let follower = Node::new(Config::cluster(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        assert!(follower
+            .step(Message::pre_vote_reply(2, 1, 1, true))
+            .unwrap()
+            .is_empty());
+        assert_eq!(follower.role(), NodeState::Follower);
+        // Without a majority of promises, a five-node asker keeps asking.
+        let five = Node::new(Config::cluster(1, vec![1, 2, 3, 4, 5]), MemoryStorage::new()).unwrap();
+        pre_campaign(&five);
+        five.step(Message::pre_vote_reply(2, 1, 1, true)).unwrap();
+        assert_eq!((five.role(), five.term()), (NodeState::PreCandidate, 0));
+        // A refusal from a node in a later term makes the asker catch up.
+        five.step(Message::pre_vote_reply(3, 1, 9, false)).unwrap();
+        assert_eq!((five.role(), five.term()), (NodeState::Follower, 9));
+    }
+
+    #[test]
+    fn pre_vote_is_granted_only_to_a_candidate_that_could_win() {
+        let mut log = Log::new();
+        log.append(&[entry(1, 2, b"a"), entry(2, 2, b"b")]).unwrap();
+        let state = |recovering| DurableState {
+            term: 2,
+            voted_for: Some(3),
+            log: log.clone(),
+            recovering,
+        };
+        let node = |recovering| {
+            let s = MemoryStorage::with_state(state(recovering));
+            (Node::new(Config::cluster(1, vec![1, 2, 3]), s.clone()).unwrap(), s)
+        };
+        let ask = |n: &Node, term, idx, last_term| {
+            let r = n.step(Message::pre_vote(2, 1, term, idx, last_term)).unwrap();
+            (r[0].msg_type, r[0].vote_granted, r[0].term)
+        };
+        let (n, s) = node(false);
+        // Promised: next term, log at least as up to date. Nothing changes,
+        // not even the vote it already gave in this term.
+        assert_eq!(ask(&n, 3, 2, 2), (MsgType::PreVoteReply, true, 3));
+        assert_eq!(ask(&n, 3, 5, 3), (MsgType::PreVoteReply, true, 3));
+        assert_eq!((n.term(), s.load().unwrap().voted_for), (2, Some(3)));
+        // Refused with our own term: log behind, or not a later term.
+        assert_eq!(ask(&n, 3, 1, 2), (MsgType::PreVoteReply, false, 2));
+        assert_eq!(ask(&n, 3, 9, 1), (MsgType::PreVoteReply, false, 2));
+        assert_eq!(ask(&n, 2, 9, 9), (MsgType::PreVoteReply, false, 2));
+        assert_eq!(ask(&n, 1, 9, 9), (MsgType::PreVoteReply, false, 2));
+        // Refused while a leader is heard from, even with a better log.
+        n.step(Message::append_entries(3, 1, 2, 2, 2, vec![], 0)).unwrap();
+        assert_eq!(ask(&n, 3, 9, 9), (MsgType::PreVoteReply, false, 2));
+        // ... and by a leader itself.
+        let leader = Node::new(Config::single(1), MemoryStorage::new()).unwrap();
+        leader_of(&leader, 20);
+        let l = Node::new(classic(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        campaign(&l);
+        let t = l.term();
+        l.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        assert_eq!(l.role(), NodeState::Leader);
+        let r = l.step(Message::pre_vote(2, 1, t + 1, 9, 9)).unwrap();
+        assert!(!r[0].vote_granted && r[0].term == t);
+        // A recovering node never promises.
+        let (n, _) = node(true);
+        assert_eq!(ask(&n, 3, 9, 9), (MsgType::PreVoteReply, false, 2));
+    }
+
+    /// What pre-vote is for: a node cut off from the cluster keeps its term,
+    /// so it cannot depose the leader when it comes back.
+    #[test]
+    fn isolated_node_does_not_disturb_the_cluster_when_it_returns() {
+        let run = |pre_vote: bool| {
+            let mut net = Net::with_pre_vote(3, pre_vote);
+            net.run(60, &[]);
+            let leader = net.leaders(&[])[0];
+            let (term, loner) = (net.node(leader).term(), (1..=3).find(|&i| i != leader).unwrap());
+            net.run(300, &[loner]);
+            let isolated_term = net.node(loner).term();
+            net.run(60, &[]);
+            let after = (net.leaders(&[]), net.node(leader).term());
+            (term, isolated_term, after, leader)
+        };
+        let (term, isolated, (leaders, now), leader) = run(true);
+        assert_eq!((isolated, now, leaders), (term, term, vec![leader]), "pre-vote on");
+        let (term, isolated, (_, now), _) = run(false);
+        assert!(
+            isolated > term + 5 && now >= isolated,
+            "classic: {term} {isolated} {now}"
+        );
     }
 
     fn damaged(term: Term, entries: &[LogEntry]) -> Arc<MemoryStorage> {

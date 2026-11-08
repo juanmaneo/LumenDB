@@ -392,8 +392,10 @@ impl Sim {
         let env: Arc<dyn Env> = Arc::new(self.replicas[i].env.clone());
         let storage =
             FileStorage::open_with_env(env, &self.dir).map_err(|e| format!("replica {id} cannot restart: {e}"))?;
+        // A cluster may mix replicas with and without pre-vote.
         let cfg = Config {
             seed: self.rng.next(),
+            pre_vote: self.rng.next() & 1 == 0,
             ..Config::cluster(id, self.voters.clone())
         };
         let node = Node::new(cfg, storage).expect("a voter, and FileStorage::load cannot fail");

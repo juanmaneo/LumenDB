@@ -96,6 +96,13 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   and entries are durable before any dependent message leaves, so a node
   never votes twice in a term. `FileStorage` uses flashkv's `Env` and record
   framing: an atomic state file plus a generation-numbered log.
+- **Pre-vote** (Raft thesis, section 9.6). A node whose election timer fires
+  first asks its peers whether they would vote for it, without changing its
+  term or vote. Only with a majority of promises does it campaign. A peer
+  refuses while it hears from a leader, and a recovering node never promises.
+  So a node cut off from the cluster keeps its term and does not depose a
+  healthy leader when it comes back. It is on by default (`Config::pre_vote`),
+  and clusters may mix nodes with and without it.
 - **Protocol-aware recovery** (TigerBeetle; Alagappan et al., FAST '18). A
   bit flip in the Raft log may have destroyed entries the node acknowledged,
   and so helped commit. The node keeps the intact prefix and is marked
