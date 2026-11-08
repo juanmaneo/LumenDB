@@ -103,6 +103,16 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   So a node cut off from the cluster keeps its term and does not depose a
   healthy leader when it comes back. It is on by default (`Config::pre_vote`),
   and clusters may mix nodes with and without it.
+- **ReadIndex** (Raft thesis, section 6.4). `Node::read_index` gives a
+  linearizable read without writing to the log. The leader notes its commit
+  index and confirms it still leads when a majority acknowledges an
+  AppendEntries of a later round, piggybacked on the normal replication
+  traffic. `tick()` then releases the read, and the state machine can answer
+  it locally. A leader cut off from the majority never confirms, so it never
+  serves a stale read, and when it is deposed its pending reads fail. A new
+  leader first needs an entry of its own term committed; the first read
+  appends an empty entry for that and asks the caller to retry, so
+  applications that read must ignore entries with empty data.
 - **Protocol-aware recovery** (TigerBeetle; Alagappan et al., FAST '18). A
   bit flip in the Raft log may have destroyed entries the node acknowledged,
   and so helped commit. The node keeps the intact prefix and is marked
@@ -118,12 +128,15 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   crashes, power loss with torn writes, bit flips in the Raft log, and I/O
   errors. After every event the simulator checks election safety (one leader
   per term), leader completeness, state machine safety (no two replicas
-  commit or apply different entries at an index), and log matching. Then
+  commit or apply different entries at an index), log matching, and
+  linearizable reads (a read, even one sent to a stale leader, must include
+  everything committed when it was asked). Then
   faults stop and the cluster must converge: one leader, nobody recovering,
   identical logs. Corruption hits a minority of replicas at a time, which is
   what the protocol can survive. A failing seed replays exactly. The check
   is real: with the recovery rule removed, 9 of 300 seeds fail with `leader
-  lacks committed entry`. `cargo test` runs a fixed set of seeds, and
+  lacks committed entry`, and a leader that confirms reads one acknowledgement
+  early fails within the first few seeds with `stale read`. `cargo test` runs a fixed set of seeds, and
   `cargo xtask vopr` runs many.
 - **SWIM** membership: round-robin probes, indirect `PingReq` probes,
   suspicion, death, incarnation-based refutation, and piggybacked gossip.

@@ -25,6 +25,17 @@
 //! the exit is made durable first. A single-node cluster has no one to copy
 //! from, so a damaged single node stays stuck: that is the correct fail-stop.
 //!
+//! ReadIndex (Raft thesis §6.4): [`Node::read_index`] gives a linearizable
+//! read without writing to the log. The leader notes its commit index, then
+//! confirms it is still the leader by getting one AppendEntries of a later
+//! round acknowledged by a majority. When the state machine has applied up to
+//! that index, `tick()` releases the read, which may then be served from local
+//! state. A leader cut off from the majority never confirms, so it can never
+//! serve a stale read. A new leader may have no entry of its own term
+//! committed yet, and then the first `read_index` appends an empty entry and
+//! asks the caller to retry; applications that read must ignore entries with
+//! empty data.
+//!
 //! Committed entries are handed out by `tick()` in index order, exactly once
 //! per process lifetime (after a restart they are replayed from index 1 as the
 //! commit index is re-learned).
@@ -58,6 +69,29 @@ pub struct TickOutcome {
     pub messages: Vec<Message>,
     /// Newly committed entries, to apply to the state machine in order.
     pub committed: Vec<LogEntry>,
+    /// Reads that are decided, see [`Node::read_index`].
+    pub reads: Vec<ReadState>,
+}
+
+/// The end of a [`Node::read_index`] request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadState {
+    /// The id `read_index` returned.
+    pub id: u64,
+    /// `Some(i)`: the leader was confirmed with commit index `i`, and every
+    /// entry up to `i` has been handed out by `tick` (`TickOutcome::committed`
+    /// of this or an earlier tick). Once the caller has applied them, a read
+    /// of the state machine is linearizable. `None`: leadership was lost
+    /// before it was confirmed; retry on the current leader.
+    pub index: Option<Index>,
+}
+
+/// A read waiting for a majority to confirm the leader.
+struct PendingRead {
+    id: u64,
+    index: Index,
+    /// Round of the AppendEntries that confirms it (`None`: not yet sent).
+    round: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +150,16 @@ struct Inner {
     rng: u64,
     clock: LamportClock,
     recovering: bool,
+    next_read_id: u64,
+    /// Last read round sent as leader.
+    read_round: u64,
+    /// The highest read round each peer acknowledged as leader.
+    read_acked: BTreeMap<NodeId, u64>,
+    reads: Vec<PendingRead>,
+    /// Confirmed reads, released by the next tick.
+    reads_ready: Vec<(u64, Index)>,
+    /// Reads abandoned because this node stopped being leader.
+    reads_failed: Vec<u64>,
 }
 
 pub struct Node {
@@ -176,6 +220,12 @@ impl Node {
                 rng,
                 clock: LamportClock::new(),
                 recovering,
+                next_read_id: 0,
+                read_round: 0,
+                read_acked: BTreeMap::new(),
+                reads: Vec::new(),
+                reads_ready: Vec::new(),
+                reads_failed: Vec::new(),
             }),
             cfg,
         })
@@ -236,17 +286,88 @@ impl Node {
         Ok(entry.index)
     }
 
+    /// Starts a linearizable read and returns its id; the answer arrives in
+    /// [`TickOutcome::reads`] (see [`ReadState`]). Ids are unique within one
+    /// process lifetime.
+    ///
+    /// Leader only. `Err(NotReady)` means the leader has no committed entry
+    /// of its own term yet, which it needs to know its commit index is
+    /// current; an empty entry has been appended for that, so retry after a
+    /// few ticks.
+    pub fn read_index(&self) -> Result<u64> {
+        let mut s = self.state.lock();
+        if s.role != NodeState::Leader {
+            return Err(Error::NotLeader(s.leader_id));
+        }
+        if s.log.term_at(s.commit_index) != Some(s.term) {
+            if s.log.last_term() != s.term {
+                let noop = LogEntry {
+                    index: s.log.last_index() + 1,
+                    term: s.term,
+                    data: Vec::new(),
+                };
+                let batch = std::slice::from_ref(&noop);
+                self.storage.append_entries(batch)?;
+                s.log.append(batch).expect("a leader appends at its own tail");
+            }
+            return Err(Error::NotReady);
+        }
+        s.next_read_id += 1;
+        s.clock.tick();
+        let (id, index) = (s.next_read_id, s.commit_index);
+        if self.peers.is_empty() {
+            s.reads_ready.push((id, index));
+        } else {
+            s.reads.push(PendingRead { id, index, round: None });
+        }
+        Ok(id)
+    }
+
+    /// A node that is no longer leader will never confirm its pending reads.
+    fn fail_unconfirmed_reads(s: &mut Inner) {
+        if s.role != NodeState::Leader {
+            let ids: Vec<u64> = s.reads.drain(..).map(|r| r.id).collect();
+            s.reads_failed.extend(ids);
+        }
+    }
+
+    /// Moves reads whose round a majority has acknowledged to `reads_ready`.
+    fn confirm_reads(&self, s: &mut Inner) {
+        let n = self.peers.len() + 1;
+        let acked: Vec<u64> = s.read_acked.values().copied().collect();
+        let confirmed = |r: &PendingRead| {
+            let acks = acked.iter().filter(|&&a| Some(a) >= r.round).count();
+            r.round.is_some() & is_majority(1 + acks, n)
+        };
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut s.reads).into_iter().partition(confirmed);
+        s.reads = waiting;
+        s.reads_ready.extend(ready.into_iter().map(|r| (r.id, r.index)));
+    }
+
     /// Advances logical time by one tick: heartbeats / replication as leader,
     /// election timeout otherwise. Returns messages and newly committed entries.
     pub fn tick(&self) -> Result<TickOutcome> {
         let mut s = self.state.lock();
         let mut messages = Vec::new();
+        Self::fail_unconfirmed_reads(&mut s);
         if s.role == NodeState::Leader {
             s.heartbeat_elapsed += 1;
-            if s.heartbeat_elapsed >= self.cfg.heartbeat_interval {
+            // Reads wait for a round that starts after they were asked.
+            let reads_due = s.reads.iter().any(|r| r.round.is_none());
+            if (s.heartbeat_elapsed >= self.cfg.heartbeat_interval) | reads_due {
                 s.heartbeat_elapsed = 0;
+                let round = if reads_due {
+                    s.read_round += 1;
+                    s.read_round
+                } else {
+                    0
+                };
+                for r in s.reads.iter_mut().filter(|r| r.round.is_none()) {
+                    r.round = Some(round);
+                }
                 for &p in &self.peers {
-                    let m = self.append_for(&s, p);
+                    let mut m = self.append_for(&s, p);
+                    m.read_ctx = round;
                     messages.push(Self::send(&mut s, m));
                 }
             }
@@ -263,7 +384,17 @@ impl Node {
         }
         let committed = s.log.entries()[s.last_applied as usize..s.commit_index as usize].to_vec();
         s.last_applied = s.commit_index;
-        Ok(TickOutcome { messages, committed })
+        // A confirmed read's index is a commit index from before this tick,
+        // and the tick has just handed out everything up to the commit index.
+        let mut reads: Vec<ReadState> = (std::mem::take(&mut s.reads_ready).into_iter())
+            .map(|(id, index)| ReadState { id, index: Some(index) })
+            .collect();
+        reads.extend(s.reads_failed.drain(..).map(|id| ReadState { id, index: None }));
+        Ok(TickOutcome {
+            messages,
+            committed,
+            reads,
+        })
     }
 
     /// Handles one message from a peer; returns the replies to send.
@@ -295,12 +426,17 @@ impl Node {
                     self.on_vote_reply(&mut s, &msg);
                     Vec::new()
                 }
-                MsgType::AppendEntries => vec![self.on_append(&mut s, &msg)?],
+                MsgType::AppendEntries => {
+                    let mut reply = self.on_append(&mut s, &msg)?;
+                    reply.read_ctx = msg.read_ctx;
+                    vec![reply]
+                }
                 MsgType::AppendEntriesReply => self.on_append_reply(&mut s, &msg).into_iter().collect(),
                 MsgType::PreVote => vec![self.on_pre_vote(&s, &msg)],
                 MsgType::PreVoteReply => self.on_pre_vote_reply(&mut s, &msg)?,
             }
         };
+        Self::fail_unconfirmed_reads(&mut s);
         Ok(replies.into_iter().map(|m| Self::send(&mut s, m)).collect())
     }
 
@@ -393,6 +529,8 @@ impl Node {
             let next = s.log.last_index() + 1;
             s.next_index = self.peers.iter().map(|&p| (p, next)).collect();
             s.match_index = self.peers.iter().map(|&p| (p, 0)).collect();
+            s.read_round = 0;
+            s.read_acked = self.peers.iter().map(|&p| (p, 0)).collect();
             // Heartbeat on the very next tick.
             s.heartbeat_elapsed = self.cfg.heartbeat_interval;
         }
@@ -490,6 +628,13 @@ impl Node {
         if s.role != NodeState::Leader {
             return None;
         }
+        // Any reply of this term shows the follower accepted this leader
+        // after the round named in `read_ctx` began.
+        if msg.read_ctx > 0 {
+            let acked = s.read_acked.entry(msg.from).or_insert(0);
+            *acked = (*acked).max(msg.read_ctx);
+            self.confirm_reads(s);
+        }
         let next = if msg.success {
             // Trust the reply even if it is lower than before: a follower
             // that lost entries to storage damage reports what it really has
@@ -551,6 +696,7 @@ mod tests {
     struct Net {
         nodes: Vec<Node>,
         applied: Vec<Vec<LogEntry>>,
+        reads: Vec<Vec<ReadState>>,
     }
 
     impl Net {
@@ -572,6 +718,7 @@ mod tests {
                 .collect();
             Net {
                 applied: vec![Vec::new(); nodes.len()],
+                reads: vec![Vec::new(); nodes.len()],
                 nodes,
             }
         }
@@ -586,6 +733,7 @@ mod tests {
                 for (i, n) in self.nodes.iter().enumerate() {
                     let out = n.tick().unwrap();
                     self.applied[i].extend(out.committed);
+                    self.reads[i].extend(out.reads);
                     q.extend(out.messages);
                 }
                 while let Some(m) = q.pop_front() {
@@ -922,6 +1070,11 @@ mod tests {
         pre_campaign(&n);
         assert!(n.step(Message::pre_vote_reply(2, 1, 1, true)).is_err());
         assert_eq!((n.term(), n.role()), (0, NodeState::PreCandidate));
+        // The empty entry a read needs.
+        let n = Node::new(Config::single(1), Failing::new(2)).unwrap();
+        leader_of(&n, 20);
+        assert_eq!(n.read_index(), Err(Error::Storage("disk gone".into())));
+        assert!(n.log_snapshot().1.is_empty());
         // Proposing.
         let n = Node::new(Config::single(1), Failing::new(2)).unwrap();
         leader_of(&n, 20);
@@ -940,6 +1093,137 @@ mod tests {
         let n = Node::new(cfg(), Failing::with_state(3, damaged)).unwrap();
         assert!(n.step(catch_up()).unwrap()[0].success);
         assert!(!n.recovering());
+    }
+
+    /// A leader of node 1 in a classic cluster of three, term and log
+    /// returned: its first entry (index 1, term `t`) is acknowledged by
+    /// node 2 and committed.
+    fn committed_leader() -> (Node, Term) {
+        let node = Node::new(classic(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        campaign(&node);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        node.propose(b"x".to_vec()).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, 1)).unwrap();
+        assert_eq!(node.commit_index(), 1);
+        (node, t)
+    }
+
+    #[test]
+    fn read_index_waits_for_a_commit_in_the_term_and_a_majority() {
+        let node = Node::new(classic(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        assert_eq!(node.read_index(), Err(Error::NotLeader(None)));
+        campaign(&node);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        // Nothing of this term is committed: an empty entry is appended once.
+        assert_eq!(node.read_index(), Err(Error::NotReady));
+        assert_eq!(node.read_index(), Err(Error::NotReady));
+        let log = node.log_snapshot().1;
+        assert_eq!((log.len(), log[0].term, log[0].data.len()), (1, t, 0));
+        node.step(Message::append_entries_reply(2, 1, t, true, 1)).unwrap();
+        assert_eq!(node.commit_index(), 1);
+        // Reads asked before a tick share the round that tick starts.
+        let a = node.read_index().unwrap();
+        let b = node.read_index().unwrap();
+        let sent = node.tick().unwrap().messages;
+        assert!(sent
+            .iter()
+            .all(|m| m.msg_type == MsgType::AppendEntries && m.read_ctx == 1));
+        assert_eq!(sent.len(), 2);
+        // An acknowledgement of an older round does not count, and neither
+        // does one without a round.
+        let reply = |from, ctx| {
+            let mut m = Message::append_entries_reply(from, 1, t, true, 1);
+            m.read_ctx = ctx;
+            m
+        };
+        node.step(reply(2, 0)).unwrap();
+        assert!(node.tick().unwrap().reads.is_empty());
+        // One acknowledgement of round 1 is a majority of three with the leader.
+        node.step(reply(3, 1)).unwrap();
+        let reads = node.tick().unwrap().reads;
+        assert_eq!(
+            reads,
+            vec![ReadState { id: a, index: Some(1) }, ReadState { id: b, index: Some(1) }]
+        );
+        assert!(node.tick().unwrap().reads.is_empty(), "released once");
+        // A reply to a later round also confirms the reads of earlier ones.
+        let c = node.read_index().unwrap();
+        node.tick().unwrap();
+        let d = node.read_index().unwrap();
+        node.tick().unwrap();
+        node.step(reply(2, 3)).unwrap();
+        let ids: Vec<u64> = node.tick().unwrap().reads.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![c, d]);
+        // The reply is echoed by a follower, and a stale one is ignored.
+        let f = Node::new(classic(2, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        let mut m = Message::append_entries(1, 2, 1, 0, 0, vec![], 0);
+        m.read_ctx = 7;
+        assert_eq!(f.step(m).unwrap()[0].read_ctx, 7);
+        assert!(f.step(reply(1, 5)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_index_fails_when_leadership_is_lost() {
+        let (node, t) = committed_leader();
+        let id = node.read_index().unwrap();
+        // Deposed before a majority confirmed it.
+        node.step(Message::request_vote(3, 1, t + 1, 9, 9)).unwrap();
+        assert_eq!(node.role(), NodeState::Follower);
+        assert_eq!(node.tick().unwrap().reads, vec![ReadState { id, index: None }]);
+        assert_eq!(node.read_index(), Err(Error::NotLeader(None)));
+        // A confirmed read survives losing leadership: it was confirmed
+        // while this node led.
+        let (node, t) = committed_leader();
+        let id = node.read_index().unwrap();
+        node.tick().unwrap();
+        let mut m = Message::append_entries_reply(3, 1, t, true, 1);
+        m.read_ctx = 1;
+        node.step(m).unwrap();
+        node.step(Message::request_vote(2, 1, t + 1, 9, 9)).unwrap();
+        assert_eq!(node.tick().unwrap().reads, vec![ReadState { id, index: Some(1) }]);
+    }
+
+    #[test]
+    fn single_node_reads_need_no_round() {
+        let node = Node::new(Config::single(1), MemoryStorage::new()).unwrap();
+        leader_of(&node, 20);
+        assert_eq!(node.read_index(), Err(Error::NotReady));
+        node.tick().unwrap();
+        assert_eq!(node.commit_index(), 1);
+        let id = node.read_index().unwrap();
+        let out = node.tick().unwrap();
+        assert_eq!(out.reads, vec![ReadState { id, index: Some(1) }]);
+        assert!(out.messages.is_empty());
+    }
+
+    #[test]
+    fn a_cut_off_leader_cannot_serve_reads() {
+        let mut net = Net::new(3);
+        net.run(60, &[]);
+        let old = net.leaders(&[])[0];
+        net.node(old).propose(b"x".to_vec()).unwrap();
+        net.run(10, &[]);
+        // A read through the connected leader completes within a few ticks.
+        let id = net.node(old).read_index().unwrap();
+        net.run(5, &[]);
+        assert_eq!(net.reads[(old - 1) as usize], vec![ReadState { id, index: Some(1) }]);
+        // Cut off, it still believes it leads but cannot confirm a read.
+        let stale = net.node(old).read_index().unwrap();
+        net.run(80, &[old]);
+        assert_eq!(net.node(old).role(), NodeState::Leader);
+        assert_eq!(net.reads[(old - 1) as usize].len(), 1, "nothing was released");
+        let new = net.leaders(&[old])[0];
+        assert_ne!(new, old);
+        // Once it hears from the new leader, the read fails instead of being
+        // answered from a possibly stale state.
+        net.run(30, &[]);
+        assert_eq!(
+            net.reads[(old - 1) as usize].last(),
+            Some(&ReadState { id: stale, index: None })
+        );
+        assert_eq!(net.node(old).role(), NodeState::Follower);
     }
 
     /// Ticks `node` until it asks for pre-votes; returns those messages.

@@ -394,37 +394,17 @@ fn vopr(a: &Args) -> Res<String> {
     let mut total = raft::sim::Report::default();
     for seed in start..start.saturating_add(seeds) {
         match raft::sim::run(seed, &cfg) {
-            Ok(r) => {
-                total.committed += r.committed;
-                total.elections += r.elections;
-                total.crashes += r.crashes;
-                total.corruptions += r.corruptions;
-                total.recoveries += r.recoveries;
-                total.io_errors += r.io_errors;
-                total.partitions += r.partitions;
-                total.delivered += r.delivered;
-                total.dropped += r.dropped;
-            }
+            Ok(r) => total.add(&r),
             Err(e) => failures.push(e),
         }
     }
     let mut out = format!(
-        "{seeds} seeds from {start}, {} replicas, {} + {} ticks, in {:.1} s\n\
-         committed {}, elections {}, crashes {}, log corruptions {}, recoveries {}, io errors {}, \
-         partitions {}, messages {} delivered / {} dropped\n",
+        "{seeds} seeds from {start}, {} replicas, {} + {} ticks, in {:.1} s\n{}\n",
         cfg.replicas,
         cfg.ticks,
         cfg.heal_ticks,
         secs(t.elapsed()),
-        total.committed,
-        total.elections,
-        total.crashes,
-        total.corruptions,
-        total.recoveries,
-        total.io_errors,
-        total.partitions,
-        total.delivered,
-        total.dropped
+        total.summary()
     );
     if failures.is_empty() {
         let _ = writeln!(out, "all safety properties held");

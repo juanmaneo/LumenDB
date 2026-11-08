@@ -22,9 +22,10 @@
 //! cluster can always recover. Safety holds even beyond that; only liveness
 //! needs the bound.
 
+use crate::error::Error;
 use crate::log::LogEntry;
 use crate::message::Message;
-use crate::node::{Config, Node, NodeState};
+use crate::node::{Config, Node, NodeState, ReadState};
 use crate::storage::FileStorage;
 use crate::{Index, NodeId, Term};
 use flashkv::env::Env;
@@ -57,6 +58,8 @@ pub struct Faults {
     pub downtime: (u64, u64),
     /// Per tick: a client proposes an entry to the leader.
     pub propose: u32,
+    /// Per tick: a client asks the leader for a linearizable read.
+    pub read: u32,
 }
 
 impl Default for Faults {
@@ -71,6 +74,7 @@ impl Default for Faults {
             io_error: 1_000,
             downtime: (5, 60),
             propose: 300_000,
+            read: 150_000,
         }
     }
 }
@@ -112,15 +116,33 @@ pub struct Report {
     pub partitions: u64,
     pub delivered: u64,
     pub dropped: u64,
+    /// Reads answered, each checked against what was committed when asked.
+    pub reads_served: u64,
+    /// Reads that failed because the leader lost its leadership first.
+    pub reads_failed: u64,
 }
 
-impl fmt::Display for Report {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "seed {}: committed {}, elections {}, crashes {}, corruptions {}, recoveries {}, \
-             io errors {}, partitions {}, messages {} delivered / {} dropped",
-            self.seed,
+impl Report {
+    /// Adds the counters of `o`; the seed is left alone.
+    pub fn add(&mut self, o: &Report) {
+        self.committed += o.committed;
+        self.elections += o.elections;
+        self.crashes += o.crashes;
+        self.corruptions += o.corruptions;
+        self.recoveries += o.recoveries;
+        self.io_errors += o.io_errors;
+        self.partitions += o.partitions;
+        self.delivered += o.delivered;
+        self.dropped += o.dropped;
+        self.reads_served += o.reads_served;
+        self.reads_failed += o.reads_failed;
+    }
+
+    /// The counters, without the seed.
+    pub fn summary(&self) -> String {
+        format!(
+            "committed {}, elections {}, crashes {}, corruptions {}, recoveries {}, io errors {}, \
+             partitions {}, reads {} served / {} failed, messages {} delivered / {} dropped",
             self.committed,
             self.elections,
             self.crashes,
@@ -128,9 +150,17 @@ impl fmt::Display for Report {
             self.recoveries,
             self.io_errors,
             self.partitions,
+            self.reads_served,
+            self.reads_failed,
             self.delivered,
             self.dropped
         )
+    }
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "seed {}: {}", self.seed, self.summary())
     }
 }
 
@@ -212,6 +242,11 @@ impl Checker {
         Ok(())
     }
 
+    /// The highest index seen committed.
+    fn top(&self) -> Index {
+        self.committed.last_key_value().map_or(0, |(&i, _)| i)
+    }
+
     /// `id` applies `e` as its `n`-th entry.
     fn apply(&self, id: NodeId, n: Index, e: &LogEntry) -> Result<(), String> {
         match (e.index == n) & (self.committed.get(&n).map(|c| &c.0) == Some(e)) {
@@ -268,6 +303,9 @@ struct Sim {
     partition: Option<(u64, Vec<bool>)>,
     check: Checker,
     payload: u64,
+    /// Reads asked and not yet answered, by (replica, id): the highest index
+    /// known to be committed when each was asked.
+    reads: BTreeMap<(usize, u64), Index>,
     report: Report,
 }
 
@@ -296,6 +334,7 @@ impl Sim {
             partition: None,
             check: Checker::default(),
             payload: 0,
+            reads: BTreeMap::new(),
             report: Report {
                 seed,
                 ..Report::default()
@@ -331,6 +370,9 @@ impl Sim {
                         r.applied += 1;
                         self.check.apply(i as NodeId + 1, r.applied, e)?;
                     }
+                    for read in &out.reads {
+                        self.answered(i, read)?;
+                    }
                     self.send(out.messages);
                 }
                 Some(Err(e)) => self.failed(i, e)?,
@@ -338,6 +380,9 @@ impl Sim {
         }
         if (self.now < self.cfg.ticks + self.cfg.heal_ticks / 2) & self.rng.chance(self.cfg.faults.propose) {
             self.propose()?;
+        }
+        if (self.now < self.cfg.ticks + self.cfg.heal_ticks / 2) & self.rng.chance(self.cfg.faults.read) {
+            self.read()?;
         }
         self.deliver()?;
         if self.now.is_multiple_of(16) {
@@ -413,6 +458,7 @@ impl Sim {
         let rng = &mut self.rng;
         let r = &mut self.replicas[i];
         r.node = None;
+        self.reads.retain(|&(replica, _), _| replica != i);
         r.env.heal();
         r.env.crash(&mut |unsynced| rng.below(unsynced as u64 + 1) as usize);
         if corrupt {
@@ -476,6 +522,57 @@ impl Sim {
             Some(Err(e)) => self.failed(i, e),
             _ => self.observe(i),
         }
+    }
+
+    /// A client asks a leader, any leader: a stale one that still believes
+    /// it leads must never answer.
+    fn read(&mut self) -> Result<(), String> {
+        let leaders: Vec<usize> = (0..self.replicas.len())
+            .filter(|&i| {
+                self.replicas[i]
+                    .node
+                    .as_ref()
+                    .is_some_and(|n| n.role() == NodeState::Leader)
+            })
+            .collect();
+        if leaders.is_empty() {
+            return Ok(());
+        }
+        let i = leaders[self.rng.below(leaders.len() as u64) as usize];
+        let asked = self.replicas[i].node.as_ref().expect("a leader is up").read_index();
+        match asked {
+            Ok(id) => {
+                self.reads.insert((i, id), self.check.top());
+                Ok(())
+            }
+            Err(Error::NotReady) => Ok(()),
+            Err(e) => self.failed(i, e),
+        }
+    }
+
+    /// Replica `i` answered a read: it must have been asked, an answer must
+    /// include everything committed when it was asked (linearizability), and
+    /// the replica must have applied up to it.
+    fn answered(&mut self, i: usize, read: &ReadState) -> Result<(), String> {
+        let id = i + 1;
+        let floor = (self.reads.remove(&(i, read.id)))
+            .ok_or_else(|| format!("replica {id} answered read {} that it was never asked", read.id))?;
+        let Some(index) = read.index else {
+            self.report.reads_failed += 1;
+            return Ok(());
+        };
+        if index < floor {
+            return Err(format!(
+                "stale read: replica {id} served a read at index {index}, but {floor} was committed when it was asked"
+            ));
+        }
+        if self.replicas[i].applied < index {
+            return Err(format!(
+                "replica {id} served a read at index {index} before applying it"
+            ));
+        }
+        self.report.reads_served += 1;
+        Ok(())
     }
 
     fn send(&mut self, messages: Vec<Message>) {
@@ -572,17 +669,14 @@ mod tests {
             for replicas in [3, 5] {
                 let r = run(seed, &quick(replicas)).unwrap();
                 assert!(r.committed > 0, "{r}");
-                total.crashes += r.crashes;
-                total.corruptions += r.corruptions;
-                total.recoveries += r.recoveries;
-                total.io_errors += r.io_errors;
-                total.partitions += r.partitions;
-                total.dropped += r.dropped;
+                total.add(&r);
             }
         }
         // The faults really happened.
         assert!(total.crashes > 50, "{total}");
         assert!(total.corruptions > 5, "{total}");
+        assert!(total.reads_served > 100, "{total}");
+        assert!(total.reads_failed > 0, "{total}");
         assert!(total.recoveries > 0, "{total}");
         assert!(total.io_errors > 0, "{total}");
         assert!(total.partitions > 0, "{total}");
@@ -764,6 +858,76 @@ mod tests {
             .tick()
             .unwrap_err()
             .contains("logs share term 1 at index 1 but differ up to it"));
+    }
+
+    #[test]
+    fn reads_are_checked_against_what_was_committed() {
+        let mut sim = started(quick(1));
+        let read = |id, index| ReadState { id, index };
+        let never = sim.answered(0, &read(9, Some(1))).unwrap_err();
+        assert!(never.contains("read 9 that it was never asked"), "{never}");
+        // Committed up to 10 when asked: an answer at 3 is stale.
+        sim.reads.insert((0, 1), 10);
+        let stale = sim.answered(0, &read(1, Some(3))).unwrap_err();
+        assert!(
+            stale.contains("stale read: replica 1 served a read at index 3, but 10"),
+            "{stale}"
+        );
+        // An answer past what the replica applied is wrong too.
+        sim.reads.insert((0, 2), 0);
+        let early = sim.answered(0, &read(2, Some(4))).unwrap_err();
+        assert!(early.contains("before applying it"), "{early}");
+        // Right answers, and a failure that is allowed.
+        sim.replicas[0].applied = 4;
+        sim.reads.insert((0, 3), 4);
+        sim.answered(0, &read(3, Some(4))).unwrap();
+        sim.reads.insert((0, 4), 99);
+        sim.answered(0, &read(4, None)).unwrap();
+        assert_eq!((sim.report.reads_served, sim.report.reads_failed), (1, 1));
+        assert!(sim.reads.is_empty());
+        // The replica's own failure to start a read surfaces too.
+        let mut sim = started(quick(1));
+        while sim.replicas[0].node.as_ref().unwrap().role() != NodeState::Leader {
+            sim.replicas[0].node.as_ref().unwrap().tick().unwrap();
+        }
+        sim.replicas[0].env.fail_after(0);
+        sim.replicas[0].env = MemEnv::new();
+        let err = sim.read().unwrap_err();
+        assert!(err.starts_with("replica 1 failed: "), "{err}");
+        // The same from a tick that asks for a read (and never proposes).
+        let mut sim = started(SimConfig {
+            faults: Faults {
+                propose: 0,
+                read: 1_000_000,
+                ..quick(1).faults
+            },
+            ..quick(1)
+        });
+        while sim.replicas[0].node.as_ref().unwrap().role() != NodeState::Leader {
+            sim.replicas[0].node.as_ref().unwrap().tick().unwrap();
+        }
+        sim.replicas[0].env.fail_after(0);
+        sim.replicas[0].env = MemEnv::new();
+        let err = sim.tick().unwrap_err();
+        assert!(err.starts_with("replica 1 failed: "), "{err}");
+        // A read the simulator never asked for is released by a tick.
+        let mut sim = started(SimConfig {
+            faults: Faults {
+                propose: 0,
+                read: 0,
+                ..quick(1).faults
+            },
+            ..quick(1)
+        });
+        let node = sim.replicas[0].node.as_ref().unwrap();
+        while node.role() != NodeState::Leader {
+            node.tick().unwrap();
+        }
+        assert_eq!(node.read_index(), Err(Error::NotReady));
+        node.tick().unwrap();
+        node.read_index().unwrap();
+        let err = sim.tick().unwrap_err();
+        assert!(err.contains("that it was never asked"), "{err}");
     }
 
     #[test]

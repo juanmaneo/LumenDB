@@ -31,6 +31,10 @@ pub struct Message {
     /// AppendEntries: the leader's last log index at send time, so that a
     /// recovering follower knows when it holds the leader's whole log.
     pub leader_last_index: Index,
+    /// AppendEntries and its reply: the leader's read round (0: none). A
+    /// reply echoes it, proving the follower still accepted the leader after
+    /// that round began; see [`crate::Node::read_index`].
+    pub read_ctx: u64,
     /// Sender's Lamport clock at send time.
     pub lc: u64,
 }
@@ -50,6 +54,7 @@ impl Message {
             match_index: 0,
             success: false,
             leader_last_index: 0,
+            read_ctx: 0,
             lc: 0,
         }
     }
@@ -81,6 +86,7 @@ impl Message {
             match_index: 0,
             success: false,
             leader_last_index: 0,
+            read_ctx: 0,
             lc: 0,
         }
     }
@@ -106,6 +112,7 @@ impl Message {
             match_index: 0,
             success: false,
             leader_last_index: 0,
+            read_ctx: 0,
             lc: 0,
         }
     }
@@ -123,6 +130,7 @@ impl Message {
             match_index,
             success,
             leader_last_index: 0,
+            read_ctx: 0,
             lc: 0,
         }
     }

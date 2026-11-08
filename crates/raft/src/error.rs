@@ -56,6 +56,9 @@ pub enum Error {
     NotConfigured,
     /// Proposal sent to a non-leader; carries the known leader, if any.
     NotLeader(Option<NodeId>),
+    /// A linearizable read needs an entry of the leader's own term to be
+    /// committed first; one is on its way, retry shortly.
+    NotReady,
 }
 
 impl fmt::Display for Error {
@@ -66,6 +69,7 @@ impl fmt::Display for Error {
             Error::LogInconsistency(m) => write!(f, "log inconsistency: {m}"),
             Error::NotConfigured => write!(f, "node not in peer set"),
             Error::NotLeader(hint) => write!(f, "not leader (leader hint: {hint:?})"),
+            Error::NotReady => write!(f, "leader has not committed an entry of its term yet, retry"),
         }
     }
 }
@@ -100,6 +104,7 @@ mod tests {
         );
         assert!(format!("{}", Error::NotConfigured).contains("not in peer set"));
         assert!(format!("{}", Error::NotLeader(Some(3))).contains("Some(3)"));
+        assert!(Error::NotReady.to_string().ends_with("retry"));
     }
 
     #[test]

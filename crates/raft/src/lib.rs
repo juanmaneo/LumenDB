@@ -19,7 +19,7 @@ pub use clock::LamportClock;
 pub use error::{Error, LogError, Result};
 pub use log::{Log, LogEntry};
 pub use message::{Message, MsgType};
-pub use node::{Config, Node, NodeState, TickOutcome};
+pub use node::{Config, Node, NodeState, ReadState, TickOutcome};
 pub use quorum::{is_majority, quorum};
 pub use storage::{DurableState, FileStorage, MemoryStorage, Storage};
 pub use swim::{Gossip, Member, Status, Swim};
