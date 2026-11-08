@@ -245,7 +245,7 @@ This code was initially written with the help of **Le Chonk**, aka
 [Mistral Large 4](https://mistral.ai) from Mistral.ai. Le Chonk is a
 large language model, and the entire codebase — crates, tests, proofs and
 CI — was generated through conversations with it, then reviewed and edited
-by a human.
+by a human (aka https://github.com/juanmaneo).
 
 ## License
 
