@@ -16,17 +16,43 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    CAP[pcap / pcapng file] -->|mmap read-only| PF[pcapfast: record-aligned chunks, scoped threads]
-    PF -->|flows + traffic timeline| TS[tsvdb]
-    LP[line protocol] --> TS
-    TS -->|WAL record + series/schema| KV[flashkv]
-    TS -->|flush: Gorilla chunks per column and hour| KV
-    CMP[compactor thread] -->|snapshot read, atomic batch| KV
-    Q[queries] -->|snapshot| KV
-    KV -->|pread, CRC-checked| DISK[(files: WAL, SSTables, MANIFEST)]
-    RAFT[raft: Raft + SWIM + Lamport] -->|FileStorage on the same Env| DISK
+```text
+ pcap / pcapng file                       line protocol
+        |                                       |
+        | mmap read-only                        |
+        v                                       |
+ +--------------------------------+             |
+ | pcapfast                       |             |
+ | record-aligned chunks,         |             |
+ | scoped threads                 |             |
+ +--------------------------------+             |
+        |                                       |
+        | flows + traffic timeline              |
+        v                                       v
+ +-----------------------------------------------------+
+ | tsvdb                                               |
+ +-----------------------------------------------------+
+        |
+        | WAL record + series/schema
+        | flush: Gorilla chunks per column and hour
+        v
+ +-----------------------------------------------------+
+ | flashkv                                             |<-- compactor thread
+ |                                                     |    (snapshot read, atomic batch)
+ |                                                     |<-- queries (snapshot)
+ +-----------------------------------------------------+
+        |
+        | pread, CRC-checked
+        v
+ +-----------------------------------------------------+
+ | files: WAL, SSTables, MANIFEST                      |
+ +-----------------------------------------------------+
+        ^
+        | FileStorage on the same Env
+        |
+ +-----------------------------------------------------+
+ | raft: Raft + SWIM + Lamport                         |
+ +-----------------------------------------------------+
 ```
 
 ### flashkv: the storage engine
