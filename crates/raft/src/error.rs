@@ -68,6 +68,12 @@ pub enum Error {
     NotReady,
     /// A snapshot the node cannot take: the reason.
     BadSnapshot(&'static str),
+    /// Bytes that are not a message: the reason (see [`crate::wire`]).
+    BadMessage(&'static str),
+    /// A [`crate::Server`] call that did not finish in time.
+    Timeout,
+    /// The [`crate::Server`] was shut down, or stopped on a storage error.
+    Stopped,
 }
 
 impl fmt::Display for Error {
@@ -81,6 +87,9 @@ impl fmt::Display for Error {
             Error::NotLeader(hint) => write!(f, "not leader (leader hint: {hint:?})"),
             Error::NotReady => write!(f, "leader has not committed an entry of its term yet, retry"),
             Error::BadSnapshot(why) => write!(f, "bad snapshot: {why}"),
+            Error::BadMessage(why) => write!(f, "malformed message: {why}"),
+            Error::Timeout => write!(f, "timed out"),
+            Error::Stopped => write!(f, "the server has stopped"),
         }
     }
 }
@@ -117,6 +126,12 @@ mod tests {
         assert!(format!("{}", Error::NotLeader(Some(3))).contains("Some(3)"));
         assert!(Error::NotReady.to_string().ends_with("retry"));
         assert_eq!(Error::BadSnapshot("too new").to_string(), "bad snapshot: too new");
+        assert_eq!(
+            Error::BadMessage("unknown version").to_string(),
+            "malformed message: unknown version"
+        );
+        assert_eq!(Error::Timeout.to_string(), "timed out");
+        assert_eq!(Error::Stopped.to_string(), "the server has stopped");
         assert_eq!(
             Error::BadConfig("one at a time").to_string(),
             "membership change refused: one at a time"

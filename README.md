@@ -151,6 +151,23 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   or the new pair. A snapshot that fails its checksum loses the applied
   prefix: the node starts from an empty log, marked recovering, and is
   caught up by the leader.
+- **Wire format and TCP transport** (`raft::wire`, `raft::net`, `std::net`
+  only). A message is one record in flashkv's CRC framing, so a flipped bit,
+  a truncated stream and garbage are all detected, and a lying length costs
+  nothing: the receiver never allocates more than has arrived. The transport
+  is deliberately lossy, as Raft copes with lost, duplicated and reordered
+  messages (the simulator proves it): `send` never blocks, one writer thread
+  per peer reconnects after failures and drops what it cannot deliver, and a
+  reader drops a connection that sends a bad frame. Every drop is counted.
+  There is no authentication or encryption; run it on a trusted network or
+  behind a tunnel.
+- **Server** (`raft::server`). `Server` runs a node on a clock: it steps the
+  node with what the transport receives, ticks it, sends its messages, hands
+  committed entries, snapshots and confirmed reads to the application's
+  `StateMachine`, and compacts the log every `snapshot_every` entries. The
+  application proposes (`propose`, `wait_applied`) and gets linearizable
+  reads from `read_barrier`. A storage error stops the server for good, as
+  the state on disk can no longer be trusted to match memory.
 - **Protocol-aware recovery** (TigerBeetle; Alagappan et al., FAST '18). A
   bit flip in the Raft log may have destroyed entries the node acknowledged,
   and so helped commit. The node keeps the intact prefix and is marked
