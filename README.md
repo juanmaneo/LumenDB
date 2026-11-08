@@ -65,10 +65,14 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   optional LZ compression, bloom filters, CRC per block) with leveled
   compaction. A `MANIFEST` log plus `CURRENT` is updated by atomic rename.
 - **Hardware-crash safety.** With `sync` on (the default), a write returns
-  `Ok` only once it is on stable storage. Torn WAL or manifest tails are cut
-  at the last valid record during recovery. Errors are sticky, like LevelDB's
-  `bg_error`: after a failed write, later writes are refused until the store
-  is reopened.
+  `Ok` only once it is on stable storage. Recovery tells a torn tail from
+  corruption, as TigerBeetle does. A torn tail is an incomplete last record
+  or zero fill: a write that never completed, so it was never acknowledged.
+  It is cut at the last valid record. A complete record with a bad checksum,
+  or intact records after a bad one, means acknowledged data was damaged, so
+  the open fails instead of silently dropping it. Errors are sticky, like
+  LevelDB's `bg_error`: after a failed write, later writes are refused until
+  the store is reopened.
 - **No mmap of database files.** This avoids LMDB's map-size failure
   (`MDB_MAP_FULL`) and SIGBUS on a truncated file. Tables are read with
   `pread`, and every block is length- and CRC-checked, so corruption becomes
@@ -90,6 +94,15 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   and entries are durable before any dependent message leaves, so a node
   never votes twice in a term. `FileStorage` uses flashkv's `Env` and record
   framing: an atomic state file plus a generation-numbered log.
+- **Protocol-aware recovery** (TigerBeetle; Alagappan et al., FAST '18). A
+  bit flip in the Raft log may have destroyed entries the node acknowledged,
+  and so helped commit. The node keeps the intact prefix and is marked
+  *recovering*, durably. A recovering node never votes and never campaigns,
+  so every election quorum still overlaps every commit quorum in an intact
+  node. It rejoins once it holds the current leader's whole log. A damaged
+  single-node cluster stays stuck: there is no one to copy from, and
+  stopping is safer than guessing. The state file (term, vote) holds two
+  checksummed copies; either one is enough, and two intact copies must agree.
 - **SWIM** membership: round-robin probes, indirect `PingReq` probes,
   suspicion, death, incarnation-based refutation, and piggybacked gossip.
 - **Lamport clocks** stamp every message. Ordering never depends on wall

@@ -8,6 +8,16 @@
 //! returned, so a node that crashes and restarts never votes twice in a term
 //! nor forgets an entry it acknowledged.
 //!
+//! Protocol-aware recovery: if storage reports the log damaged
+//! ([`DurableState::recovering`]), entries this node acknowledged may be gone,
+//! and some of them may have been committed with its help. Such a node never
+//! grants a vote and never campaigns, so every election quorum still overlaps
+//! every commit quorum in an intact node, and an elected leader holds every
+//! committed entry. The node leaves this state once an AppendEntries from the
+//! leader of its current term has left it with that leader's whole log, and
+//! the exit is made durable first. A single-node cluster has no one to copy
+//! from, so a damaged single node stays stuck: that is the correct fail-stop.
+//!
 //! Committed entries are handed out by `tick()` in index order, exactly once
 //! per process lifetime (after a restart they are replayed from index 1 as the
 //! commit index is re-learned).
@@ -91,6 +101,7 @@ struct Inner {
     match_index: BTreeMap<NodeId, Index>,
     rng: u64,
     clock: LamportClock,
+    recovering: bool,
 }
 
 pub struct Node {
@@ -121,7 +132,12 @@ impl Node {
         if !cfg.voters.contains(&cfg.id) {
             return Err(Error::NotConfigured);
         }
-        let DurableState { term, voted_for, log } = storage.load()?;
+        let DurableState {
+            term,
+            voted_for,
+            log,
+            recovering,
+        } = storage.load()?;
         let peers: BTreeSet<NodeId> = cfg.voters.iter().copied().filter(|&v| v != cfg.id).collect();
         let mut rng = (cfg.seed ^ cfg.id) | 1;
         let election_timeout = random_timeout(&cfg, &mut rng);
@@ -144,6 +160,7 @@ impl Node {
                 match_index: BTreeMap::new(),
                 rng,
                 clock: LamportClock::new(),
+                recovering,
             }),
             cfg,
         })
@@ -172,6 +189,11 @@ impl Node {
 
     pub fn logical_time(&self) -> u64 {
         self.state.lock().clock.now()
+    }
+
+    /// The log was damaged: no voting or campaigning until caught up.
+    pub fn recovering(&self) -> bool {
+        self.state.lock().recovering
     }
 
     /// Current term and full log.
@@ -217,7 +239,11 @@ impl Node {
         } else {
             s.election_elapsed += 1;
             if s.election_elapsed >= s.election_timeout {
-                self.campaign(&mut s, &mut messages)?;
+                if s.recovering {
+                    s.election_elapsed = 0;
+                } else {
+                    self.campaign(&mut s, &mut messages)?;
+                }
             }
         }
         let committed = s.log.entries()[s.last_applied as usize..s.commit_index as usize].to_vec();
@@ -318,7 +344,7 @@ impl Node {
         let entries = s.log.entries();
         let start = (prev as usize).min(entries.len());
         let end = start.saturating_add(MAX_BATCH).min(entries.len());
-        Message::append_entries(
+        let mut m = Message::append_entries(
             self.cfg.id,
             peer,
             s.term,
@@ -326,13 +352,15 @@ impl Node {
             prev_term,
             entries[start..end].to_vec(),
             s.commit_index,
-        )
+        );
+        m.leader_last_index = s.log.last_index();
+        m
     }
 
     fn on_request_vote(&self, s: &mut Inner, msg: &Message) -> Result<Message> {
         let up_to_date = (msg.last_log_term, msg.last_log_index) >= (s.log.last_term(), s.log.last_index());
         let free = s.voted_for.unwrap_or(msg.from) == msg.from;
-        let granted = up_to_date & free;
+        let granted = up_to_date & free & !s.recovering;
         if granted {
             self.storage.save_vote(s.term, Some(msg.from))?;
             s.voted_for = Some(msg.from);
@@ -371,6 +399,12 @@ impl Node {
         s.log.append(&msg.entries).expect("validated by check_append");
         let last_new = msg.entries.last().map_or(msg.last_log_index, |e| e.index);
         s.commit_index = s.commit_index.max(msg.commit_index.min(last_new));
+        // Our log now matches the leader's up to `last_new`; entries past it
+        // may be stale leftovers, so they do not count.
+        if s.recovering & (last_new >= msg.leader_last_index) {
+            self.storage.mark_repaired()?;
+            s.recovering = false;
+        }
         Ok(Message::append_entries_reply(
             self.cfg.id,
             msg.from,
@@ -385,10 +419,12 @@ impl Node {
             return None;
         }
         let next = if msg.success {
-            let matched = s.match_index[&msg.from].max(msg.match_index);
-            s.match_index.insert(msg.from, matched);
+            // Trust the reply even if it is lower than before: a follower
+            // that lost entries to storage damage reports what it really has
+            // (a reordered older reply only causes a harmless resend).
+            s.match_index.insert(msg.from, msg.match_index);
             self.maybe_commit(s);
-            matched + 1
+            msg.match_index + 1
         } else {
             (s.next_index[&msg.from] - 1)
                 .min(msg.match_index.saturating_add(1))
@@ -602,6 +638,7 @@ mod tests {
                 l.append(&[entry(1, 2, b"a"), entry(2, 2, b"b")]).unwrap();
                 l
             },
+            recovering: false,
         });
         let node = Node::new(Config::cluster(1, vec![1, 2, 3]), storage.clone()).unwrap();
         // Candidate log is behind (older last term / shorter): refused.
@@ -699,6 +736,11 @@ mod tests {
         // Peer 3 has only entry 1: the rest is sent right away.
         let r = node.step(Message::append_entries_reply(3, 1, t, true, 1)).unwrap();
         assert_eq!((r[0].last_log_index, r[0].entries.len()), (1, 1));
+        assert_eq!(r[0].leader_last_index, 2);
+        // Peer 2 lost entries since it acknowledged 2: believe it and resend.
+        let r = node.step(Message::append_entries_reply(2, 1, t, true, 0)).unwrap();
+        assert_eq!((r[0].last_log_index, r[0].entries.len()), (0, 2));
+        assert_eq!(node.commit_index(), 2, "commit never goes back");
     }
 
     #[test]
@@ -709,6 +751,7 @@ mod tests {
             term: 1,
             voted_for: None,
             log,
+            recovering: false,
         });
         let node = Node::new(Config::single(1), storage).unwrap();
         leader_of(&node, 20);
@@ -726,8 +769,11 @@ mod tests {
 
     impl Failing {
         fn new(budget: u64) -> Arc<Self> {
+            Self::with_state(budget, DurableState::default())
+        }
+        fn with_state(budget: u64, state: DurableState) -> Arc<Self> {
             Arc::new(Failing {
-                inner: MemoryStorage::new(),
+                inner: MemoryStorage::with_state(state),
                 budget: AtomicU64::new(budget),
             })
         }
@@ -750,6 +796,10 @@ mod tests {
         fn append_entries(&self, entries: &[LogEntry]) -> Result<()> {
             self.spend()?;
             self.inner.append_entries(entries)
+        }
+        fn mark_repaired(&self) -> Result<()> {
+            self.spend()?;
+            self.inner.mark_repaired()
         }
     }
 
@@ -782,5 +832,92 @@ mod tests {
         leader_of(&n, 20);
         assert!(n.propose(b"x".to_vec()).is_err());
         assert!(n.log_snapshot().1.is_empty());
+        // Leaving the recovering state: the entries are kept, the flag too.
+        let damaged = DurableState {
+            recovering: true,
+            ..DurableState::default()
+        };
+        let catch_up = || Message::append_entries(2, 1, 0, 0, 0, vec![entry(1, 0, b"a")], 0);
+        let n = Node::new(cfg(), Failing::with_state(2, damaged.clone())).unwrap();
+        assert!(n.step(catch_up()).is_err());
+        assert!(n.recovering());
+        assert_eq!(n.log_snapshot().1.len(), 1);
+        let n = Node::new(cfg(), Failing::with_state(3, damaged)).unwrap();
+        assert!(n.step(catch_up()).unwrap()[0].success);
+        assert!(!n.recovering());
+    }
+
+    fn damaged(term: Term, entries: &[LogEntry]) -> Arc<MemoryStorage> {
+        let mut log = Log::new();
+        log.append(entries).unwrap();
+        MemoryStorage::with_state(DurableState {
+            term,
+            voted_for: None,
+            log,
+            recovering: true,
+        })
+    }
+
+    #[test]
+    fn recovering_node_neither_votes_nor_campaigns() {
+        let storage = damaged(2, &[entry(1, 2, b"a")]);
+        let node = Node::new(Config::cluster(1, vec![1, 2, 3]), storage.clone()).unwrap();
+        assert!(node.recovering());
+        for _ in 0..200 {
+            assert!(node.tick().unwrap().messages.is_empty());
+        }
+        assert_eq!((node.role(), node.term()), (NodeState::Follower, 2));
+        // Even a candidate far ahead is refused, in this term and the next.
+        assert!(!node.step(Message::request_vote(2, 1, 2, 9, 9)).unwrap()[0].vote_granted);
+        assert!(!node.step(Message::request_vote(2, 1, 3, 9, 9)).unwrap()[0].vote_granted);
+        assert_eq!(storage.load().unwrap().voted_for, None);
+    }
+
+    #[test]
+    fn recovering_node_rejoins_once_it_has_the_leaders_whole_log() {
+        // Our damaged log kept a stale entry 2 the leader does not have.
+        let storage = damaged(2, &[entry(1, 2, b"a"), entry(2, 2, b"stale")]);
+        let node = Node::new(Config::cluster(1, vec![1, 2, 3]), storage.clone()).unwrap();
+        let append = |prev: Index, prev_term: Term, entries: Vec<LogEntry>, leader_last: Index| {
+            let mut m = Message::append_entries(2, 1, 3, prev, prev_term, entries, 0);
+            m.leader_last_index = leader_last;
+            node.step(m).unwrap()
+        };
+        // Matches up to 1 only: the leftover entry 2 does not count.
+        assert!(append(1, 2, vec![], 2)[0].success);
+        assert!(node.recovering());
+        // A partial batch is not enough either.
+        assert!(append(1, 2, vec![entry(2, 3, b"b")], 3)[0].success);
+        assert!(node.recovering() && storage.load().unwrap().recovering);
+        assert!(append(2, 3, vec![entry(3, 3, b"c")], 3)[0].success);
+        assert!(!node.recovering() && !storage.load().unwrap().recovering);
+        // Back to normal: votes are granted again.
+        let r = node.step(Message::request_vote(3, 1, 4, 3, 3)).unwrap();
+        assert!(r[0].vote_granted);
+    }
+
+    #[test]
+    fn damaged_follower_catches_up_in_a_cluster() {
+        let mut net = Net::new(3);
+        net.run(60, &[]);
+        let leader = net.leaders(&[])[0];
+        for i in 0..5u8 {
+            net.node(leader).propose(vec![i]).unwrap();
+        }
+        net.run(10, &[]);
+        // A follower restarts having lost all but its first entry; the
+        // leader still believes it has all 5.
+        let f = (1..=3).find(|&id| id != leader).unwrap();
+        let (term, entries) = net.node(f).log_snapshot();
+        let voters: Vec<NodeId> = (1..=3).collect();
+        net.nodes[(f - 1) as usize] = Node::new(Config::cluster(f, voters), damaged(term, &entries[..1])).unwrap();
+        assert!(net.node(f).recovering());
+        for i in 5..8u8 {
+            net.node(leader).propose(vec![i]).unwrap();
+        }
+        net.run(20, &[]);
+        assert!(!net.node(f).recovering());
+        assert_eq!(net.node(f).log_snapshot().1, net.node(leader).log_snapshot().1);
+        assert_eq!(net.node(f).commit_index(), 8);
     }
 }

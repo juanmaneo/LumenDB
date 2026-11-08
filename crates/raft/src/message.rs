@@ -24,6 +24,9 @@ pub struct Message {
     pub vote_granted: bool,
     pub match_index: Index,
     pub success: bool,
+    /// AppendEntries: the leader's last log index at send time, so that a
+    /// recovering follower knows when it holds the leader's whole log.
+    pub leader_last_index: Index,
     /// Sender's Lamport clock at send time.
     pub lc: u64,
 }
@@ -42,6 +45,7 @@ impl Message {
             vote_granted: false,
             match_index: 0,
             success: false,
+            leader_last_index: 0,
             lc: 0,
         }
     }
@@ -58,6 +62,7 @@ impl Message {
             vote_granted: granted,
             match_index: 0,
             success: false,
+            leader_last_index: 0,
             lc: 0,
         }
     }
@@ -82,6 +87,7 @@ impl Message {
             vote_granted: false,
             match_index: 0,
             success: false,
+            leader_last_index: 0,
             lc: 0,
         }
     }
@@ -98,6 +104,7 @@ impl Message {
             vote_granted: false,
             match_index,
             success,
+            leader_last_index: 0,
             lc: 0,
         }
     }
