@@ -187,7 +187,33 @@ including the binaries: integration tests spawn them through
 following, within the bounds stated in each harness:
 
 - the flashkv varint round-trips every `u64`;
-- CRC32C matches its published check values, and CRC masking is a bijection;
+- CRC32C matches its published check values, and CRC masking is a
+  bijection;
+
+  A masked CRC is the raw CRC passed through a fixed post-processing step.
+  flashkv uses the LevelDB form,
+  `mask(c) = c.rotate_right(15).wrapping_add(0xa282_e8a8)`. Other common
+  masks:
+
+  | mask | what it is |
+  |---|---|
+  | `crc(x) ⊕ 0xFFFFFFFF` | complement, as in the IEEE 802.3 FCS |
+  | `crc(x) ⊕ k` | XOR with a fixed constant `k`, e.g. zlib |
+  | `swap_bytes(crc(x))` | bit or byte reversal |
+
+  Each transform is a bijection on the 32-bit checksum space: XOR with a
+  constant is its own inverse, rotation and byte order are permutations,
+  and adding a constant modulo 2³² is undone by subtracting it. Therefore
+  `masked(a) = masked(b)` ⟺ `crc(a) = crc(b)`. Masking neither creates nor
+  hides collisions. It is cosmetic, and every collision and
+  burst-error-detection property of CRC-32 carries over unchanged.
+
+  The Ethernet FCS is the canonical example: it is just `crc32(frame)` run
+  through complement and byte swap (transmitted most-significant byte
+  first). It is not a new checksum and changes nothing about error
+  detection. It only makes the wire encoding well-behaved: an all-zeros
+  frame no longer maps to an all-zeros checksum.
+
 - any two majority quorums intersect;
 - the Lamport clock is monotonic.
 
