@@ -211,6 +211,21 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   change commits. `cargo test` runs a fixed set of seeds, and
   `cargo xtask vopr` runs many; `--voters N` fixes how many replicas start
   as voters.
+- **Not adopted: a checksum chain over the log** (TigerBeetle chains each
+  prepare's checksum to its parent's). A chain would catch two replicas
+  holding different data under the same index and term, which only a bug or
+  memory corruption in a node can cause. Everything else it detects is
+  covered already: media and transit damage by the CRC of every log batch,
+  snapshot and wire frame, a lost or misplaced write by contiguous indices and
+  non-decreasing terms checked at every append and at every open (a gap makes
+  the log damaged, so the node recovers), and the property itself by the
+  simulator's log-matching and state-machine checks on every event. A chain
+  would change the log, state and wire formats and cost a hash per entry.
+- **Not implemented**: leadership transfer (a leader that removes itself is
+  replaced after an election timeout), a leader that steps down on losing its
+  quorum (it keeps leading until it hears a higher term, but cannot commit or
+  confirm reads), chunked snapshot transfer, pipelined replication, and
+  authentication or encryption on the wire.
 - **SWIM** membership: round-robin probes, indirect `PingReq` probes,
   suspicion, death, incarnation-based refutation, and piggybacked gossip.
 - **Lamport clocks** stamp every message. Ordering never depends on wall
