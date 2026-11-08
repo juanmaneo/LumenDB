@@ -110,9 +110,33 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   traffic. `tick()` then releases the read, and the state machine can answer
   it locally. A leader cut off from the majority never confirms, so it never
   serves a stale read, and when it is deposed its pending reads fail. A new
-  leader first needs an entry of its own term committed; the first read
-  appends an empty entry for that and asks the caller to retry, so
-  applications that read must ignore entries with empty data.
+  leader first needs an entry of its own term committed, so a read asked
+  before that returns `NotReady`: retry in a few ticks.
+- **An empty entry per leader.** A new leader appends an empty entry of its
+  term as soon as it is elected (Raft thesis, section 6.4). Entries of
+  earlier terms commit only together with an entry of the leader's term, so
+  without it they could stay uncommitted until a client happened to write.
+  The simulator found this: after a leader change the cluster did not always
+  converge. Applications must ignore entries with empty data, and entries of
+  kind `Config`.
+- **Membership changes** (Raft thesis, section 4.1, one server at a time).
+  The voter set is held in configuration entries of the log, in effect as
+  soon as the entry is appended and taken back if it is truncated. The
+  leader changes it by one server per entry (`add_voter`, `remove_voter`), so
+  the old and the new majorities always overlap. It refuses a change while
+  another is not committed, and before it has committed an entry of its own
+  term (otherwise two leaders could choose different configurations on the
+  same prefix). A new server joins first as a learner (`add_learner`): it
+  gets the log but neither votes nor counts toward a quorum, and `add_voter`
+  waits until it has caught up, so a slow newcomer cannot stall commits.
+  A node that is not a voter never campaigns, and while it hears from a
+  leader a node ignores vote traffic from servers outside its voter set, so a
+  removed server cannot disturb the cluster. A leader that removes itself
+  steps down once the change commits. A server whose removal is not
+  committed keeps its place in elections: the leader may be gone with the
+  entry only on the server it removes, and the rest could not win without it.
+  Snapshots carry the configuration, as the entries that set it are gone.
+  The application sees committed configuration entries too, and ignores them.
 - **Snapshots and log compaction.** The application owns the state machine,
   so it decides when to snapshot: `Node::compact(index, data)` stores the
   serialized state machine as of an applied index, durably, and drops the log
@@ -137,26 +161,38 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   stopping is safer than guessing. The state file (term, vote) holds two
   checksummed copies; either one is enough, and two intact copies must agree.
 - **Deterministic simulation** (TigerBeetle's VOPR). One seed fixes a whole
-  run of a 3 to 5 replica cluster, each replica on its own `MemEnv` with the
+  run of a 3 to 7 replica cluster, each replica on its own `MemEnv` with the
   real `FileStorage`: message loss, duplication and reordering, partitions,
   crashes, power loss with torn writes, bit flips in the Raft log, and I/O
-  errors. After every event the simulator checks election safety (one leader
+  errors, while an operator keeps adding and removing servers through
+  whichever replica leads. After every event the simulator checks election safety (one leader
   per term), leader completeness, state machine safety (no two replicas
   commit or apply different entries at an index), log matching, and
   linearizable reads (a read, even one sent to a stale leader, must include
   everything committed when it was asked), and snapshots (each replica has a
   state machine, a hash of what it applied, that it snapshots, restores after
   a restart and when a leader sends a snapshot; no two replicas may ever
-  differ in state at the same index). Then
-  faults stop and the cluster must converge: one leader, nobody recovering,
-  identical logs. Corruption hits a minority of replicas at a time, which is
+  differ in state at the same index), and membership (committed
+  configurations differ by one server, and the voters a node or a snapshot
+  has are the ones committed at its index). Then
+  faults stop and the cluster must converge: one leader that is one of its
+  own voters, and among the voters nobody recovering, identical logs and
+  state machines. Corruption hits a minority of the voters at a time, which is
   what the protocol can survive. A failing seed replays exactly. The check
   is real: with the recovery rule removed, 9 of 300 seeds fail with `leader
   lacks committed entry`, and a leader that confirms reads one acknowledgement
   early fails within the first few seeds with `stale read`; a snapshot that
   never reaches the state machine, or a restart that skips the stored one,
-  fails on seed 0 with `applied entry ... not as committed`. `cargo test` runs a fixed set of seeds, and
-  `cargo xtask vopr` runs many.
+  fails on seed 0 with `applied entry ... not as committed`. For membership,
+  allowing several changes at once fails with `leader ... lacks committed
+  entry`, a change of two servers fails on seed 0, a log that keeps
+  configuration entries it truncated fails within a few dozen seeds, and a leader that never steps down after
+  removing itself leaves no convergence. Two guards only unit tests catch:
+  the committed-entry-in-term rule for changes (the simulator did not find its
+  scenario in 600 seeds), and replicating to a removed server until the
+  change commits. `cargo test` runs a fixed set of seeds, and
+  `cargo xtask vopr` runs many; `--voters N` fixes how many replicas start
+  as voters.
 - **SWIM** membership: round-robin probes, indirect `PingReq` probes,
   suspicion, death, incarnation-based refutation, and piggybacked gossip.
 - **Lamport clocks** stamp every message. Ordering never depends on wall

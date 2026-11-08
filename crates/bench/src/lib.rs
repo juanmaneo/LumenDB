@@ -42,11 +42,13 @@ commands:
       into the page cache. `wall` is the whole parse_file call (open, mmap,
       parse, munmap), `parse` excludes mapping and unmapping. Fails if the
       best wall-clock rate is below X Mpkt/s
-  vopr [--seeds N] [--start N] [--replicas N] [--ticks N] [--heal-ticks N]
+  vopr [--seeds N] [--start N] [--replicas N] [--voters N] [--ticks N] [--heal-ticks N]
       deterministic Raft cluster simulation (in the style of TigerBeetle's
       VOPR): per seed, message loss, duplication, reordering, partitions,
       crashes, power loss with torn writes, log bit flips and I/O errors,
-      with the safety properties checked after every event. A failing seed
+      and an operator who adds and removes servers (--voters N: how many of
+      the replicas are voters at the start, default: the seed picks), with
+      the safety properties checked after every event. A failing seed
       replays exactly with `--start SEED --seeds 1`
 
 storage options (ingest, write, query, kv-bench):
@@ -376,10 +378,11 @@ fn parse_bench(a: &Args) -> Res<String> {
 }
 
 fn vopr(a: &Args) -> Res<String> {
-    a.check(&["seeds", "start", "replicas", "ticks", "heal-ticks"])?;
+    a.check(&["seeds", "start", "replicas", "voters", "ticks", "heal-ticks"])?;
     let defaults = raft::sim::SimConfig::default();
     let cfg = raft::sim::SimConfig {
         replicas: a.num("replicas", defaults.replicas)?,
+        voters: a.num("voters", defaults.voters)?,
         ticks: a.num("ticks", defaults.ticks)?,
         heal_ticks: a.num("heal-ticks", defaults.heal_ticks)?,
         ..defaults
@@ -517,6 +520,7 @@ mod tests {
             ("vopr --seeds z", "--seeds: invalid number \"z\""),
             ("vopr --start z", "--start: invalid number \"z\""),
             ("vopr --replicas z", "--replicas: invalid number \"z\""),
+            ("vopr --voters z", "--voters: invalid number \"z\""),
             ("vopr --ticks z", "--ticks: invalid number \"z\""),
             ("vopr --heal-ticks z", "--heal-ticks: invalid number \"z\""),
             ("vopr --replicas 0", "--replicas must be between 1 and 64"),
@@ -638,7 +642,7 @@ mod tests {
 
     #[test]
     fn vopr_runs_seeds_and_reports_failures() {
-        let out = cmd("vopr --seeds 3 --start 10 --replicas 3 --ticks 300 --heal-ticks 300").unwrap();
+        let out = cmd("vopr --seeds 3 --start 10 --replicas 3 --voters 3 --ticks 300 --heal-ticks 300").unwrap();
         assert!(
             out.starts_with("3 seeds from 10, 3 replicas, 300 + 300 ticks, in "),
             "{out}"

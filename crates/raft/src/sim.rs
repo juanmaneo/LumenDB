@@ -19,14 +19,22 @@
 //!   applied) that it snapshots, compacting its log, and restores from the
 //!   snapshot after a restart or when a leader sends one. No two replicas
 //!   may ever have different state at the same index;
+//! - membership: an operator keeps changing the cluster through whichever
+//!   replica leads (add a learner, promote it, remove a voter, drop a
+//!   learner), while replicas crash and partitions come and go. Committed
+//!   configurations must differ by exactly one server, and the configuration
+//!   a snapshot carries must be the committed one at its index. Election
+//!   safety, leader completeness and state machine safety are what catch two
+//!   disjoint majorities;
 //! - log matching (every few ticks): two logs with the same term at an index
 //!   are identical up to it, over the part both still have.
 //!
 //! Then faults stop, every replica restarts and the cluster must converge:
-//! one leader, nobody recovering, identical logs and commit indices.
-//! Corruption hits at most a minority of replicas at a time, so the
-//! cluster can always recover. Safety holds even beyond that; only liveness
-//! needs the bound.
+//! one leader, and among the voters of its configuration nobody recovering,
+//! identical logs, commit indices and state machines. Corruption hits at
+//! most a minority of the smallest voter set at a time, so the cluster can
+//! always recover. Safety holds even beyond that; only liveness needs the
+//! bound.
 
 use crate::error::Error;
 use crate::log::LogEntry;
@@ -68,6 +76,8 @@ pub struct Faults {
     pub read: u32,
     /// Per replica and tick: snapshot the state machine and compact the log.
     pub snapshot: u32,
+    /// Per tick: the operator asks the leader for a membership change.
+    pub membership: u32,
 }
 
 impl Default for Faults {
@@ -84,13 +94,19 @@ impl Default for Faults {
             propose: 300_000,
             read: 150_000,
             snapshot: 30_000,
+            membership: 25_000,
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SimConfig {
+    /// Servers that exist: ids `1..=replicas`. All of them run from the start.
     pub replicas: u64,
+    /// How many of them, `1..=voters`, are voters at the start; the others
+    /// wait to be added. 0: the seed picks between 3 (or `replicas`, if
+    /// fewer) and `replicas`.
+    pub voters: u64,
     /// Ticks with faults.
     pub ticks: u64,
     /// Fault-free ticks to converge in afterwards.
@@ -102,6 +118,7 @@ impl Default for SimConfig {
     fn default() -> Self {
         SimConfig {
             replicas: 5,
+            voters: 0,
             ticks: 2_000,
             heal_ticks: 600,
             faults: Faults::default(),
@@ -136,6 +153,8 @@ pub struct Report {
     /// Snapshots the state machine was restored from: after a restart, or
     /// sent by a leader to a follower that needed compacted entries.
     pub restores: u64,
+    /// Membership changes that committed.
+    pub reconfigs: u64,
 }
 
 impl Report {
@@ -155,6 +174,7 @@ impl Report {
         self.snapshots += o.snapshots;
         self.snapshots_sent += o.snapshots_sent;
         self.restores += o.restores;
+        self.reconfigs += o.reconfigs;
     }
 
     /// The counters, without the seed.
@@ -162,7 +182,7 @@ impl Report {
         format!(
             "committed {}, elections {}, crashes {}, corruptions {}, recoveries {}, io errors {}, \
              partitions {}, reads {} served / {} failed, snapshots {} taken / {} sent / {} restored, \
-             messages {} delivered / {} dropped",
+             membership changes {}, messages {} delivered / {} dropped",
             self.committed,
             self.elections,
             self.crashes,
@@ -175,6 +195,7 @@ impl Report {
             self.snapshots,
             self.snapshots_sent,
             self.restores,
+            self.reconfigs,
             self.delivered,
             self.dropped
         )
@@ -237,12 +258,60 @@ struct Checker {
     committed: BTreeMap<Index, (LogEntry, Term)>,
     /// The state machine (digest) after each index, as first seen.
     states: BTreeMap<Index, u64>,
+    /// The committed configurations by the index of their entry. Index 0 is
+    /// the initial one, when known.
+    configs: BTreeMap<Index, Vec<NodeId>>,
 }
 
 /// A log as the simulator sees it: where it starts, and its entries.
 type LogView = (Index, Vec<LogEntry>);
 
+/// How many servers two voter sets differ by.
+fn distance(a: &[NodeId], b: &[NodeId]) -> usize {
+    a.iter().filter(|x| !b.contains(x)).count() + b.iter().filter(|x| !a.contains(x)).count()
+}
+
 impl Checker {
+    /// A checker for a cluster that starts with the voters `initial`.
+    fn new(initial: Vec<NodeId>) -> Self {
+        Checker {
+            configs: BTreeMap::from([(0, initial)]),
+            ..Checker::default()
+        }
+    }
+
+    /// The configuration entry at `index` committed with `voters`. It must
+    /// differ from the committed configurations around it by one server.
+    fn config(&mut self, index: Index, voters: Vec<NodeId>) -> Result<(), String> {
+        let before = self.configs.range(..index).next_back();
+        let after = self.configs.range(index + 1..).next();
+        for (&other, v) in before.into_iter().chain(after) {
+            let by = distance(v, &voters);
+            if by != 1 {
+                return Err(format!(
+                    "configurations {other} and {index} differ by {by} servers, not one"
+                ));
+            }
+        }
+        self.configs.insert(index, voters);
+        Ok(())
+    }
+
+    /// `id` uses the voters `voters` where it is at `index`, with no
+    /// configuration entry of its log beyond that: they must be the ones
+    /// committed at that index. This covers a snapshot it takes or installs,
+    /// and the configuration a node derives from its log. No voters at all
+    /// is what a node without configuration, and without a configuration
+    /// entry in its log, knows.
+    fn config_at(&self, id: NodeId, index: Index, voters: &[NodeId]) -> Result<(), String> {
+        match self.configs.range(..=index).next_back() {
+            Some((&at, v)) if (v != voters) & !(voters.is_empty() & (at == 0)) => Err(format!(
+                "replica {id} uses voters {voters:?} at index {index}, but {v:?} was committed"
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// `id` leads `term`; returns whether that is news. A new leader must
     /// hold every entry committed in an earlier term.
     fn leader(&mut self, id: NodeId, term: Term, log: &dyn Fn() -> LogView) -> Result<bool, String> {
@@ -285,6 +354,9 @@ impl Checker {
             match self.committed.entry(e.index) {
                 Entry::Vacant(v) => {
                     v.insert((e.clone(), term));
+                    if let Some(voters) = e.voters() {
+                        self.config(e.index, voters)?;
+                    }
                 }
                 Entry::Occupied(mut o) if o.get().0 == *e => {
                     let lowest = &mut o.get_mut().1;
@@ -361,7 +433,8 @@ struct Sim {
     rng: Rng,
     now: u64,
     dir: PathBuf,
-    voters: Vec<NodeId>,
+    /// The voters the cluster started with, `1..=n`.
+    initial: Vec<NodeId>,
     replicas: Vec<Replica>,
     /// In-flight messages by (delivery tick, send order).
     queue: BTreeMap<(u64, u64), Message>,
@@ -378,9 +451,14 @@ struct Sim {
 
 impl Sim {
     fn new(seed: u64, cfg: SimConfig) -> Self {
-        let voters: Vec<NodeId> = (1..=cfg.replicas).collect();
-        let replicas = voters
-            .iter()
+        let mut rng = Rng(seed);
+        let fewest = cfg.replicas.min(3);
+        let count = match cfg.voters {
+            0 => rng.range((fewest, cfg.replicas)),
+            n => n.min(cfg.replicas),
+        };
+        let initial: Vec<NodeId> = (1..=count).collect();
+        let replicas = (0..cfg.replicas)
             .map(|_| Replica {
                 env: MemEnv::new(),
                 node: None,
@@ -392,15 +470,15 @@ impl Sim {
             })
             .collect();
         Sim {
-            rng: Rng(seed),
+            rng,
             now: 0,
             dir: PathBuf::from("/raft"),
-            voters,
+            check: Checker::new(initial.clone()),
+            initial,
             replicas,
             queue: BTreeMap::new(),
             sent: 0,
             partition: None,
-            check: Checker::default(),
             payload: 0,
             reads: BTreeMap::new(),
             report: Report {
@@ -458,7 +536,10 @@ impl Sim {
             self.propose()?;
         }
         if (self.now < self.cfg.ticks + self.cfg.heal_ticks / 2) & self.rng.chance(self.cfg.faults.read) {
-            self.read()?;
+            self.read();
+        }
+        if (self.now < self.cfg.ticks + self.cfg.heal_ticks / 2) & self.rng.chance(self.cfg.faults.membership) {
+            self.reconfigure()?;
         }
         self.deliver()?;
         if self.now.is_multiple_of(16) {
@@ -489,6 +570,7 @@ impl Sim {
         let r = &mut self.replicas[i];
         (r.applied, r.digest) = (snapshot.index, digest);
         self.check.state(id, snapshot.index, digest)?;
+        self.check.config_at(id, snapshot.index, &snapshot.voters)?;
         self.report.restores += 1;
         Ok(())
     }
@@ -519,11 +601,18 @@ impl Sim {
             self.partition = Some((self.now + self.rng.range((10, 100)), sides));
             self.report.partitions += 1;
         }
-        let bound = (self.replicas.len() - 1) / 2;
+        // A server that no live node counts as a voter cannot hold anyone up.
+        let voting: Vec<NodeId> = (self.replicas.iter())
+            .filter_map(|r| r.node.as_ref())
+            .flat_map(Node::voters)
+            .collect();
+        let bound = (self.fewest_voters() as usize).saturating_sub(1) / 2;
         for i in 0..self.replicas.len() {
             let up = self.replicas[i].node.is_some();
             if up & self.rng.chance(f.crash) {
-                let damaged = self.replicas.iter().filter(|r| r.damaged).count();
+                let damaged = (self.replicas.iter().enumerate())
+                    .filter(|(i, r)| r.damaged & voting.contains(&(*i as NodeId + 1)))
+                    .count();
                 let corrupt = self.rng.chance(f.corrupt) & (damaged < bound);
                 self.crash(i, corrupt);
             } else if up & self.rng.chance(f.io_error) {
@@ -542,18 +631,32 @@ impl Sim {
         }
     }
 
+    /// The smallest voter set the cluster can have: the operator never goes
+    /// below 3 voters (or all the servers, if there are fewer), and without
+    /// an operator it stays at its initial size.
+    fn fewest_voters(&self) -> u64 {
+        match self.cfg.faults.membership {
+            0 => self.initial.len() as u64,
+            _ => self.cfg.replicas.min(3),
+        }
+    }
+
     fn start(&mut self, i: usize) -> Result<(), String> {
         let id = i as NodeId + 1;
         let env: Arc<dyn Env> = Arc::new(self.replicas[i].env.clone());
         let storage =
             FileStorage::open_with_env(env, &self.dir).map_err(|e| format!("replica {id} cannot restart: {e}"))?;
         // A cluster may mix replicas with and without pre-vote.
+        let base = match id <= self.initial.len() as NodeId {
+            true => Config::cluster(id, self.initial.clone()),
+            false => Config::joiner(id),
+        };
         let cfg = Config {
             seed: self.rng.next(),
             pre_vote: self.rng.next() & 1 == 0,
-            ..Config::cluster(id, self.voters.clone())
+            ..base
         };
-        let node = Node::new(cfg, storage).expect("a voter, and FileStorage::load cannot fail");
+        let node = Node::new(cfg, storage).expect("a configured node, and FileStorage::load cannot fail");
         let r = &mut self.replicas[i];
         r.damaged = node.recovering();
         r.node = Some(node);
@@ -616,6 +719,11 @@ impl Sim {
                 .commit(id, term, &log.1[(from - log.0) as usize..(commit - log.0) as usize])?;
             r.seen_commit = commit;
         }
+        // With no configuration entry beyond the commit index in its log, the
+        // voters a node uses are the ones committed at that index.
+        if !node.config_pending() {
+            self.check.config_at(id, commit, &node.voters())?;
+        }
         if r.damaged & !node.recovering() {
             r.damaged = false;
             self.report.recoveries += 1;
@@ -623,13 +731,52 @@ impl Sim {
         Ok(())
     }
 
-    fn propose(&mut self) -> Result<(), String> {
-        let leader = (self.replicas.iter().enumerate())
+    /// The replica that leads in the highest term.
+    fn newest_leader(&self) -> Option<usize> {
+        (self.replicas.iter().enumerate())
             .filter_map(|(i, r)| r.node.as_ref().map(|n| (n, i)))
             .filter(|(n, _)| n.role() == NodeState::Leader)
             .max_by_key(|(n, _)| n.term())
-            .map(|(_, i)| i);
-        let Some(i) = leader else { return Ok(()) };
+            .map(|(_, i)| i)
+    }
+
+    /// The operator asks the leader for one membership change: it adds a
+    /// learner, promotes one, removes a voter or drops a learner. A leader
+    /// refuses when a change is pending, when a learner has not caught up, or
+    /// when it has just lost its leadership; that is normal.
+    fn reconfigure(&mut self) -> Result<(), String> {
+        let Some(i) = self.newest_leader() else { return Ok(()) };
+        let node = self.replicas[i].node.as_ref().expect("a leader is up");
+        let (voters, learners) = (node.voters(), node.learners());
+        let outside = (1..=self.cfg.replicas).filter(|id| !voters.contains(id) & !learners.contains(id));
+        let mut ops: Vec<(Op, NodeId)> = outside.map(|id| (Op::AddLearner, id)).collect();
+        ops.extend(
+            learners
+                .iter()
+                .flat_map(|&id| [(Op::AddVoter, id), (Op::RemoveLearner, id)]),
+        );
+        if voters.len() as u64 > self.fewest_voters() {
+            ops.extend(voters.iter().map(|&id| (Op::RemoveVoter, id)));
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let (op, id) = ops[self.rng.below(ops.len() as u64) as usize];
+        let result = match op {
+            Op::AddLearner => node.add_learner(id),
+            Op::RemoveLearner => node.remove_learner(id),
+            Op::AddVoter => node.add_voter(id).map(|_| ()),
+            Op::RemoveVoter => node.remove_voter(id).map(|_| ()),
+        };
+        match result {
+            Err(Error::NotReady | Error::NotLeader(_) | Error::BadConfig(_)) => Ok(()),
+            Err(e) => self.failed(i, e),
+            Ok(()) => self.observe(i),
+        }
+    }
+
+    fn propose(&mut self) -> Result<(), String> {
+        let Some(i) = self.newest_leader() else { return Ok(()) };
         self.payload += 1;
         let data = self.payload.to_le_bytes().to_vec();
         match self.replicas[i].node.as_ref().map(|n| n.propose(data)) {
@@ -640,7 +787,7 @@ impl Sim {
 
     /// A client asks a leader, any leader: a stale one that still believes
     /// it leads must never answer.
-    fn read(&mut self) -> Result<(), String> {
+    fn read(&mut self) {
         let leaders: Vec<usize> = (0..self.replicas.len())
             .filter(|&i| {
                 self.replicas[i]
@@ -650,17 +797,13 @@ impl Sim {
             })
             .collect();
         if leaders.is_empty() {
-            return Ok(());
+            return;
         }
         let i = leaders[self.rng.below(leaders.len() as u64) as usize];
-        let asked = self.replicas[i].node.as_ref().expect("a leader is up").read_index();
-        match asked {
-            Ok(id) => {
-                self.reads.insert((i, id), self.check.top());
-                Ok(())
-            }
-            Err(Error::NotReady) => Ok(()),
-            Err(e) => self.failed(i, e),
+        // A leader answers with an id, or with `NotReady` while the empty
+        // entry of its term is not committed yet.
+        if let Ok(id) = self.replicas[i].node.as_ref().expect("a leader is up").read_index() {
+            self.reads.insert((i, id), self.check.top());
         }
     }
 
@@ -734,35 +877,73 @@ impl Sim {
         Ok(())
     }
 
-    /// After healing: every replica up and caught up, one leader, identical
-    /// logs (past the newest snapshot), commit indices and state machines.
+    /// After healing: every replica up, one leader, and the voters of its
+    /// configuration caught up, with identical logs (past the newest
+    /// snapshot), commit indices and state machines. Servers that are not
+    /// voters, such as the removed ones, are not expected to.
     fn converged(&mut self) -> Result<(), String> {
-        let nodes: Vec<&Node> = self.replicas.iter().filter_map(|r| r.node.as_ref()).collect();
-        let logs = self.logs();
-        let leaders = nodes.iter().filter(|n| n.role() == NodeState::Leader).count();
+        let up: Vec<&Node> = self.replicas.iter().filter_map(|r| r.node.as_ref()).collect();
+        let leaders = up.iter().filter(|n| n.role() == NodeState::Leader).count();
+        let leader = up.iter().find(|n| n.role() == NodeState::Leader);
+        let voters = leader.map_or_else(Vec::new, |n| n.voters());
+        // A leader that is not among its own voters has not stepped down.
+        let leads_itself = leader.is_some_and(|n| voters.contains(&n.id()));
+        let members: Vec<usize> = (0..self.replicas.len())
+            .filter(|&i| voters.contains(&(i as NodeId + 1)))
+            .collect();
+        let nodes: Vec<&Node> = members.iter().filter_map(|&i| self.replicas[i].node.as_ref()).collect();
+        let logs: Vec<LogView> = nodes.iter().map(|n| (n.snapshot_index(), n.log_snapshot().1)).collect();
         let commits: Vec<Index> = nodes.iter().map(|n| n.commit_index()).collect();
         let recovering = nodes.iter().filter(|n| n.recovering()).count();
-        let machines: Vec<(Index, u64)> = self.replicas.iter().map(|r| (r.applied, r.digest)).collect();
+        let machines: Vec<(Index, u64)> = members
+            .iter()
+            .map(|&i| (self.replicas[i].applied, self.replicas[i].digest))
+            .collect();
         let floor = logs.iter().map(|l| l.0).max().unwrap_or(0);
         let lasts: Vec<Index> = logs.iter().map(|l| l.0 + l.1.len() as Index).collect();
-        let ok = (nodes.len() == self.replicas.len())
+        let ok = (up.len() == self.replicas.len())
             & (leaders == 1)
+            & leads_itself
             & (recovering == 0)
             & lasts.windows(2).all(|w| w[0] == w[1])
             & logs.windows(2).all(|w| after(&w[0], floor) == after(&w[1], floor))
             & commits.windows(2).all(|w| w[0] == w[1])
             & machines.windows(2).all(|w| w[0] == w[1]);
         if !ok {
+            let each: Vec<String> = (up.iter())
+                .map(|n| {
+                    let (role, recovering) = (n.role(), n.recovering());
+                    format!(
+                        "{}: {role:?} term {} voters {:?} commit {} recovering {recovering}",
+                        n.id(),
+                        n.term(),
+                        n.voters(),
+                        n.commit_index()
+                    )
+                })
+                .collect();
             return Err(format!(
-                "no convergence after healing: {} of {} up, {leaders} leaders, {recovering} recovering, \
-                 last indices {lasts:?}, commit indices {commits:?}, state machines {machines:x?}",
-                nodes.len(),
+                "no convergence after healing: {} of {} up, {leaders} leaders, voters {voters:?}, \
+                 {recovering} recovering, last indices {lasts:?}, commit indices {commits:?}, \
+                 state machines {machines:x?}; replicas: {}",
+                up.len(),
                 self.replicas.len(),
+                each.join("; "),
             ));
         }
         self.report.committed = commits[0];
+        self.report.reconfigs = self.check.configs.len() as u64 - 1;
         Ok(())
     }
+}
+
+/// What the operator asks of a leader.
+#[derive(Clone, Copy)]
+enum Op {
+    AddLearner,
+    AddVoter,
+    RemoveVoter,
+    RemoveLearner,
 }
 
 #[cfg(test)]
@@ -772,6 +953,7 @@ mod tests {
     fn quick(replicas: u64) -> SimConfig {
         SimConfig {
             replicas,
+            voters: 0,
             ticks: 600,
             heal_ticks: 400,
             faults: Faults {
@@ -819,6 +1001,7 @@ mod tests {
     fn single_replica_and_no_faults() {
         let cfg = SimConfig {
             replicas: 1,
+            voters: 0,
             ticks: 0,
             heal_ticks: 200,
             faults: Faults::default(),
@@ -838,11 +1021,7 @@ mod tests {
     }
 
     fn e(index: Index, term: Term) -> LogEntry {
-        LogEntry {
-            index,
-            term,
-            data: vec![index as u8, term as u8],
-        }
+        LogEntry::new(index, term, vec![index as u8, term as u8])
     }
 
     #[test]
@@ -867,6 +1046,34 @@ mod tests {
         let lacking = c.leader(3, 5, &|| (2, vec![e(3, 2)])).unwrap_err();
         assert!(lacking.contains("lacks committed entry 3"), "{lacking}");
         assert_eq!(c.leader(3, 6, &|| (2, vec![e(3, 1)])), Ok(true));
+        // Committed configurations differ by one server, in either order.
+        let mut k = Checker::new(vec![1, 2, 3]);
+        k.config(5, vec![1, 2, 3, 4]).unwrap();
+        k.config(9, vec![1, 3, 4]).unwrap();
+        k.config(7, vec![1, 2, 3, 4, 5]).unwrap_err();
+        let two = k.config(3, vec![1, 2, 3, 4, 5]).unwrap_err();
+        assert!(
+            two.contains("configurations 0 and 3 differ by 2 servers, not one"),
+            "{two}"
+        );
+        assert_eq!(k.configs.len(), 3);
+        // ... also when they come with the entries a replica reports.
+        let entry = LogEntry::config(12, 1, &[1, 2]);
+        let by_three = k.commit(1, 1, &[entry]).unwrap_err();
+        assert!(by_three.contains("differ by"), "{by_three}");
+        // A node's voters must be those committed at its index; none at all
+        // is fine before the first entry, for a node with no configuration.
+        let at = |c: &Checker, index, voters: &[NodeId]| c.config_at(1, index, voters);
+        assert_eq!(at(&k, 0, &[1, 2, 3]), Ok(()));
+        assert_eq!(at(&k, 4, &[]), Ok(()));
+        assert_eq!(at(&k, 6, &[1, 2, 3, 4]), Ok(()));
+        assert_eq!(at(&k, 20, &[1, 3, 4]), Ok(()));
+        let wrong = at(&k, 6, &[1, 2, 3]).unwrap_err();
+        assert!(
+            wrong.contains("replica 1 uses voters [1, 2, 3] at index 6, but [1, 2, 3, 4] was committed"),
+            "{wrong}"
+        );
+        assert!(at(&k, 6, &[]).is_err());
         // States must agree at every index.
         c.state(1, 5, 0xabc).unwrap();
         c.state(2, 5, 0xabc).unwrap();
@@ -964,11 +1171,7 @@ mod tests {
     /// checks that every path that watches a replica reports it.
     #[test]
     fn oracle_violations_stop_the_run() {
-        let other = || LogEntry {
-            index: 1,
-            term: 1,
-            data: b"other".to_vec(),
-        };
+        let other = || LogEntry::new(1, 1, b"other".to_vec());
         let first_error = |sim: &mut Sim| (0..200).find_map(|_| sim.tick().err()).unwrap();
         // Two leaders in one term, seen on a tick.
         let mut sim = started(quick(1));
@@ -1038,31 +1241,6 @@ mod tests {
         sim.answered(0, &read(4, None)).unwrap();
         assert_eq!((sim.report.reads_served, sim.report.reads_failed), (1, 1));
         assert!(sim.reads.is_empty());
-        // The replica's own failure to start a read surfaces too.
-        let mut sim = started(quick(1));
-        while sim.replicas[0].node.as_ref().unwrap().role() != NodeState::Leader {
-            sim.replicas[0].node.as_ref().unwrap().tick().unwrap();
-        }
-        sim.replicas[0].env.fail_after(0);
-        sim.replicas[0].env = MemEnv::new();
-        let err = sim.read().unwrap_err();
-        assert!(err.starts_with("replica 1 failed: "), "{err}");
-        // The same from a tick that asks for a read (and never proposes).
-        let mut sim = started(SimConfig {
-            faults: Faults {
-                propose: 0,
-                read: 1_000_000,
-                ..quick(1).faults
-            },
-            ..quick(1)
-        });
-        while sim.replicas[0].node.as_ref().unwrap().role() != NodeState::Leader {
-            sim.replicas[0].node.as_ref().unwrap().tick().unwrap();
-        }
-        sim.replicas[0].env.fail_after(0);
-        sim.replicas[0].env = MemEnv::new();
-        let err = sim.tick().unwrap_err();
-        assert!(err.starts_with("replica 1 failed: "), "{err}");
         // A read the simulator never asked for is released by a tick.
         let mut sim = started(SimConfig {
             faults: Faults {
@@ -1108,7 +1286,8 @@ mod tests {
         let sim = idle_leader(faults);
         let node = sim.replicas[0].node.as_ref().unwrap();
         node.propose(b"a".to_vec()).unwrap();
-        assert_eq!(node.tick().unwrap().committed.len(), 1);
+        // Its own empty entry, and this one.
+        assert_eq!(node.tick().unwrap().committed.len(), 2);
         sim
     }
 
@@ -1117,6 +1296,7 @@ mod tests {
         let snapshot = |data: &[u8]| Snapshot {
             index: 1,
             term: 1,
+            voters: vec![1, 2, 3],
             data: data.to_vec(),
         };
         let mut sim = started(quick(1));
@@ -1182,5 +1362,107 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.starts_with("seed 5, tick 600: no convergence"), "{err}");
+    }
+
+    /// A cluster of 5 servers with 4 voters at the start, and no faults but
+    /// the operator's.
+    fn operated(membership: u32) -> Sim {
+        started(SimConfig {
+            replicas: 5,
+            voters: 4,
+            ticks: 5_000,
+            heal_ticks: 100,
+            faults: Faults {
+                drop: 0,
+                duplicate: 0,
+                partition: 0,
+                crash: 0,
+                io_error: 0,
+                propose: 0,
+                read: 0,
+                snapshot: 0,
+                membership,
+                ..Faults::default()
+            },
+        })
+    }
+
+    #[test]
+    fn the_operator_changes_the_cluster_and_the_voters_are_counted() {
+        // Some servers wait to be added; the operator can be switched off.
+        let cfg = |voters, membership| SimConfig {
+            replicas: 5,
+            voters,
+            ticks: 600,
+            heal_ticks: 400,
+            faults: Faults {
+                membership,
+                ..quick(5).faults
+            },
+        };
+        let idle = run(4, &cfg(4, 0)).unwrap();
+        assert!(idle.committed > 0 && idle.reconfigs == 0);
+        let busy = run(4, &cfg(4, 100_000)).unwrap();
+        assert!(busy.reconfigs > 0, "{busy}");
+        assert!(busy.to_string().contains("membership changes"), "{busy}");
+        let mut sum = Report::default();
+        sum.add(&busy);
+        sum.add(&busy);
+        assert_eq!(sum.reconfigs, 2 * busy.reconfigs);
+        // The seed picks how many start as voters when none is asked for.
+        let sizes: Vec<usize> = (0..20).map(|seed| Sim::new(seed, cfg(0, 0)).initial.len()).collect();
+        assert!(sizes.iter().all(|n| (3..=5).contains(n)) && sizes.iter().any(|&n| n != sizes[0]));
+        assert_eq!(
+            Sim::new(1, cfg(9, 0)).initial.len(),
+            5,
+            "no more than there are servers"
+        );
+    }
+
+    #[test]
+    fn a_failing_leader_during_a_membership_change_is_a_violation() {
+        let mut sim = operated(1_000_000);
+        // Wait for a leader that has committed its own empty entry.
+        let leader = (0..200)
+            .find_map(|_| {
+                sim.tick().unwrap();
+                sim.newest_leader().filter(|&i| {
+                    let n = sim.replicas[i].node.as_ref().unwrap();
+                    n.commit_index() > 0
+                })
+            })
+            .unwrap();
+        // Its disk fails, without the simulator having injected it.
+        sim.replicas[leader].env.fail_after(0);
+        sim.replicas[leader].env = MemEnv::new();
+        let err = (0..200).find_map(|_| sim.reconfigure().err()).unwrap();
+        assert!(err.starts_with(&format!("replica {} failed: ", leader + 1)), "{err}");
+        // The same from a tick, in which the operator acts every time.
+        let err = (0..200).find_map(|_| sim.tick().err()).unwrap();
+        assert!(err.contains(" failed: "), "{err}");
+    }
+
+    #[test]
+    fn a_node_that_disagrees_about_the_configuration_is_a_violation() {
+        // The checker was told the committed configuration is another one.
+        let mut sim = started(quick(3));
+        sim.check.configs.insert(0, vec![9]);
+        let err = sim.observe(0).unwrap_err();
+        assert!(
+            err.contains("replica 1 uses voters [1, 2, 3] at index 0, but [9] was committed"),
+            "{err}"
+        );
+        // The same for the configuration a snapshot brings.
+        let snapshot = Snapshot {
+            index: 1,
+            term: 1,
+            voters: vec![1, 2, 3],
+            data: 7u64.to_le_bytes().to_vec(),
+        };
+        let err = sim.restore(0, &snapshot).unwrap_err();
+        assert!(
+            err.contains("uses voters [1, 2, 3] at index 1, but [9] was committed"),
+            "{err}"
+        );
     }
 }

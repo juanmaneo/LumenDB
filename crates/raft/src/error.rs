@@ -24,6 +24,8 @@ pub enum LogError {
     TruncatesCommitted,
     /// A snapshot at `index` does not move the base `base` forward.
     NotAboveBase { index: Index, base: Index },
+    /// The configuration entry at `index` does not hold a valid voter list.
+    BadConfig { index: Index },
 }
 
 impl fmt::Display for LogError {
@@ -43,6 +45,7 @@ impl fmt::Display for LogError {
             ),
             LogError::TruncatesCommitted => write!(f, "append would truncate committed entries"),
             LogError::NotAboveBase { index, base } => write!(f, "snapshot at {index} is not above the base {base}"),
+            LogError::BadConfig { index } => write!(f, "configuration entry {index} holds no valid voter list"),
         }
     }
 }
@@ -51,12 +54,13 @@ impl fmt::Display for LogError {
 pub enum Error {
     /// Durable storage failed (I/O error, corruption); the node must stop.
     Storage(String),
-    /// Message from a node that is not a peer of this one.
-    UnknownPeer(u64),
+
     /// Entries that would break the log invariants or a committed prefix.
     LogInconsistency(LogError),
     /// This node is not in its own voter set.
     NotConfigured,
+    /// A membership change the leader refuses: the reason.
+    BadConfig(&'static str),
     /// Proposal sent to a non-leader; carries the known leader, if any.
     NotLeader(Option<NodeId>),
     /// A linearizable read needs an entry of the leader's own term to be
@@ -70,9 +74,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Storage(m) => write!(f, "storage: {m}"),
-            Error::UnknownPeer(id) => write!(f, "unknown peer {id}"),
+
             Error::LogInconsistency(m) => write!(f, "log inconsistency: {m}"),
             Error::NotConfigured => write!(f, "node not in peer set"),
+            Error::BadConfig(why) => write!(f, "membership change refused: {why}"),
             Error::NotLeader(hint) => write!(f, "not leader (leader hint: {hint:?})"),
             Error::NotReady => write!(f, "leader has not committed an entry of its term yet, retry"),
             Error::BadSnapshot(why) => write!(f, "bad snapshot: {why}"),
@@ -102,7 +107,7 @@ mod tests {
     #[test]
     fn display() {
         assert!(format!("{}", Error::Storage("s".into())).contains('s'));
-        assert!(format!("{}", Error::UnknownPeer(7)).contains("7"));
+
         let e = Error::LogInconsistency(LogError::TruncatesCommitted);
         assert_eq!(
             e.to_string(),
@@ -112,6 +117,10 @@ mod tests {
         assert!(format!("{}", Error::NotLeader(Some(3))).contains("Some(3)"));
         assert!(Error::NotReady.to_string().ends_with("retry"));
         assert_eq!(Error::BadSnapshot("too new").to_string(), "bad snapshot: too new");
+        assert_eq!(
+            Error::BadConfig("one at a time").to_string(),
+            "membership change refused: one at a time"
+        );
     }
 
     #[test]
@@ -143,6 +152,10 @@ mod tests {
             (
                 LogError::NotAboveBase { index: 2, base: 5 },
                 "snapshot at 2 is not above the base 5",
+            ),
+            (
+                LogError::BadConfig { index: 8 },
+                "configuration entry 8 holds no valid voter list",
             ),
         ];
         for (e, want) in cases {

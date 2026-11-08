@@ -40,7 +40,7 @@
 //! missing snapshot or log file fails the open instead.
 
 use crate::error::{Error, Result};
-use crate::log::{Log, LogEntry};
+use crate::log::{decode_voters, encode_voters, EntryKind, Log, LogEntry};
 use crate::{Index, NodeId, Term};
 use flashkv::codec::Decoder;
 use flashkv::env::{Env, LockGuard, OsEnv};
@@ -52,11 +52,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// A snapshot of the state machine: the effect of every entry up to `index`
-/// (whose term was `term`). What `data` holds is up to the application.
+/// (whose term was `term`). What `data` holds is up to the application. The
+/// cluster configuration at `index` is part of it, as the log entries that
+/// set it are gone (empty: the log never had a configuration entry, and the
+/// node's own configured voters apply).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub index: Index,
     pub term: Term,
+    pub voters: Vec<NodeId>,
     pub data: Vec<u8>,
 }
 
@@ -126,7 +130,8 @@ impl Storage for MemoryStorage {
     }
     fn install_snapshot(&self, snapshot: Arc<Snapshot>) -> Result<()> {
         let mut s = self.state.lock();
-        s.log.install_snapshot(snapshot.index, snapshot.term)?;
+        s.log
+            .install_snapshot(snapshot.index, snapshot.term, snapshot.voters.clone())?;
         s.snapshot = Some(snapshot);
         Ok(())
     }
@@ -150,9 +155,10 @@ fn snap_name(index: Index) -> String {
 }
 
 fn encode_snapshot(s: &Snapshot) -> Vec<u8> {
-    let mut p = Vec::with_capacity(16 + s.data.len());
+    let mut p = Vec::with_capacity(32 + s.data.len());
     p.extend_from_slice(&s.index.to_le_bytes());
     p.extend_from_slice(&s.term.to_le_bytes());
+    put_len_prefixed(&mut p, &encode_voters(&s.voters));
     p.extend_from_slice(&s.data);
     let mut out = Vec::with_capacity(p.len() + flashkv::log::HEADER);
     frame(&mut out, &p);
@@ -163,18 +169,30 @@ fn encode_snapshot(s: &Snapshot) -> Vec<u8> {
 /// `(index, term)` the state file expects.
 fn decode_snapshot(buf: &[u8], index: Index, term: Term) -> Option<Snapshot> {
     let (records, end) = parse(buf);
-    match records.as_slice() {
-        [p] if (end == buf.len()) & (p.len() >= 16) => {
-            let mut d = Decoder::new(p);
-            let (i, t) = (d.u64(), d.u64());
-            ((i, t) == (index, term)).then(|| Snapshot {
-                index: i,
-                term: t,
-                data: p[16..].to_vec(),
-            })
-        }
-        _ => None,
+    let [p] = records.as_slice() else {
+        return None;
+    };
+    if end != buf.len() {
+        return None;
     }
+    let mut d = Decoder::new(p);
+    let (i, t) = (d.u64(), d.u64());
+    let voters = d.lp();
+    let rest = d.remaining();
+    let data = d.bytes(rest);
+    let voters = match voters.is_empty() {
+        true => Some(Vec::new()),
+        false => decode_voters(voters),
+    };
+    if ((i, t) != (index, term)) | d.finish("snapshot").is_err() {
+        return None;
+    }
+    Some(Snapshot {
+        index: i,
+        term: t,
+        voters: voters?,
+        data: data.to_vec(),
+    })
 }
 
 /// Contents of `raft.state`.
@@ -260,6 +278,7 @@ fn encode_batch(entries: &[LogEntry]) -> Vec<u8> {
     for e in entries {
         p.extend_from_slice(&e.index.to_le_bytes());
         p.extend_from_slice(&e.term.to_le_bytes());
+        p.push(e.kind as u8);
         put_len_prefixed(&mut p, &e.data);
     }
     p
@@ -268,14 +287,24 @@ fn encode_batch(entries: &[LogEntry]) -> Vec<u8> {
 fn decode_batch(p: &[u8]) -> Result<Vec<LogEntry>> {
     let mut d = Decoder::new(p);
     let n = d.varint();
-    // Every entry takes at least 17 bytes: a corrupt count cannot spin.
+    // Every entry takes at least 18 bytes: a corrupt count cannot spin.
     let n = n.min(d.remaining() as u64);
     let mut out = Vec::new();
     for _ in 0..n {
         let index = d.u64();
         let term = d.u64();
+        let kind = match d.u8() {
+            0 => EntryKind::Normal,
+            1 => EntryKind::Config,
+            _ => return Err(Error::Storage("unknown entry kind".into())),
+        };
         let data = d.lp().to_vec();
-        out.push(LogEntry { index, term, data });
+        out.push(LogEntry {
+            index,
+            term,
+            kind,
+            data,
+        });
     }
     d.finish("raft log batch")?;
     Ok(out)
@@ -337,7 +366,7 @@ impl FileStorage {
         damaged |= (rec.snap_index != 0) & snapshot.is_none();
         let mut log = snapshot
             .as_ref()
-            .map_or_else(Log::new, |s| Log::with_base(s.index, s.term));
+            .map_or_else(Log::new, |s| Log::with_base(s.index, s.term, s.voters.clone()));
         for record in records {
             // An intact checksum around a batch that does not decode or does
             // not follow the log is damage too: keep the prefix before it.
@@ -480,7 +509,8 @@ impl Storage for FileStorage {
     fn install_snapshot(&self, snapshot: Arc<Snapshot>) -> Result<()> {
         let mut g = self.inner.lock();
         let mut next = g.state.clone();
-        next.log.install_snapshot(snapshot.index, snapshot.term)?;
+        next.log
+            .install_snapshot(snapshot.index, snapshot.term, snapshot.voters.clone())?;
         next.snapshot = Some(snapshot.clone());
         // The snapshot is durable before the state file points at it, and the
         // state file switches log and snapshot together. A crash in between
@@ -509,11 +539,11 @@ mod tests {
     use std::fs;
 
     fn e(index: u64, term: u64) -> LogEntry {
-        LogEntry {
-            index,
-            term,
-            data: format!("e{index}t{term}").into_bytes(),
-        }
+        LogEntry::new(index, term, format!("e{index}t{term}").into_bytes())
+    }
+
+    fn c(index: u64, term: u64, voters: &[NodeId]) -> LogEntry {
+        LogEntry::config(index, term, voters)
     }
 
     fn tmpdir(name: &str) -> PathBuf {
@@ -541,11 +571,13 @@ mod tests {
         let snapshot = Arc::new(Snapshot {
             index: 1,
             term: 5,
+            voters: vec![1, 2],
             data: b"x".to_vec(),
         });
         r.install_snapshot(snapshot.clone()).unwrap();
         let after = r.load().unwrap();
         assert_eq!((after.log.base_index(), after.log.last_index()), (1, 2));
+        assert_eq!(after.log.voters(), &[1, 2]);
         assert_eq!(after.snapshot, Some(snapshot.clone()));
         assert!(r.install_snapshot(snapshot).is_err());
         assert_eq!(r.load().unwrap(), after);
@@ -800,28 +832,30 @@ mod tests {
                 acked.log.append(&[e(1, 1), e(2, 1)]).unwrap();
                 s.append_entries(&[e(3, 1)])?;
                 acked.log.append(&[e(3, 1)]).unwrap();
-                s.append_entries(&[e(2, 2), e(3, 2)])?;
-                acked.log.append(&[e(2, 2), e(3, 2)]).unwrap();
+                s.append_entries(&[e(2, 2), c(3, 2, &[1, 2, 3])])?;
+                acked.log.append(&[e(2, 2), c(3, 2, &[1, 2, 3])]).unwrap();
                 // Compaction: the snapshot and the shortened log switch together.
                 let snap = Arc::new(Snapshot {
                     index: 2,
                     term: 2,
+                    voters: vec![1, 2],
                     data: b"state at 2".to_vec(),
                 });
                 s.install_snapshot(snap.clone())?;
-                acked.log.install_snapshot(2, 2).unwrap();
+                acked.log.install_snapshot(2, 2, vec![1, 2]).unwrap();
                 acked.snapshot = Some(snap);
-                s.append_entries(&[e(4, 2)])?;
-                acked.log.append(&[e(4, 2)]).unwrap();
+                s.append_entries(&[c(4, 2, &[1, 2, 3, 4])])?;
+                acked.log.append(&[c(4, 2, &[1, 2, 3, 4])]).unwrap();
                 // A snapshot ahead of the log replaces it, and replaces the
                 // previous snapshot file.
                 let snap = Arc::new(Snapshot {
                     index: 6,
                     term: 3,
+                    voters: vec![1, 2, 3, 4],
                     data: b"state at 6".to_vec(),
                 });
                 s.install_snapshot(snap.clone())?;
-                acked.log.install_snapshot(6, 3).unwrap();
+                acked.log.install_snapshot(6, 3, vec![1, 2, 3, 4]).unwrap();
                 acked.snapshot = Some(snap);
                 s.save_vote(2, None)?;
                 (acked.term, acked.voted_for) = (2, None);
@@ -854,6 +888,7 @@ mod tests {
         Arc::new(Snapshot {
             index,
             term,
+            voters: vec![1, 2, 3],
             data: data.to_vec(),
         })
     }
@@ -973,5 +1008,39 @@ mod tests {
         assert_eq!(st.snapshot.as_deref(), Some(&*snap(2, 3, b"state")));
         assert!(!dir.join(snap_name(7)).exists() && path.exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn entry_kinds_and_snapshot_voters_are_validated_on_decoding() {
+        let batch = vec![e(1, 1), c(2, 1, &[1, 2]), e(3, 1)];
+        assert_eq!(decode_batch(&encode_batch(&batch)).unwrap(), batch);
+        let mut p = Vec::new();
+        put_uvarint64(&mut p, 1);
+        p.extend_from_slice(&1u64.to_le_bytes());
+        p.extend_from_slice(&1u64.to_le_bytes());
+        p.push(7);
+        put_len_prefixed(&mut p, b"x");
+        assert_eq!(decode_batch(&p), Err(Error::Storage("unknown entry kind".into())));
+        // A snapshot record whose voter list is not one is damaged; an empty
+        // list means none was known.
+        let record = |voters: &[u8]| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&2u64.to_le_bytes());
+            p.extend_from_slice(&3u64.to_le_bytes());
+            put_len_prefixed(&mut p, voters);
+            p.extend_from_slice(b"data");
+            let mut out = Vec::new();
+            frame(&mut out, &p);
+            out
+        };
+        let decoded = |voters: &[u8]| decode_snapshot(&record(voters), 2, 3);
+        assert_eq!(decoded(&encode_voters(&[1, 2])).unwrap().voters, vec![1, 2]);
+        assert_eq!(decoded(&[]).unwrap().voters, Vec::<NodeId>::new());
+        assert_eq!(decoded(&encode_voters(&[1, 2])).unwrap().data, b"data");
+        assert_eq!(decoded(&encode_voters(&[2, 1])), None, "not ascending");
+        assert_eq!(decoded(&[1, 2, 3]), None, "not a list of ids");
+        // The snapshot the state file names is the one that is read.
+        assert_eq!(decode_snapshot(&record(&[]), 2, 4), None);
+        assert_eq!(decode_snapshot(&record(&[]), 5, 3), None);
     }
 }

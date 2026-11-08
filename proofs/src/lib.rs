@@ -48,11 +48,7 @@ pub fn crc_mask_roundtrip(c: u32) -> bool {
 }
 
 fn entry(index: Index, term: Term) -> LogEntry {
-    LogEntry {
-        index,
-        term,
-        data: Vec::new(),
-    }
+    LogEntry::new(index, term, Vec::new())
 }
 
 /// The documented `Log` invariants.

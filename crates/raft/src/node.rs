@@ -31,10 +31,8 @@
 //! round acknowledged by a majority. When the state machine has applied up to
 //! that index, `tick()` releases the read, which may then be served from local
 //! state. A leader cut off from the majority never confirms, so it can never
-//! serve a stale read. A new leader may have no entry of its own term
-//! committed yet, and then the first `read_index` appends an empty entry and
-//! asks the caller to retry; applications that read must ignore entries with
-//! empty data.
+//! serve a stale read. A new leader has no entry of its own term committed
+//! yet, and then `read_index` asks the caller to retry shortly.
 //!
 //! Snapshots and log compaction: the application owns the state machine, so
 //! it decides when to snapshot. [`Node::compact`] takes the serialized state
@@ -44,6 +42,37 @@
 //! it, and `tick()` hands it to the application as [`TickOutcome::snapshot`]
 //! to restore the state machine from, before any entries after it. After a
 //! restart the first tick does the same with the stored snapshot.
+//!
+//! Membership changes (Raft thesis section 4.1, one server at a time): the
+//! cluster configuration is a voter set held in [`crate::EntryKind::Config`] log
+//! entries. A configuration is in effect as soon as its entry is in the log,
+//! committed or not, and a truncated entry takes it back to the one before.
+//! The leader changes the voter set by one server per entry
+//! ([`Node::add_voter`], [`Node::remove_voter`]), so the old and the new
+//! majorities always overlap. It refuses a change while an earlier one is not
+//! committed, and before it has committed an entry of its own term: without
+//! that, two leaders in different terms could pick different configurations
+//! on the same log prefix. A new server first joins as a learner
+//! ([`Node::add_learner`]): it gets the log but does not vote or count toward
+//! any quorum, and [`Node::add_voter`] waits until it has caught up, so a
+//! slow newcomer cannot stall commits. A node that is not a voter never votes
+//! and never campaigns, and as long as a node hears from a leader, vote
+//! traffic from a server outside the voter set is ignored, so a removed server
+//! cannot depose it (with pre-vote on, which is the default, it cannot disturb
+//! a cluster that has a leader either way). Without a leader the traffic is
+//! answered: a server that has not heard that another was added may need that
+//! one to win. Granting a vote needs no membership, only the candidate's own
+//! voter set decides whether it counts. A server whose removal is still
+//! uncommitted keeps campaigning, see `is_member`. A leader that
+//! commits its own removal steps down. Until the cluster has a configuration
+//! entry the configured voters apply ([`Config::voters`]); an empty list makes
+//! a node that waits to be added ([`Config::joiner`]).
+//!
+//! A new leader appends an empty entry of its term at once (Raft thesis
+//! section 6.4). Entries of earlier terms commit only together with an entry
+//! of the leader's own term, so without it they could stay uncommitted, and
+//! stale entries on a follower unreplaced, until a client happened to write.
+//! Applications must ignore entries with empty data.
 //!
 //! Committed entries are handed out by `tick()` in index order, exactly once
 //! per process lifetime (after a restart they are replayed from just after the
@@ -110,6 +139,8 @@ struct PendingRead {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub id: NodeId,
+    /// The voters until the log holds a configuration entry (or a snapshot
+    /// that knows one). Empty for a node that waits to be added to a cluster.
     pub voters: Vec<NodeId>,
     pub election_timeout_min: u64,
     pub election_timeout_max: u64,
@@ -130,6 +161,13 @@ impl Config {
             seed: 0x1234_5678_9abc_def0,
             pre_vote: true,
         }
+    }
+
+    /// A node that is not in any cluster yet: it votes for nobody and never
+    /// campaigns, and learns the configuration from the leader that adds it
+    /// ([`Node::add_learner`], then [`Node::add_voter`]).
+    pub fn joiner(id: NodeId) -> Self {
+        Config::cluster(id, Vec::new())
     }
 
     pub fn cluster(id: NodeId, voters: Vec<NodeId>) -> Self {
@@ -178,12 +216,16 @@ struct Inner {
     snapshot: Option<Arc<Snapshot>>,
     /// A snapshot the next tick hands to the application.
     install: Option<Arc<Snapshot>>,
+    /// Leader only: servers that get the log without being voters, so that
+    /// they can catch up before they are added.
+    learners: BTreeSet<NodeId>,
 }
 
 pub struct Node {
     cfg: Config,
-    /// Voters other than this node, deduplicated.
-    peers: Vec<NodeId>,
+    /// `cfg.voters`, ascending and deduplicated: the voters until the log
+    /// knows a configuration.
+    initial: Vec<NodeId>,
     storage: Arc<dyn Storage>,
     state: Mutex<Inner>,
 }
@@ -205,7 +247,7 @@ fn random_timeout(cfg: &Config, rng: &mut u64) -> u64 {
 
 impl Node {
     pub fn new(cfg: Config, storage: Arc<dyn Storage>) -> Result<Self> {
-        if !cfg.voters.contains(&cfg.id) {
+        if !cfg.voters.is_empty() && !cfg.voters.contains(&cfg.id) {
             return Err(Error::NotConfigured);
         }
         let DurableState {
@@ -218,11 +260,11 @@ impl Node {
         if log.base_index() != snapshot.as_ref().map_or(0, |s| s.index) {
             return Err(Error::Storage("the log does not start after the snapshot".into()));
         }
-        let peers: BTreeSet<NodeId> = cfg.voters.iter().copied().filter(|&v| v != cfg.id).collect();
+        let initial: BTreeSet<NodeId> = cfg.voters.iter().copied().collect();
         let mut rng = (cfg.seed ^ cfg.id) | 1;
         let election_timeout = random_timeout(&cfg, &mut rng);
         Ok(Node {
-            peers: peers.into_iter().collect(),
+            initial: initial.into_iter().collect(),
             storage,
             state: Mutex::new(Inner {
                 role: NodeState::Follower,
@@ -250,6 +292,7 @@ impl Node {
                 reads_failed: Vec::new(),
                 install: snapshot.clone(),
                 snapshot,
+                learners: BTreeSet::new(),
             }),
             cfg,
         })
@@ -290,6 +333,72 @@ impl Node {
         self.state.lock().log.base_index()
     }
 
+    /// The voters in effect: the last configuration in the log, committed or
+    /// not.
+    pub fn voters(&self) -> Vec<NodeId> {
+        let s = self.state.lock();
+        self.voters_of(&s).to_vec()
+    }
+
+    /// Whether the log holds a configuration entry that is not committed yet.
+    /// A leader starts no other membership change meanwhile.
+    pub fn config_pending(&self) -> bool {
+        let s = self.state.lock();
+        s.log.config_index() > s.commit_index
+    }
+
+    /// The servers this leader replicates to without them voting.
+    pub fn learners(&self) -> Vec<NodeId> {
+        self.state.lock().learners.iter().copied().collect()
+    }
+
+    /// The voters in effect, ascending.
+    fn voters_of<'a>(&'a self, s: &'a Inner) -> &'a [NodeId] {
+        match s.log.voters() {
+            [] => &self.initial,
+            voters => voters,
+        }
+    }
+
+    /// The voters in effect at `index`, which the log must still hold.
+    fn voters_at<'a>(&'a self, s: &'a Inner, index: Index) -> &'a [NodeId] {
+        match s.log.voters_at(index) {
+            [] => &self.initial,
+            voters => voters,
+        }
+    }
+
+    fn is_voter(&self, s: &Inner) -> bool {
+        self.voters_of(s).binary_search(&self.cfg.id).is_ok()
+    }
+
+    /// Whether `id` takes part in elections: it is a voter, or it is a voter
+    /// of the committed configuration and an uncommitted change removes it.
+    /// The latter matters: the leader that appended the removal may be gone,
+    /// with the entry on the removed server (which has the longest log) and
+    /// nowhere else, and the voters that remain cannot win without its vote.
+    /// Safe, because a candidate counts the votes it needs in its own latest
+    /// configuration, which differs from the committed one by one server. A
+    /// removal that is committed ends it.
+    fn is_member(&self, s: &Inner, id: NodeId) -> bool {
+        let pending = s.log.config_index() > s.commit_index;
+        let voter = |voters: &[NodeId]| voters.binary_search(&id).is_ok();
+        voter(self.voters_of(s)) | (pending & voter(self.voters_at(s, s.commit_index)))
+    }
+
+    /// How many of `votes` are voters in the configuration in effect.
+    fn counted(&self, s: &Inner, votes: &BTreeSet<NodeId>) -> usize {
+        let voters = self.voters_of(s);
+        votes.iter().filter(|v| voters.binary_search(v).is_ok()).count()
+    }
+
+    /// The voters other than this node.
+    fn others(&self, s: &Inner) -> Vec<NodeId> {
+        (self.voters_of(s).iter().copied())
+            .filter(|&v| v != self.cfg.id)
+            .collect()
+    }
+
     /// Current term and the log: the entries after the snapshot.
     pub fn log_snapshot(&self) -> (Term, Vec<LogEntry>) {
         let s = self.state.lock();
@@ -309,10 +418,16 @@ impl Node {
             return Err(Error::BadSnapshot("index is not above the snapshot"));
         }
         let term = s.log.term_at(index).expect("applied entries are in the log");
-        let snapshot = Arc::new(Snapshot { index, term, data });
+        let voters = self.voters_at(&s, index).to_vec();
+        let snapshot = Arc::new(Snapshot {
+            index,
+            term,
+            voters,
+            data,
+        });
         self.storage.install_snapshot(snapshot.clone())?;
         s.log
-            .install_snapshot(index, term)
+            .install_snapshot(index, term, snapshot.voters.clone())
             .expect("checked to be above the base");
         s.snapshot = Some(snapshot);
         s.clock.tick();
@@ -326,16 +441,157 @@ impl Node {
         if s.role != NodeState::Leader {
             return Err(Error::NotLeader(s.leader_id));
         }
-        let entry = LogEntry {
-            index: s.log.last_index() + 1,
-            term: s.term,
-            data,
-        };
+        let entry = LogEntry::new(s.log.last_index() + 1, s.term, data);
         let batch = std::slice::from_ref(&entry);
         self.storage.append_entries(batch)?;
         s.log.append(batch).expect("a leader appends at its own tail");
         s.clock.tick();
         Ok(entry.index)
+    }
+
+    /// Starts replicating the log to `id`, which does not vote or count
+    /// toward any quorum. Leader only. Once it has caught up,
+    /// [`Node::add_voter`] makes it a voter.
+    pub fn add_learner(&self, id: NodeId) -> Result<()> {
+        let mut s = self.state.lock();
+        if s.role != NodeState::Leader {
+            return Err(Error::NotLeader(s.leader_id));
+        }
+        if id == self.cfg.id {
+            return Err(Error::BadConfig("this node is the leader"));
+        }
+        if self.voters_of(&s).contains(&id) {
+            return Err(Error::BadConfig("already a voter"));
+        }
+        s.learners.insert(id);
+        self.sync_targets(&mut s);
+        Ok(())
+    }
+
+    /// Stops replicating to the learner `id`.
+    pub fn remove_learner(&self, id: NodeId) -> Result<()> {
+        let mut s = self.state.lock();
+        if s.role != NodeState::Leader {
+            return Err(Error::NotLeader(s.leader_id));
+        }
+        if !s.learners.remove(&id) {
+            return Err(Error::BadConfig("not a learner"));
+        }
+        self.sync_targets(&mut s);
+        Ok(())
+    }
+
+    /// Makes the learner `id` a voter: appends the configuration entry and
+    /// returns its index. It takes effect on this leader at once and is
+    /// committed by a majority of the new voter set. Leader only; refused
+    /// unless `id` is a learner that holds everything committed, while the
+    /// leader has committed an entry of its term and no other change is
+    /// uncommitted.
+    pub fn add_voter(&self, id: NodeId) -> Result<Index> {
+        let mut s = self.state.lock();
+        self.may_change_config(&mut s)?;
+        if self.voters_of(&s).contains(&id) {
+            return Err(Error::BadConfig("already a voter"));
+        }
+        if !s.learners.contains(&id) {
+            return Err(Error::BadConfig("not a learner, add it as one first"));
+        }
+        if s.match_index.get(&id).copied().unwrap_or(0) < s.commit_index {
+            return Err(Error::BadConfig("the learner has not caught up"));
+        }
+        let mut voters = self.voters_of(&s).to_vec();
+        voters.push(id);
+        voters.sort_unstable();
+        let index = self.append_config(&mut s, &voters)?;
+        s.learners.remove(&id);
+        Ok(index)
+    }
+
+    /// Removes the voter `id`, itself included: appends the configuration
+    /// entry and returns its index. A leader that removes itself steps down
+    /// once the entry is committed. Same conditions as [`Node::add_voter`]
+    /// (but `id` is a voter, and not the last one).
+    pub fn remove_voter(&self, id: NodeId) -> Result<Index> {
+        let mut s = self.state.lock();
+        self.may_change_config(&mut s)?;
+        let voters = self.voters_of(&s);
+        if !voters.contains(&id) {
+            return Err(Error::BadConfig("not a voter"));
+        }
+        if voters.len() == 1 {
+            return Err(Error::BadConfig("cannot remove the last voter"));
+        }
+        let voters: Vec<NodeId> = voters.iter().copied().filter(|&v| v != id).collect();
+        self.append_config(&mut s, &voters)
+    }
+
+    /// The leader may start a membership change: it has committed an entry of
+    /// its own term, and the last change is committed.
+    fn may_change_config(&self, s: &mut Inner) -> Result<()> {
+        if s.role != NodeState::Leader {
+            return Err(Error::NotLeader(s.leader_id));
+        }
+        self.need_current_term_commit(s)?;
+        if s.log.config_index() > s.commit_index {
+            return Err(Error::BadConfig("the previous change is not committed yet"));
+        }
+        Ok(())
+    }
+
+    /// Appends the configuration entry `voters` to the leader's log.
+    fn append_config(&self, s: &mut Inner, voters: &[NodeId]) -> Result<Index> {
+        let entry = LogEntry::config(s.log.last_index() + 1, s.term, voters);
+        let batch = std::slice::from_ref(&entry);
+        self.storage.append_entries(batch)?;
+        s.log.append(batch).expect("a leader appends at its own tail");
+        s.clock.tick();
+        self.sync_targets(s);
+        Ok(entry.index)
+    }
+
+    /// Leader: replicate to the servers that need the log. Those are the
+    /// voters, the learners, and the voters of the committed configuration:
+    /// a server removed by an uncommitted change keeps getting entries until
+    /// the change commits, as it may be needed to commit it. Progress of the
+    /// ones that stay is kept.
+    fn sync_targets(&self, s: &mut Inner) {
+        let mut wanted: BTreeSet<NodeId> = (self.voters_of(s).iter())
+            .chain(self.voters_at(s, s.commit_index))
+            .chain(&s.learners)
+            .copied()
+            .collect();
+        wanted.remove(&self.cfg.id);
+        s.next_index.retain(|p, _| wanted.contains(p));
+        s.match_index.retain(|p, _| wanted.contains(p));
+        s.read_acked.retain(|p, _| wanted.contains(p));
+        let next = s.log.last_index() + 1;
+        for p in wanted {
+            s.next_index.entry(p).or_insert(next);
+            s.match_index.entry(p).or_insert(0);
+            s.read_acked.entry(p).or_insert(0);
+        }
+    }
+
+    /// Stops being leader without a term change, because the configuration
+    /// that excludes this node is committed.
+    fn step_down(s: &mut Inner) {
+        s.role = NodeState::Follower;
+        s.leader_id = None;
+        s.election_elapsed = 0;
+        s.learners.clear();
+        s.next_index.clear();
+        s.match_index.clear();
+        s.read_acked.clear();
+    }
+
+    /// A leader that has no committed entry of its own term does not know its
+    /// commit index is current. It appended one when it was elected, so this
+    /// only asks the caller to retry until that has committed.
+    fn need_current_term_commit(&self, s: &Inner) -> Result<()> {
+        match s.log.term_at(s.commit_index) == Some(s.term) {
+            true => Ok(()),
+            false => Err(Error::NotReady),
+        }
     }
 
     /// Starts a linearizable read and returns its id; the answer arrives in
@@ -344,30 +600,18 @@ impl Node {
     ///
     /// Leader only. `Err(NotReady)` means the leader has no committed entry
     /// of its own term yet, which it needs to know its commit index is
-    /// current; an empty entry has been appended for that, so retry after a
-    /// few ticks.
+    /// current; the empty entry it appended when elected is on its way, so
+    /// retry after a few ticks.
     pub fn read_index(&self) -> Result<u64> {
         let mut s = self.state.lock();
         if s.role != NodeState::Leader {
             return Err(Error::NotLeader(s.leader_id));
         }
-        if s.log.term_at(s.commit_index) != Some(s.term) {
-            if s.log.last_term() != s.term {
-                let noop = LogEntry {
-                    index: s.log.last_index() + 1,
-                    term: s.term,
-                    data: Vec::new(),
-                };
-                let batch = std::slice::from_ref(&noop);
-                self.storage.append_entries(batch)?;
-                s.log.append(batch).expect("a leader appends at its own tail");
-            }
-            return Err(Error::NotReady);
-        }
+        self.need_current_term_commit(&s)?;
         s.next_read_id += 1;
         s.clock.tick();
         let (id, index) = (s.next_read_id, s.commit_index);
-        if self.peers.is_empty() {
+        if self.others(&s).is_empty() {
             s.reads_ready.push((id, index));
         } else {
             s.reads.push(PendingRead { id, index, round: None });
@@ -385,11 +629,16 @@ impl Node {
 
     /// Moves reads whose round a majority has acknowledged to `reads_ready`.
     fn confirm_reads(&self, s: &mut Inner) {
-        let n = self.peers.len() + 1;
-        let acked: Vec<u64> = s.read_acked.values().copied().collect();
+        let voters = self.voters_of(s);
+        let n = voters.len();
+        let me = usize::from(voters.contains(&self.cfg.id));
+        let acked: Vec<u64> = (voters.iter())
+            .filter(|&&v| v != self.cfg.id)
+            .map(|v| s.read_acked.get(v).copied().unwrap_or(0))
+            .collect();
         let confirmed = |r: &PendingRead| {
             let acks = acked.iter().filter(|&&a| Some(a) >= r.round).count();
-            r.round.is_some() & is_majority(1 + acks, n)
+            r.round.is_some() & is_majority(me + acks, n)
         };
         let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut s.reads).into_iter().partition(confirmed);
         s.reads = waiting;
@@ -417,7 +666,8 @@ impl Node {
                 for r in s.reads.iter_mut().filter(|r| r.round.is_none()) {
                     r.round = Some(round);
                 }
-                for &p in &self.peers {
+                let targets: Vec<NodeId> = s.next_index.keys().copied().collect();
+                for p in targets {
                     let mut m = self.replicate(&s, p);
                     m.read_ctx = round;
                     messages.push(Self::send(&mut s, m));
@@ -427,7 +677,10 @@ impl Node {
         } else {
             s.election_elapsed += 1;
             if s.election_elapsed >= s.election_timeout {
-                if s.recovering {
+                // The leader's lease is over, whether or not this node may
+                // campaign: others may need its vote.
+                s.leader_id = None;
+                if s.recovering | !self.is_member(&s, self.cfg.id) {
                     s.election_elapsed = 0;
                 } else {
                     self.start_election(&mut s, &mut messages)?;
@@ -455,10 +708,24 @@ impl Node {
 
     /// Handles one message from a peer; returns the replies to send.
     pub fn step(&self, msg: Message) -> Result<Vec<Message>> {
-        if !self.peers.contains(&msg.from) {
-            return Err(Error::UnknownPeer(msg.from));
-        }
         let mut s = self.state.lock();
+        // Only voters take part in elections. A server that was removed, or
+        // has not learned yet that it was added, must not move anybody's
+        // term. Appends and snapshots come from whoever leads, and replies
+        // are matched against the leader's own targets. A message from this
+        // node itself is a transport mistake.
+        let vote_traffic = matches!(
+            msg.msg_type,
+            MsgType::RequestVote | MsgType::RequestVoteReply | MsgType::PreVote | MsgType::PreVoteReply
+        );
+        // While a leader is heard from, vote traffic from a server outside the
+        // configuration is ignored (Raft thesis section 4.2.3). Without a
+        // leader it is not: a server this node has not heard was added may be
+        // the only one that can win.
+        let outsider = vote_traffic & s.leader_id.is_some() & !self.is_member(&s, msg.from);
+        if outsider | (msg.from == self.cfg.id) {
+            return Ok(Vec::new());
+        }
         s.clock.observe(msg.lc);
         // Asking for, or promising, a pre-vote is not a term change.
         let pre = match msg.msg_type {
@@ -472,6 +739,7 @@ impl Node {
             s.voted_for = None;
             s.leader_id = None;
             s.role = NodeState::Follower;
+            s.learners.clear();
         }
         let replies: Vec<Message> = if msg.term < s.term {
             self.stale_reply(&s, &msg).into_iter().collect()
@@ -479,7 +747,7 @@ impl Node {
             match msg.msg_type {
                 MsgType::RequestVote => vec![self.on_request_vote(&mut s, &msg)?],
                 MsgType::RequestVoteReply => {
-                    self.on_vote_reply(&mut s, &msg);
+                    self.on_vote_reply(&mut s, &msg)?;
                     Vec::new()
                 }
                 MsgType::AppendEntries => {
@@ -524,7 +792,8 @@ impl Node {
     /// An election timeout: ask for pre-votes, or campaign right away when
     /// pre-vote is off or there is nobody to ask.
     fn start_election(&self, s: &mut Inner, out: &mut Vec<Message>) -> Result<()> {
-        if !self.cfg.pre_vote | self.peers.is_empty() {
+        let others = self.others(s);
+        if !self.cfg.pre_vote | others.is_empty() {
             return self.campaign(s, out);
         }
         s.role = NodeState::PreCandidate;
@@ -534,7 +803,7 @@ impl Node {
         s.election_elapsed = 0;
         s.election_timeout = random_timeout(&self.cfg, &mut s.rng);
         let (term, last_index, last_term) = (s.term + 1, s.log.last_index(), s.log.last_term());
-        for &p in &self.peers {
+        for p in others {
             let m = Message::pre_vote(self.cfg.id, p, term, last_index, last_term);
             out.push(Self::send(s, m));
         }
@@ -561,7 +830,7 @@ impl Node {
         let current = (s.role == NodeState::PreCandidate) & msg.vote_granted & (msg.term == s.term + 1);
         if current {
             s.pre_votes.insert(msg.from);
-            if is_majority(s.pre_votes.len(), self.peers.len() + 1) {
+            if is_majority(self.counted(s, &s.pre_votes), self.voters_of(s).len()) {
                 self.campaign(s, &mut out)?;
             }
         }
@@ -581,37 +850,59 @@ impl Node {
         s.election_elapsed = 0;
         s.election_timeout = random_timeout(&self.cfg, &mut s.rng);
         let (last_index, last_term) = (s.log.last_index(), s.log.last_term());
-        for &p in &self.peers {
+        for p in self.others(s) {
             let m = Message::request_vote(self.cfg.id, p, term, last_index, last_term);
             out.push(Self::send(s, m));
         }
-        self.maybe_win(s);
-        Ok(())
+        self.maybe_win(s)
     }
 
-    fn maybe_win(&self, s: &mut Inner) {
-        if is_majority(s.votes.len(), self.peers.len() + 1) {
-            s.role = NodeState::Leader;
-            s.leader_id = Some(self.cfg.id);
-            let next = s.log.last_index() + 1;
-            s.next_index = self.peers.iter().map(|&p| (p, next)).collect();
-            s.match_index = self.peers.iter().map(|&p| (p, 0)).collect();
-            s.read_round = 0;
-            s.read_acked = self.peers.iter().map(|&p| (p, 0)).collect();
-            // Heartbeat on the very next tick.
-            s.heartbeat_elapsed = self.cfg.heartbeat_interval;
+    /// Becomes leader on a majority of votes, with an empty entry of the new
+    /// term appended first (see the module docs).
+    fn maybe_win(&self, s: &mut Inner) -> Result<()> {
+        if !is_majority(self.counted(s, &s.votes), self.voters_of(s).len()) {
+            return Ok(());
         }
+        let noop = LogEntry::new(s.log.last_index() + 1, s.term, Vec::new());
+        let batch = std::slice::from_ref(&noop);
+        self.storage.append_entries(batch)?;
+        s.log.append(batch).expect("a leader appends at its own tail");
+        s.role = NodeState::Leader;
+        s.leader_id = Some(self.cfg.id);
+        s.learners.clear();
+        s.next_index.clear();
+        s.match_index.clear();
+        s.read_acked.clear();
+        s.read_round = 0;
+        self.sync_targets(s);
+        // Heartbeat on the very next tick.
+        s.heartbeat_elapsed = self.cfg.heartbeat_interval;
+        Ok(())
     }
 
     /// Commits the highest index stored on a majority, if it is from the
     /// current term (Raft §5.4.2: older entries commit only indirectly).
     fn maybe_commit(&self, s: &mut Inner) {
-        let mut matched: Vec<Index> = s.match_index.values().copied().collect();
-        matched.push(s.log.last_index());
+        let mut matched: Vec<Index> = (self.voters_of(s).iter())
+            .map(|v| match *v == self.cfg.id {
+                true => s.log.last_index(),
+                false => s.match_index.get(v).copied().unwrap_or(0),
+            })
+            .collect();
         matched.sort_unstable();
         let candidate = matched[matched.len() - quorum(matched.len())];
         if candidate > s.commit_index && s.log.term_at(candidate) == Some(s.term) {
+            let pending = s.log.config_index() > s.commit_index;
             s.commit_index = candidate;
+            // A configuration entry just committed: servers it removed need
+            // no more entries, and a leader it removed hands over.
+            if pending & (s.log.config_index() <= candidate) {
+                if self.is_voter(s) {
+                    self.sync_targets(s);
+                } else {
+                    Self::step_down(s);
+                }
+            }
         }
     }
 
@@ -620,15 +911,7 @@ impl Node {
     fn replicate(&self, s: &Inner, peer: NodeId) -> Message {
         match &s.snapshot {
             Some(snap) if s.next_index[&peer] <= snap.index => {
-                let mut m = Message::install_snapshot(
-                    self.cfg.id,
-                    peer,
-                    s.term,
-                    snap.index,
-                    snap.term,
-                    snap.data.clone(),
-                    s.commit_index,
-                );
+                let mut m = Message::install_snapshot(self.cfg.id, peer, s.term, snap.clone(), s.commit_index);
                 m.leader_last_index = s.log.last_index();
                 m
             }
@@ -668,11 +951,12 @@ impl Node {
         Ok(Message::request_vote_reply(self.cfg.id, msg.from, s.term, granted))
     }
 
-    fn on_vote_reply(&self, s: &mut Inner, msg: &Message) {
+    fn on_vote_reply(&self, s: &mut Inner, msg: &Message) -> Result<()> {
         if (s.role == NodeState::Candidate) & msg.vote_granted {
             s.votes.insert(msg.from);
-            self.maybe_win(s);
+            self.maybe_win(s)?;
         }
+        Ok(())
     }
 
     fn on_append(&self, s: &mut Inner, msg: &Message) -> Result<Message> {
@@ -719,21 +1003,19 @@ impl Node {
         s.role = NodeState::Follower;
         s.leader_id = Some(msg.from);
         s.election_elapsed = 0;
-        let (index, term) = (msg.last_log_index, msg.last_log_term);
+        let Some(snapshot) = msg.snapshot.clone() else {
+            return Err(Error::BadSnapshot("InstallSnapshot without a snapshot"));
+        };
+        let index = snapshot.index;
         let reply = |s: &Inner, matched| Message::install_snapshot_reply(self.cfg.id, msg.from, s.term, true, matched);
         if index <= s.commit_index {
             // Committed entries are the same on every node, so this log
             // matches the leader's up to its commit index.
             return Ok(reply(s, s.commit_index));
         }
-        let snapshot = Arc::new(Snapshot {
-            index,
-            term,
-            data: msg.snapshot_data.clone(),
-        });
         self.storage.install_snapshot(snapshot.clone())?;
         s.log
-            .install_snapshot(index, term)
+            .install_snapshot(index, snapshot.term, snapshot.voters.clone())
             .expect("above the commit index, so above the base");
         s.commit_index = index;
         s.last_applied = index;
@@ -750,6 +1032,8 @@ impl Node {
         if s.role != NodeState::Leader {
             return None;
         }
+        // A reply from a server that is no longer replicated to is old news.
+        let current = *s.next_index.get(&msg.from)?;
         // Any reply of this term shows the follower accepted this leader
         // after the round named in `read_ctx` began.
         if msg.read_ctx > 0 {
@@ -765,11 +1049,11 @@ impl Node {
             self.maybe_commit(s);
             msg.match_index + 1
         } else {
-            (s.next_index[&msg.from] - 1)
-                .min(msg.match_index.saturating_add(1))
-                .max(1)
+            (current - 1).min(msg.match_index.saturating_add(1)).max(1)
         };
-        s.next_index.insert(msg.from, next);
+        // Committing may have removed this server from the targets, or made
+        // this node step down.
+        *s.next_index.get_mut(&msg.from)? = next;
         let more = (next <= s.log.last_index()) | !msg.success;
         more.then(|| self.replicate(s, msg.from))
     }
@@ -783,11 +1067,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn entry(index: Index, term: Term, data: &[u8]) -> LogEntry {
-        LogEntry {
-            index,
-            term,
-            data: data.to_vec(),
-        }
+        LogEntry::new(index, term, data.to_vec())
     }
 
     /// A cluster member that campaigns right away (no pre-vote phase).
@@ -888,13 +1168,15 @@ mod tests {
         );
         leader_of(&node, 20);
         assert_eq!(node.leader(), Some(1));
-        assert_eq!(node.propose(b"cmd-1".to_vec()).unwrap(), 1);
-        let committed = node.tick().unwrap().committed;
-        assert_eq!(committed, vec![entry(1, node.term(), b"cmd-1")]);
-        assert!(node.tick().unwrap().committed.is_empty(), "applied once");
+        // Its own empty entry came first, and committed by itself.
         assert_eq!(node.commit_index(), 1);
+        assert_eq!(node.propose(b"cmd-1".to_vec()).unwrap(), 2);
+        let committed = node.tick().unwrap().committed;
+        assert_eq!(committed, vec![entry(2, node.term(), b"cmd-1")]);
+        assert!(node.tick().unwrap().committed.is_empty(), "applied once");
+        assert_eq!(node.commit_index(), 2);
         let (term, entries) = node.log_snapshot();
-        assert!(term >= 1 && entries.len() == 1);
+        assert!(term >= 1 && entries.len() == 2 && entries[0].data.is_empty());
         assert!(node.logical_time() > 0);
     }
 
@@ -905,14 +1187,40 @@ mod tests {
         assert_eq!(Node::new(cfg, MemoryStorage::new()).err(), Some(Error::NotConfigured));
         let node = Node::new(Config::cluster(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
         assert_eq!(node.propose(b"x".to_vec()), Err(Error::NotLeader(None)));
-        assert_eq!(
-            node.step(Message::request_vote(9, 1, 1, 0, 0)),
-            Err(Error::UnknownPeer(9))
-        );
-        assert_eq!(
-            node.step(Message::request_vote(1, 1, 1, 0, 0)),
-            Err(Error::UnknownPeer(1))
-        );
+        // A message from this node itself is a transport mistake.
+        for m in [
+            Message::request_vote(1, 1, 1, 0, 0),
+            Message::pre_vote(1, 1, 1, 0, 0),
+            Message::request_vote_reply(1, 1, 1, true),
+            Message::pre_vote_reply(1, 1, 1, true),
+            Message::append_entries(1, 1, 1, 0, 0, vec![], 0),
+        ] {
+            assert_eq!(node.step(m), Ok(vec![]));
+        }
+        assert_eq!((node.term(), node.logical_time()), (0, 0));
+        // While a leader is heard from, vote traffic from outside the voter
+        // set is ignored without moving the term, but a voter is answered.
+        node.step(Message::append_entries(2, 1, 1, 0, 0, vec![], 0)).unwrap();
+        for m in [
+            Message::request_vote(9, 1, 5, 0, 0),
+            Message::pre_vote(9, 1, 5, 0, 0),
+            Message::request_vote_reply(9, 1, 5, true),
+            Message::pre_vote_reply(9, 1, 5, true),
+        ] {
+            assert_eq!(node.step(m), Ok(vec![]));
+        }
+        assert_eq!((node.term(), node.leader()), (1, Some(2)));
+        assert!(!node.step(Message::pre_vote(3, 1, 5, 0, 0)).unwrap().is_empty());
+        // Once the leader has been silent for a timeout, anybody who asks is
+        // answered: the server that asks may be the one that was added.
+        while node.leader().is_some() {
+            node.tick().unwrap();
+        }
+        assert!(node.step(Message::request_vote(9, 1, 7, 0, 0)).unwrap()[0].vote_granted);
+        assert_eq!(node.term(), 7);
+        // An empty voter list is a node that waits to be added.
+        let joiner = Node::new(Config::joiner(4), MemoryStorage::new()).unwrap();
+        assert!(joiner.voters().is_empty() && joiner.learners().is_empty());
     }
 
     #[test]
@@ -941,7 +1249,7 @@ mod tests {
         }
         net.run(10, &[]);
         for applied in &net.applied {
-            assert_eq!(applied.len(), 3);
+            assert_eq!(applied.len(), 4, "its empty entry and three proposals");
         }
         // Partition the leader away: the others elect a new one.
         net.run(80, &[old]);
@@ -962,10 +1270,12 @@ mod tests {
         assert_eq!(net.node(old).role(), NodeState::Follower);
         assert_eq!(net.node(old).leader(), Some(new[0]));
         let reference = net.node(new[0]).log_snapshot().1;
-        assert_eq!(reference.len(), 4);
+        // Two empty entries, one per leader, the three proposals and "kept".
+        assert_eq!(reference.len(), 6);
+        assert_eq!(reference[5].data, b"kept");
         for n in &net.nodes {
             assert_eq!(n.log_snapshot().1, reference);
-            assert_eq!(n.commit_index(), 4);
+            assert_eq!(n.commit_index(), 6);
         }
         for applied in &net.applied {
             assert_eq!(applied, &reference);
@@ -1089,22 +1399,23 @@ mod tests {
         node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
         assert_eq!(node.role(), NodeState::Leader);
         node.propose(b"b".to_vec()).unwrap();
+        // The log: "a" from the old leader, the new leader's empty entry, "b".
         // Peer 2 reports a gap: resend from its hint.
         let r = node.step(Message::append_entries_reply(2, 1, t, false, 0)).unwrap();
-        assert_eq!((r[0].last_log_index, r[0].entries.len()), (0, 2));
-        // Peer 2 caught up fully: nothing more to send, both entries commit
-        // (entry 1 indirectly, through the current-term entry 2).
-        let r = node.step(Message::append_entries_reply(2, 1, t, true, 2)).unwrap();
+        assert_eq!((r[0].last_log_index, r[0].entries.len()), (0, 3));
+        // Peer 2 caught up fully: nothing more to send, everything commits
+        // (entry 1 indirectly, through the current-term entries).
+        let r = node.step(Message::append_entries_reply(2, 1, t, true, 3)).unwrap();
         assert!(r.is_empty());
-        assert_eq!(node.commit_index(), 2);
+        assert_eq!(node.commit_index(), 3);
         // Peer 3 has only entry 1: the rest is sent right away.
         let r = node.step(Message::append_entries_reply(3, 1, t, true, 1)).unwrap();
-        assert_eq!((r[0].last_log_index, r[0].entries.len()), (1, 1));
-        assert_eq!(r[0].leader_last_index, 2);
-        // Peer 2 lost entries since it acknowledged 2: believe it and resend.
+        assert_eq!((r[0].last_log_index, r[0].entries.len()), (1, 2));
+        assert_eq!(r[0].leader_last_index, 3);
+        // Peer 2 lost entries since it acknowledged 3: believe it and resend.
         let r = node.step(Message::append_entries_reply(2, 1, t, true, 0)).unwrap();
-        assert_eq!((r[0].last_log_index, r[0].entries.len()), (0, 2));
-        assert_eq!(node.commit_index(), 2, "commit never goes back");
+        assert_eq!((r[0].last_log_index, r[0].entries.len()), (0, 3));
+        assert_eq!(node.commit_index(), 3, "commit never goes back");
     }
 
     #[test]
@@ -1118,12 +1429,18 @@ mod tests {
             recovering: false,
             snapshot: None,
         });
-        let node = Node::new(Config::single(1), storage).unwrap();
-        leader_of(&node, 20);
-        node.tick().unwrap();
+        let node = Node::new(classic(1, vec![1, 2, 3]), storage).unwrap();
+        campaign(&node);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        assert_eq!(node.role(), NodeState::Leader);
+        // The log is the old entry and the leader's own empty entry. A
+        // majority holding the old entry does not commit it...
+        node.step(Message::append_entries_reply(2, 1, t, true, 1)).unwrap();
         assert_eq!(node.commit_index(), 0);
-        node.propose(b"new".to_vec()).unwrap();
-        assert_eq!(node.tick().unwrap().committed.len(), 2);
+        // ... a majority holding an entry of this term commits both.
+        node.step(Message::append_entries_reply(2, 1, t, true, 2)).unwrap();
+        assert_eq!(node.commit_index(), 2);
     }
 
     /// Storage whose calls start failing after a budget.
@@ -1201,16 +1518,23 @@ mod tests {
         pre_campaign(&n);
         assert!(n.step(Message::pre_vote_reply(2, 1, 1, true)).is_err());
         assert_eq!((n.term(), n.role()), (0, NodeState::PreCandidate));
-        // The empty entry a read needs.
+        // The empty entry that makes a node leader: it does not lead without it.
         let n = Node::new(Config::single(1), Failing::new(2)).unwrap();
-        leader_of(&n, 20);
-        assert_eq!(n.read_index(), Err(Error::Storage("disk gone".into())));
+        let errs = (0..40).filter(|_| n.tick().is_err()).count();
+        assert!(errs > 0);
+        assert_eq!(n.role(), NodeState::Candidate);
         assert!(n.log_snapshot().1.is_empty());
         // Proposing.
-        let n = Node::new(Config::single(1), Failing::new(2)).unwrap();
+        let n = Node::new(Config::single(1), Failing::new(3)).unwrap();
         leader_of(&n, 20);
         assert!(n.propose(b"x".to_vec()).is_err());
-        assert!(n.log_snapshot().1.is_empty());
+        assert_eq!(n.log_snapshot().1.len(), 1);
+        // Winning with a vote that arrives by message.
+        let n = Node::new(classic(1, vec![1, 2, 3]), Failing::new(2)).unwrap();
+        campaign(&n);
+        let t = n.term();
+        assert!(n.step(Message::request_vote_reply(2, 1, t, true)).is_err());
+        assert_eq!(n.role(), NodeState::Candidate);
         // Leaving the recovering state: the entries are kept, the flag too.
         let damaged = DurableState {
             recovering: true,
@@ -1226,17 +1550,17 @@ mod tests {
         assert!(!n.recovering());
     }
 
-    /// A leader of node 1 in a classic cluster of three, term and log
-    /// returned: its first entry (index 1, term `t`) is acknowledged by
-    /// node 2 and committed.
+    /// A leader of node 1 in a classic cluster of three, term returned: its
+    /// own empty entry (index 1, term `t`) and one of "x" (index 2) are
+    /// acknowledged by node 2 and committed.
     fn committed_leader() -> (Node, Term) {
         let node = Node::new(classic(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
         campaign(&node);
         let t = node.term();
         node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
         node.propose(b"x".to_vec()).unwrap();
-        node.step(Message::append_entries_reply(2, 1, t, true, 1)).unwrap();
-        assert_eq!(node.commit_index(), 1);
+        node.step(Message::append_entries_reply(2, 1, t, true, 2)).unwrap();
+        assert_eq!(node.commit_index(), 2);
         (node, t)
     }
 
@@ -1247,7 +1571,8 @@ mod tests {
         campaign(&node);
         let t = node.term();
         node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
-        // Nothing of this term is committed: an empty entry is appended once.
+        // Nothing of this term is committed yet, not even the leader's own
+        // empty entry.
         assert_eq!(node.read_index(), Err(Error::NotReady));
         assert_eq!(node.read_index(), Err(Error::NotReady));
         let log = node.log_snapshot().1;
@@ -1309,19 +1634,17 @@ mod tests {
         let (node, t) = committed_leader();
         let id = node.read_index().unwrap();
         node.tick().unwrap();
-        let mut m = Message::append_entries_reply(3, 1, t, true, 1);
+        let mut m = Message::append_entries_reply(3, 1, t, true, 2);
         m.read_ctx = 1;
         node.step(m).unwrap();
         node.step(Message::request_vote(2, 1, t + 1, 9, 9)).unwrap();
-        assert_eq!(node.tick().unwrap().reads, vec![ReadState { id, index: Some(1) }]);
+        assert_eq!(node.tick().unwrap().reads, vec![ReadState { id, index: Some(2) }]);
     }
 
     #[test]
     fn single_node_reads_need_no_round() {
         let node = Node::new(Config::single(1), MemoryStorage::new()).unwrap();
         leader_of(&node, 20);
-        assert_eq!(node.read_index(), Err(Error::NotReady));
-        node.tick().unwrap();
         assert_eq!(node.commit_index(), 1);
         let id = node.read_index().unwrap();
         let out = node.tick().unwrap();
@@ -1339,7 +1662,7 @@ mod tests {
         // A read through the connected leader completes within a few ticks.
         let id = net.node(old).read_index().unwrap();
         net.run(5, &[]);
-        assert_eq!(net.reads[(old - 1) as usize], vec![ReadState { id, index: Some(1) }]);
+        assert_eq!(net.reads[(old - 1) as usize], vec![ReadState { id, index: Some(2) }]);
         // Cut off, it still believes it leads but cannot confirm a read.
         let stale = net.node(old).read_index().unwrap();
         net.run(80, &[old]);
@@ -1357,12 +1680,27 @@ mod tests {
         assert_eq!(net.node(old).role(), NodeState::Follower);
     }
 
-    fn snapshot_of(index: Index, term: Term, data: &[u8]) -> Snapshot {
+    fn snapshot_of(index: Index, term: Term, voters: &[NodeId], data: &[u8]) -> Snapshot {
         Snapshot {
             index,
             term,
+            voters: voters.to_vec(),
             data: data.to_vec(),
         }
+    }
+
+    /// An InstallSnapshot message for a cluster of nodes 1, 2 and 3.
+    fn install_msg(
+        from: NodeId,
+        to: NodeId,
+        term: Term,
+        index: Index,
+        snap_term: Term,
+        data: &[u8],
+        commit: Index,
+    ) -> Message {
+        let snapshot = Arc::new(snapshot_of(index, snap_term, &[1, 2, 3], data));
+        Message::install_snapshot(from, to, term, snapshot, commit)
     }
 
     #[test]
@@ -1381,7 +1719,7 @@ mod tests {
         node.compact(2, b"state at 2".to_vec()).unwrap();
         assert_eq!(
             (node.snapshot_index(), node.log_snapshot().1),
-            (2, vec![entry(3, t, &[2])])
+            (2, vec![entry(3, t, &[1]), entry(4, t, &[2])])
         );
         cannot(2, "index is not above the snapshot");
         cannot(1, "index is not above the snapshot");
@@ -1389,7 +1727,7 @@ mod tests {
         assert!(node.tick().unwrap().snapshot.is_none());
         assert_eq!(
             storage.load().unwrap().snapshot.as_deref(),
-            Some(&snapshot_of(2, t, b"state at 2"))
+            Some(&snapshot_of(2, t, &[1], b"state at 2"))
         );
         // After a restart the first tick hands out the snapshot, once, and
         // the entries after it follow when the commit index is learned again.
@@ -1397,16 +1735,17 @@ mod tests {
         let node = Node::new(Config::single(1), storage.clone()).unwrap();
         assert_eq!((node.commit_index(), node.snapshot_index()), (2, 2));
         let out = node.tick().unwrap();
-        assert_eq!(out.snapshot.as_deref(), Some(&snapshot_of(2, t, b"state at 2")));
+        assert_eq!(out.snapshot.as_deref(), Some(&snapshot_of(2, t, &[1], b"state at 2")));
         assert!(out.committed.is_empty());
         assert!(node.tick().unwrap().snapshot.is_none());
         leader_of(&node, 20);
-        assert_eq!(node.propose(b"n".to_vec()).unwrap(), 4);
+        assert_eq!(node.propose(b"n".to_vec()).unwrap(), 6, "after its new empty entry");
         let committed: Vec<Index> = node.tick().unwrap().committed.iter().map(|e| e.index).collect();
-        assert_eq!(committed, vec![3, 4]);
+        // (`leader_of` already handed out 3 to 5)
+        assert_eq!(committed, vec![6]);
         // A snapshot that does not match the log is refused at start.
         let bad = MemoryStorage::with_state(DurableState {
-            snapshot: Some(Arc::new(snapshot_of(5, 1, b"x"))),
+            snapshot: Some(Arc::new(snapshot_of(5, 1, &[], b"x"))),
             ..DurableState::default()
         });
         let err = Node::new(Config::single(1), bad).err().unwrap();
@@ -1418,22 +1757,22 @@ mod tests {
         let (node, t) = committed_leader();
         node.propose(b"y".to_vec()).unwrap();
         node.propose(b"z".to_vec()).unwrap();
-        node.step(Message::append_entries_reply(2, 1, t, true, 3)).unwrap();
-        assert_eq!(node.tick().unwrap().committed.len(), 3);
-        node.compact(3, b"state at 3".to_vec()).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, 4)).unwrap();
+        assert_eq!(node.tick().unwrap().committed.len(), 4);
+        node.compact(4, b"state at 4".to_vec()).unwrap();
         // Peer 3 never got anything: it needs entry 1. Peer 2 is current.
         let ask_read = node.read_index().unwrap();
         let sent = (0..3).flat_map(|_| node.tick().unwrap().messages).collect::<Vec<_>>();
         let to = |peer| sent.iter().find(|m| m.to == peer).unwrap();
         let (snap, append) = (to(3), to(2));
         assert_eq!(snap.msg_type, MsgType::InstallSnapshot);
-        assert_eq!((snap.term, snap.last_log_index, snap.last_log_term), (t, 3, t));
-        assert_eq!((snap.commit_index, snap.leader_last_index), (3, 3));
-        assert_eq!(snap.snapshot_data, b"state at 3");
-        assert_eq!((append.msg_type, append.last_log_index), (MsgType::AppendEntries, 3));
+        assert_eq!((snap.term, snap.last_log_index, snap.last_log_term), (t, 4, t));
+        assert_eq!((snap.commit_index, snap.leader_last_index), (4, 4));
+        assert_eq!(snap.snapshot.as_ref().unwrap().data, b"state at 4");
+        assert_eq!((append.msg_type, append.last_log_index), (MsgType::AppendEntries, 4));
         // The snapshot carries the read round too: its reply confirms the read.
         assert_eq!((snap.read_ctx, append.read_ctx), (1, 1));
-        let mut reply = Message::install_snapshot_reply(3, 1, t, true, 3);
+        let mut reply = Message::install_snapshot_reply(3, 1, t, true, 4);
         reply.read_ctx = 1;
         assert!(
             node.step(reply.clone()).unwrap().is_empty(),
@@ -1443,7 +1782,7 @@ mod tests {
             node.tick().unwrap().reads,
             vec![ReadState {
                 id: ask_read,
-                index: Some(3)
+                index: Some(4)
             }]
         );
         // With an entry after it, the reply is answered with appends from there.
@@ -1451,15 +1790,13 @@ mod tests {
         reply.read_ctx = 0;
         let next = node.step(reply).unwrap();
         assert_eq!(next[0].msg_type, MsgType::AppendEntries);
-        assert_eq!((next[0].last_log_index, next[0].entries.len()), (3, 1));
+        assert_eq!((next[0].last_log_index, next[0].entries.len()), (4, 1));
         // A follower that rejects an append is sent the snapshot again when
         // it needs compacted entries.
         let r = node.step(Message::append_entries_reply(3, 1, t, false, 0)).unwrap();
         assert_eq!(r[0].msg_type, MsgType::InstallSnapshot);
         // A snapshot message from a stale leader is answered with our term.
-        let stale = node
-            .step(Message::install_snapshot(2, 1, t - 1, 9, 9, vec![], 9))
-            .unwrap();
+        let stale = node.step(install_msg(2, 1, t - 1, 9, 9, b"", 9)).unwrap();
         assert_eq!(
             (stale[0].msg_type, stale[0].success, stale[0].term),
             (MsgType::InstallSnapshotReply, false, t)
@@ -1481,7 +1818,7 @@ mod tests {
             (node, storage)
         };
         let install = |node: &Node, index, term, leader_last| {
-            let mut m = Message::install_snapshot(1, 2, 1, index, term, b"S".to_vec(), index);
+            let mut m = install_msg(1, 2, 1, index, term, b"S", index);
             m.leader_last_index = leader_last;
             let r = node.step(m).unwrap();
             (r[0].msg_type, r[0].success, r[0].match_index)
@@ -1494,11 +1831,11 @@ mod tests {
         assert_eq!(node.log_snapshot().1, vec![entry(4, 1, b"e"), entry(5, 1, b"e")]);
         assert_eq!(
             storage.load().unwrap().snapshot.as_deref(),
-            Some(&snapshot_of(3, 1, b"S"))
+            Some(&snapshot_of(3, 1, &[1, 2, 3], b"S"))
         );
         // The application gets it on the next tick, once, with nothing after.
         let out = node.tick().unwrap();
-        assert_eq!(out.snapshot.as_deref(), Some(&snapshot_of(3, 1, b"S")));
+        assert_eq!(out.snapshot.as_deref(), Some(&snapshot_of(3, 1, &[1, 2, 3], b"S")));
         assert!(out.committed.is_empty() && node.tick().unwrap().snapshot.is_none());
         // One it already covers is acknowledged with its commit index.
         for index in [1, 3] {
@@ -1533,7 +1870,7 @@ mod tests {
             node
         };
         let install = |node: &Node, leader_last| {
-            let mut m = Message::install_snapshot(2, 1, 1, 4, 1, b"S".to_vec(), 4);
+            let mut m = install_msg(2, 1, 1, 4, 1, b"S", 4);
             m.leader_last_index = leader_last;
             node.step(m).unwrap();
         };
@@ -1548,7 +1885,7 @@ mod tests {
     #[test]
     fn snapshot_storage_failures_leave_the_node_unchanged() {
         let cfg = || Config::cluster(2, vec![1, 2, 3]);
-        let snapshot = || Message::install_snapshot(1, 2, 0, 4, 0, b"S".to_vec(), 4);
+        let snapshot = || install_msg(1, 2, 0, 4, 0, b"S", 4);
         let n = Node::new(cfg(), Failing::new(1)).unwrap();
         assert!(n.step(snapshot()).is_err());
         assert_eq!((n.snapshot_index(), n.commit_index()), (0, 0));
@@ -1565,8 +1902,8 @@ mod tests {
         assert!(n.recovering());
         assert_eq!(n.snapshot_index(), 4);
         // Compacting.
-        // (the budget covers load, the vote and two proposals)
-        let n = Node::new(Config::single(1), Failing::new(4)).unwrap();
+        // (the budget covers load, the vote, the empty entry and two proposals)
+        let n = Node::new(Config::single(1), Failing::new(5)).unwrap();
         leader_of(&n, 20);
         n.propose(b"a".to_vec()).unwrap();
         n.propose(b"b".to_vec()).unwrap();
@@ -1584,9 +1921,10 @@ mod tests {
         for i in 0..10u8 {
             net.node(leader).propose(vec![i]).unwrap();
         }
+        let before = net.node(lag).commit_index();
         net.run(20, &[lag]);
         let applied = net.applied[(leader - 1) as usize].len() as Index;
-        assert!(applied >= 10 && net.node(lag).commit_index() == 0);
+        assert!(applied >= 10 && net.node(lag).commit_index() == before);
         // The leader snapshots and drops its log: the entries the follower
         // misses exist only in the snapshot now.
         net.node(leader).compact(applied, b"state".to_vec()).unwrap();
@@ -1801,6 +2139,350 @@ mod tests {
         net.run(20, &[]);
         assert!(!net.node(f).recovering());
         assert_eq!(net.node(f).log_snapshot().1, net.node(leader).log_snapshot().1);
-        assert_eq!(net.node(f).commit_index(), 8);
+        assert_eq!(net.node(f).commit_index(), 9, "the empty entry, eight proposals");
+    }
+
+    impl Net {
+        /// Nodes `1..=voters` form the cluster; the `joiners` after them
+        /// wait to be added.
+        fn joined(voters: u64, joiners: u64) -> Self {
+            let mut net = Net::new(voters);
+            for id in voters + 1..=voters + joiners {
+                net.nodes
+                    .push(Node::new(Config::joiner(id), MemoryStorage::new()).unwrap());
+                net.applied.push(Vec::new());
+                net.reads.push(Vec::new());
+                net.snapshots.push(Vec::new());
+            }
+            net
+        }
+    }
+
+    fn refused<T>(why: &'static str) -> Result<T> {
+        Err(Error::BadConfig(why))
+    }
+
+    #[test]
+    fn a_server_joins_as_a_learner_and_is_promoted() {
+        let mut net = Net::joined(3, 1);
+        net.run(60, &[]);
+        let leader = net.leaders(&[])[0];
+        let follower = (1..=3).find(|&i| i != leader).unwrap();
+        // Only the leader changes the cluster.
+        let f = net.node(follower);
+        let not_leader = || Error::NotLeader(Some(leader));
+        assert_eq!(f.add_learner(4), Err(not_leader()));
+        assert_eq!(f.remove_learner(4), Err(not_leader()));
+        assert_eq!(f.add_voter(4), Err(not_leader()));
+        assert_eq!(f.remove_voter(1), Err(not_leader()));
+        // What the leader refuses.
+        assert_eq!(net.node(leader).add_learner(leader), refused("this node is the leader"));
+        assert_eq!(net.node(leader).add_learner(follower), refused("already a voter"));
+        assert_eq!(net.node(leader).remove_learner(4), refused("not a learner"));
+        assert_eq!(
+            net.node(leader).add_voter(4),
+            refused("not a learner, add it as one first")
+        );
+        assert_eq!(net.node(leader).add_voter(follower), refused("already a voter"));
+        assert_eq!(net.node(leader).remove_voter(9), refused("not a voter"));
+        // A learner gets the log, and does not vote or campaign.
+        net.node(leader).add_learner(4).unwrap();
+        assert_eq!(net.node(leader).learners(), vec![4]);
+        net.run(40, &[]);
+        let joiner = net.node(4);
+        assert_eq!(joiner.log_snapshot().1, net.node(leader).log_snapshot().1);
+        assert_eq!(
+            (joiner.role(), joiner.term()),
+            (NodeState::Follower, net.node(leader).term())
+        );
+        assert!(joiner.voters().is_empty());
+        assert_eq!(net.node(leader).voters(), vec![1, 2, 3]);
+        // It can be dropped again, and picked up again.
+        net.node(leader).remove_learner(4).unwrap();
+        assert!(net.node(leader).learners().is_empty());
+        net.node(leader).add_learner(4).unwrap();
+        net.run(40, &[]);
+        // Promoted: in effect on the leader at once, committed by a majority
+        // of the four, and one change at a time.
+        let index = net.node(leader).add_voter(4).unwrap();
+        assert_eq!(net.node(leader).voters(), vec![1, 2, 3, 4]);
+        assert!(net.node(leader).learners().is_empty() && net.node(leader).config_pending());
+        assert_eq!(
+            net.node(leader).remove_voter(follower),
+            refused("the previous change is not committed yet")
+        );
+        net.run(40, &[]);
+        assert!(!net.node(leader).config_pending());
+        for n in &net.nodes {
+            assert_eq!(n.voters(), vec![1, 2, 3, 4]);
+            assert!(n.commit_index() >= index);
+        }
+        // The new voter takes part: of the four, the leader and node 4 are
+        // not a majority, and with one more of the old ones they are.
+        let old: Vec<NodeId> = (1..=3).filter(|&i| i != leader).collect();
+        let four = net.node(leader).propose(b"four".to_vec()).unwrap();
+        net.run(20, &old);
+        assert!(net.node(leader).commit_index() < four);
+        net.run(30, &old[..1]);
+        assert_eq!(net.node(leader).commit_index(), four);
+        assert_eq!(net.node(4).commit_index(), four);
+        assert!(net.node(4).log_snapshot().1.last().is_some_and(|e| e.data == b"four"));
+    }
+
+    #[test]
+    fn a_removed_server_is_replicated_to_until_the_change_commits_and_then_left_alone() {
+        let (node, t) = committed_leader();
+        // Who the leader sends to within one heartbeat interval.
+        let targets = |node: &Node| {
+            let mut to: Vec<NodeId> = (0..3)
+                .flat_map(|_| node.tick().unwrap().messages)
+                .map(|m| m.to)
+                .collect();
+            to.sort_unstable();
+            to.dedup();
+            to
+        };
+        assert_eq!(targets(&node), vec![2, 3]);
+        let index = node.remove_voter(3).unwrap();
+        assert_eq!((index, node.voters(), node.config_pending()), (3, vec![1, 2], true));
+        // Node 3 may be needed to commit it, so it still gets entries.
+        assert_eq!(targets(&node), vec![2, 3]);
+        // A majority of the new two commits it: node 1 and node 2.
+        node.step(Message::append_entries_reply(2, 1, t, true, 3)).unwrap();
+        assert_eq!((node.commit_index(), node.config_pending()), (3, false));
+        assert_eq!(targets(&node), vec![2]);
+        // A late reply from the removed server is old news.
+        assert!(node
+            .step(Message::append_entries_reply(3, 1, t, true, 3))
+            .unwrap()
+            .is_empty());
+        assert!(node
+            .step(Message::append_entries_reply(9, 1, t, false, 0))
+            .unwrap()
+            .is_empty());
+        // Its votes and requests count for nothing, as it is no member now.
+        assert_eq!(node.step(Message::request_vote(3, 1, t + 1, 9, 9)), Ok(vec![]));
+        assert_eq!(node.term(), t);
+    }
+
+    #[test]
+    fn a_leader_that_removes_itself_steps_down_when_the_change_commits() {
+        let mut net = Net::new(3);
+        net.run(60, &[]);
+        let old = net.leaders(&[])[0];
+        let term = net.node(old).term();
+        let l = net.node(old);
+        let index = l.remove_voter(old).unwrap();
+        assert_eq!(l.role(), NodeState::Leader, "until it commits");
+        assert!(!l.voters().contains(&old));
+        net.run(1, &[]);
+        net.run(60, &[]);
+        assert!(net.node(old).commit_index() >= index);
+        assert_eq!(net.node(old).role(), NodeState::Follower);
+        assert_eq!(net.node(old).leader(), None);
+        let new = net.leaders(&[]);
+        assert_eq!(new.len(), 1);
+        assert_ne!(new[0], old);
+        assert!(net.node(new[0]).term() > term);
+        // It stays out: it never campaigns, and the others never count it.
+        let after = net.node(new[0]).term();
+        net.run(300, &[]);
+        assert_eq!((net.leaders(&[]), net.node(new[0]).term()), (new, after));
+        assert_eq!(net.node(old).role(), NodeState::Follower);
+    }
+
+    #[test]
+    fn a_server_that_is_being_removed_keeps_its_place_until_the_change_commits() {
+        // Node 2 holds an uncommitted entry that removes it, and nothing else
+        // knows about that entry: it may still have to lead.
+        let node = Node::new(classic(2, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        let append = |entries: Vec<LogEntry>, commit| {
+            node.step(Message::append_entries(1, 2, 1, 0, 0, entries, commit))
+                .unwrap();
+        };
+        append(vec![entry(1, 1, b"a"), LogEntry::config(2, 1, &[1, 3])], 1);
+        assert_eq!(node.voters(), vec![1, 3]);
+        assert!(node.config_pending());
+        // No leader in earshot: it campaigns, though it is not in the voter
+        // set it uses, and only the votes of that set count.
+        let asks = campaign(&node);
+        assert_eq!(asks.iter().map(|m| m.to).collect::<Vec<_>>(), vec![1, 3]);
+        let t = node.term();
+        node.step(Message::request_vote_reply(1, 2, t, true)).unwrap();
+        assert_eq!(
+            node.role(),
+            NodeState::Candidate,
+            "one vote of two: it does not count itself"
+        );
+        node.step(Message::request_vote_reply(3, 2, t, true)).unwrap();
+        assert_eq!(node.role(), NodeState::Leader);
+        // It commits its own removal with 1 and 3 together, then hands over.
+        node.step(Message::append_entries_reply(1, 2, t, true, 3)).unwrap();
+        assert_eq!(node.role(), NodeState::Leader, "the entry needs both of the two");
+        node.step(Message::append_entries_reply(3, 2, t, true, 3)).unwrap();
+        assert_eq!((node.role(), node.leader()), (NodeState::Follower, None));
+    }
+
+    #[test]
+    fn votes_from_servers_outside_the_configuration_do_not_count() {
+        // The log holds an uncommitted configuration without node 2, which
+        // is still a voter of the committed one. Node 1 campaigns with it.
+        let mut log = Log::new();
+        log.append(&[LogEntry::config(1, 1, &[1, 3, 5])]).unwrap();
+        let storage = MemoryStorage::with_state(DurableState {
+            term: 1,
+            log,
+            ..DurableState::default()
+        });
+        let node = Node::new(classic(1, vec![1, 2, 3]), storage).unwrap();
+        let asks = campaign(&node);
+        assert_eq!(asks.iter().map(|m| m.to).collect::<Vec<_>>(), vec![3, 5]);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        assert_eq!(node.role(), NodeState::Candidate, "node 2 is not a voter of [1, 3, 5]");
+        node.step(Message::request_vote_reply(3, 1, t, true)).unwrap();
+        assert_eq!(node.role(), NodeState::Leader);
+        // Pre-votes are counted the same way.
+        let node = Node::new(Config::cluster(1, vec![1, 3, 5]), MemoryStorage::new()).unwrap();
+        pre_campaign(&node);
+        node.step(Message::pre_vote_reply(9, 1, 1, true)).unwrap();
+        assert_eq!(node.role(), NodeState::PreCandidate);
+    }
+
+    #[test]
+    fn nodes_without_a_place_never_campaign() {
+        let joiner = Node::new(Config::joiner(4), MemoryStorage::new()).unwrap();
+        for _ in 0..200 {
+            assert!(joiner.tick().unwrap().messages.is_empty());
+        }
+        assert_eq!((joiner.role(), joiner.term()), (NodeState::Follower, 0));
+        // A node that the log removed does not either, once that committed.
+        let node = Node::new(classic(2, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        node.step(Message::append_entries(
+            1,
+            2,
+            1,
+            0,
+            0,
+            vec![entry(1, 1, b"a"), LogEntry::config(2, 1, &[1, 3])],
+            2,
+        ))
+        .unwrap();
+        assert!(!node.config_pending());
+        for _ in 0..200 {
+            assert!(node.tick().unwrap().messages.is_empty());
+        }
+        assert_eq!(node.role(), NodeState::Follower);
+        // The configured voters are kept ascending and without duplicates.
+        let node = Node::new(Config::cluster(1, vec![3, 1, 2, 2]), MemoryStorage::new()).unwrap();
+        assert_eq!(node.voters(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn membership_changes_wait_for_an_entry_of_the_leaders_term() {
+        let node = Node::new(classic(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        assert_eq!(node.remove_voter(3), Err(Error::NotLeader(None)));
+        campaign(&node);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        // Its own empty entry is not committed yet.
+        assert_eq!(node.remove_voter(3), Err(Error::NotReady));
+        node.add_learner(4).unwrap();
+        assert_eq!(node.add_voter(4), Err(Error::NotReady));
+        node.step(Message::append_entries_reply(2, 1, t, true, 1)).unwrap();
+        // The learner must have everything committed.
+        assert_eq!(
+            node.add_voter(4),
+            Err(Error::BadConfig("the learner has not caught up"))
+        );
+        node.step(Message::append_entries_reply(4, 1, t, true, 1)).unwrap();
+        assert_eq!(node.add_voter(4), Ok(2));
+        let pending = Err(Error::BadConfig("the previous change is not committed yet"));
+        assert_eq!(node.add_voter(4), pending);
+        assert_eq!(node.voters(), vec![1, 2, 3, 4]);
+        assert!(node.learners().is_empty());
+        // Four voters: the entry commits with three of them.
+        node.step(Message::append_entries_reply(2, 1, t, true, 2)).unwrap();
+        assert!(node.config_pending());
+        node.step(Message::append_entries_reply(4, 1, t, true, 2)).unwrap();
+        assert!(!node.config_pending());
+        assert_eq!(node.add_voter(4), Err(Error::BadConfig("already a voter")));
+        // The last voter is never removed.
+        let single = Node::new(Config::single(1), MemoryStorage::new()).unwrap();
+        leader_of(&single, 20);
+        assert_eq!(
+            single.remove_voter(1),
+            Err(Error::BadConfig("cannot remove the last voter"))
+        );
+    }
+
+    #[test]
+    fn a_configuration_entry_that_cannot_be_stored_is_not_in_effect() {
+        // The budget covers the load, the vote and the leader's empty entry.
+        let node = Node::new(classic(1, vec![1, 2, 3]), Failing::new(3)).unwrap();
+        campaign(&node);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, 1)).unwrap();
+        assert_eq!(node.remove_voter(3), Err(Error::Storage("disk gone".into())));
+        assert_eq!((node.voters(), node.log_snapshot().1.len()), (vec![1, 2, 3], 1));
+        // The same promoting a learner: it stays a learner.
+        let node = Node::new(classic(1, vec![1, 2, 3]), Failing::new(3)).unwrap();
+        campaign(&node);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, 1)).unwrap();
+        node.add_learner(4).unwrap();
+        node.step(Message::append_entries_reply(4, 1, t, true, 1)).unwrap();
+        assert_eq!(node.add_voter(4), Err(Error::Storage("disk gone".into())));
+        assert_eq!((node.voters(), node.learners()), (vec![1, 2, 3], vec![4]));
+    }
+
+    #[test]
+    fn the_configuration_travels_with_snapshots() {
+        // A leader of one adds node 2, and snapshots after that.
+        let storage = MemoryStorage::new();
+        let node = Node::new(Config::single(1), storage.clone()).unwrap();
+        leader_of(&node, 20);
+        let t = node.term();
+        node.add_learner(2).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, 1)).unwrap();
+        let index = node.add_voter(2).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, index)).unwrap();
+        assert!(!node.config_pending());
+        node.tick().unwrap();
+        node.propose(b"after".to_vec()).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, index + 1))
+            .unwrap();
+        node.tick().unwrap();
+        node.compact(index + 1, b"state".to_vec()).unwrap();
+        let stored = storage.load().unwrap().snapshot.unwrap();
+        assert_eq!(stored.voters, vec![1, 2]);
+        // The log no longer holds the entry; after a restart the snapshot
+        // says who the voters are, not the configured list.
+        drop(node);
+        let node = Node::new(Config::single(1), storage).unwrap();
+        assert_eq!(node.voters(), vec![1, 2]);
+        // A follower that installs a snapshot takes its configuration.
+        let follower = Node::new(classic(2, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        let snapshot = Arc::new(snapshot_of(5, 1, &[2, 3, 4], b"S"));
+        follower.step(Message::install_snapshot(1, 2, 1, snapshot, 5)).unwrap();
+        assert_eq!(follower.voters(), vec![2, 3, 4]);
+        // The snapshot message must carry a snapshot, and entries a valid
+        // configuration.
+        let empty = Message {
+            msg_type: MsgType::InstallSnapshot,
+            ..Message::request_vote(1, 2, 1, 0, 0)
+        };
+        assert_eq!(
+            follower.step(empty),
+            Err(Error::BadSnapshot("InstallSnapshot without a snapshot"))
+        );
+        let bad = LogEntry {
+            kind: crate::EntryKind::Config,
+            ..entry(6, 1, b"not voters")
+        };
+        let err = follower.step(Message::append_entries(1, 2, 1, 5, 1, vec![bad], 0));
+        assert_eq!(err, Err(Error::LogInconsistency(LogError::BadConfig { index: 6 })));
     }
 }
