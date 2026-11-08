@@ -467,11 +467,13 @@ impl Db {
             .map(|f| f.1)
             .collect();
         logs.sort_unstable();
-        // Replay surviving WALs; a torn tail ends each log's valid prefix.
+        // Replay surviving WALs; a torn tail ends each log's valid prefix,
+        // corruption fails the open instead of dropping acknowledged writes.
         let mem = Memtable::new();
         for n in &logs {
-            let data = env.read_all(&dir.join(file_name(FileKind::Log, *n)))?;
-            for rec in log::parse(&data).0 {
+            let name = file_name(FileKind::Log, *n);
+            let data = env.read_all(&dir.join(&name))?;
+            for rec in log::parse_checked(&data, &name)? {
                 let (seq, batch) = WriteBatch::decode(rec)?;
                 mem.apply(&batch, seq);
                 last_seq = last_seq.max((seq + batch.len() as u64).saturating_sub(1));
@@ -843,10 +845,23 @@ mod tests {
             .filter(|p| p.extension().is_some_and(|x| x == "log"))
             .max()
             .unwrap();
+        let acked = std::fs::read(&wal).unwrap();
         let mut bytes = Vec::new();
         log::frame(&mut bytes, &[1, 2, 3]);
         std::fs::write(&wal, bytes).unwrap();
         assert!(Db::open(&d, small(Arc::new(OsEnv))).is_err());
+        // a flipped bit in an acknowledged write fails the open instead of
+        // silently dropping that write and every later one
+        let mut flipped = acked.clone();
+        flipped[log::HEADER + 2] ^= 1;
+        std::fs::write(&wal, flipped).unwrap();
+        let e = Db::open(&d, small(Arc::new(OsEnv))).err().unwrap().to_string();
+        assert!(e.contains("damaged record at offset 0"), "{e}");
+        // a torn tail after it is still dropped
+        let mut torn = acked;
+        torn.extend_from_slice(&[9, 9, 9]);
+        std::fs::write(&wal, torn).unwrap();
+        drop(Db::open(&d, small(Arc::new(OsEnv))).unwrap());
         std::fs::remove_file(&wal).unwrap();
         // stray temp files are collected; a missing table is an error
         std::fs::write(d.join(file_name(FileKind::Temp, 999)), b"").unwrap();

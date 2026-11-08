@@ -1,12 +1,16 @@
 //! CRC-framed record log, shared by the WAL and the manifest.
 //!
 //! Record = `masked_crc32c(len ++ payload): u32le | len: u32le | payload`.
-//! A hardware crash can leave a torn or garbage tail; [`parse`] returns the
-//! longest valid prefix and where it ends, so recovery never trips over it.
+//! A hardware crash can leave a torn tail; [`parse`] returns the longest
+//! valid prefix and where it ends, and [`tail`] tells a torn tail (a write
+//! that never completed, so was never acknowledged: safe to drop) from
+//! corruption (a bit flip or bad sector in data that may have been
+//! acknowledged: never silently dropped). This is the storage fault model of
+//! TigerBeetle and of protocol-aware recovery (Alagappan et al., FAST '18).
 
 use crate::crc::masked_crc;
 use crate::env::WritableFile;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 pub const HEADER: usize = 8;
 
@@ -35,6 +39,54 @@ pub fn parse(buf: &[u8]) -> (Vec<&[u8]>, usize) {
         pos = body + len;
     }
     (out, pos)
+}
+
+/// What follows the valid prefix of a log, see [`tail`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tail {
+    /// Every byte belongs to an intact record.
+    Clean,
+    /// An incomplete last record, or zero fill: a write cut short by a crash.
+    Torn,
+    /// A complete record with a bad checksum, or intact records after a bad
+    /// one: the data was damaged after it was written.
+    Corrupt,
+}
+
+/// Classifies the bytes of `buf` after `end`, the valid prefix returned by
+/// [`parse`].
+///
+/// A crash can only tear the last write, and a torn write is a prefix of a
+/// record (or zeros where the file system extended the file before the data
+/// landed). So a bad record whose declared length fits in the file, or any
+/// intact record further on, means corruption. A bit flip in a length field
+/// can make a damaged record look incomplete; the forward scan for an intact
+/// record still catches it unless it hit the very last record.
+pub fn tail(buf: &[u8], end: usize) -> Tail {
+    let rest = &buf[end..];
+    if rest.is_empty() {
+        return Tail::Clean;
+    }
+    if rest.iter().all(|&b| b == 0) {
+        return Tail::Torn;
+    }
+    let complete = rest.len() >= HEADER
+        && u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize <= rest.len() - HEADER;
+    if complete || (1..rest.len()).any(|i| !parse(&rest[i..]).0.is_empty()) {
+        Tail::Corrupt
+    } else {
+        Tail::Torn
+    }
+}
+
+/// [`parse`] for recovery: a torn tail is dropped, corruption is an error
+/// naming `what` and the offset, so acknowledged data is never lost silently.
+pub fn parse_checked<'a>(buf: &'a [u8], what: &str) -> Result<Vec<&'a [u8]>> {
+    let (records, end) = parse(buf);
+    match tail(buf, end) {
+        Tail::Corrupt => Err(Error::corruption(format!("{what}: damaged record at offset {end}"))),
+        Tail::Clean | Tail::Torn => Ok(records),
+    }
 }
 
 /// Append-only record writer over a [`WritableFile`].
@@ -106,6 +158,49 @@ mod tests {
         let mut huge = buf.clone();
         huge[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(parse(&huge), (vec![], 0));
+    }
+
+    #[test]
+    fn torn_tails_are_told_from_corruption() {
+        let mut buf = Vec::new();
+        frame(&mut buf, b"one");
+        frame(&mut buf, &[7u8; 100]);
+        frame(&mut buf, b"three");
+        let classify = |b: &[u8]| tail(b, parse(b).1);
+        assert_eq!(classify(&buf), Tail::Clean);
+        // Every proper prefix is a torn write.
+        for cut in 1..buf.len() {
+            let t = classify(&buf[..cut]);
+            assert!(t == Tail::Clean || t == Tail::Torn, "cut {cut}: {t:?}");
+        }
+        // Zero fill after the data, even a whole header's worth.
+        let mut zeros = buf.clone();
+        zeros.extend_from_slice(&[0; 64]);
+        assert_eq!(classify(&zeros), Tail::Torn);
+        // A flipped bit anywhere, including the last record, is corruption.
+        for i in 0..buf.len() {
+            let mut bad = buf.clone();
+            bad[i] ^= 0x10;
+            let t = classify(&bad);
+            let last_len_field = (buf.len() - 5 - 4..buf.len() - 5).contains(&i);
+            assert!(t == Tail::Corrupt || last_len_field, "byte {i}: {t:?}");
+        }
+        // A length flipped beyond the end of the file in the last record
+        // looks exactly like a torn write.
+        let mut last = buf.clone();
+        let n = last.len();
+        last[n - 5 - 2] ^= 0x10;
+        assert_eq!(classify(&last), Tail::Torn);
+        // ... but not in an earlier record: the intact record after it is found.
+        let mut first = buf.clone();
+        first[6] ^= 0x10;
+        assert_eq!(classify(&first), Tail::Corrupt);
+        // parse_checked drops torn tails and reports corruption.
+        assert_eq!(parse_checked(&zeros, "log").unwrap().len(), 3);
+        assert_eq!(
+            parse_checked(&first, "log 7").unwrap_err().to_string(),
+            "corruption: log 7: damaged record at offset 0"
+        );
     }
 
     #[test]

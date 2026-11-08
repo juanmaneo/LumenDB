@@ -69,8 +69,9 @@ pub fn recover(env: &dyn Env, dir: &Path) -> Result<Option<(u64, VersionEdit)>> 
         Some((FileKind::Manifest, n)) if name.ends_with('\n') => n,
         _ => return Err(Error::corruption(format!("bad CURRENT contents {name:?}"))),
     };
-    let data = env.read_all(&dir.join(file_name(FileKind::Manifest, number)))?;
-    let (records, _) = log::parse(&data);
+    let name = file_name(FileKind::Manifest, number);
+    let data = env.read_all(&dir.join(&name))?;
+    let records = log::parse_checked(&data, &name)?;
     if records.is_empty() {
         return Err(Error::corruption("manifest has no snapshot record"));
     }
@@ -116,6 +117,9 @@ mod tests {
     use crate::env::{FaultEnv, OsEnv};
     use std::sync::Arc;
 
+    /// A payload byte of the first record.
+    const HEADER_OFFSET_IN_FIRST_PAYLOAD: usize = log::HEADER;
+
     #[test]
     fn names_roundtrip() {
         for kind in [FileKind::Log, FileKind::Table, FileKind::Manifest, FileKind::Temp] {
@@ -151,6 +155,15 @@ mod tests {
         bytes.extend_from_slice(&[1, 2, 3]);
         std::fs::write(&mp, &bytes).unwrap();
         assert!(recover(&env, &d).unwrap().is_some());
+        // a flipped bit in an acknowledged edit is corruption, not a torn tail
+        let mut flipped = bytes.clone();
+        flipped[HEADER_OFFSET_IN_FIRST_PAYLOAD] ^= 1;
+        std::fs::write(&mp, &flipped).unwrap();
+        assert!(recover(&env, &d)
+            .unwrap_err()
+            .to_string()
+            .contains("damaged record at offset 0"));
+        std::fs::write(&mp, &bytes).unwrap();
         // a record that frames correctly but does not decode
         let mut bytes = std::fs::read(&mp).unwrap();
         bytes.truncate(bytes.len() - 3);
