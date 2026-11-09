@@ -11,7 +11,7 @@ use flashkv::env::{FaultEnv, OsEnv};
 use flashkv::WriteBatch;
 use pcapfast::synth::{self, SynthOptions};
 use pcapfast::{parse_bytes, parse_file, Format, ParseOptions};
-use raft::{NetOptions, NodeId, ServerOptions, Transport};
+use raft::{NetOptions, NodeId, Secret, ServerOptions, Transport};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs::File;
@@ -63,7 +63,7 @@ commands:
       how long to wait for an election, a write to be applied or the nodes to
       catch up (default 10000)
   serve --id N --dir DIR --raft ADDR --client ADDR [--voters 1,2,3] [--peer ID=ADDR]...
-        [--snapshot-every N] [--snapshot-chunk BYTES] [--timeout-ms N]
+        [--snapshot-every N] [--snapshot-chunk BYTES] [--timeout-ms N] [--secret-file FILE]
       run one node of a replicated tsvdb cluster, in this process, until a
       client sends SHUTDOWN. Raft listens on --raft and the client protocol
       on --client (port 0 lets the system pick; the first line printed says
@@ -75,8 +75,14 @@ commands:
       again; only a node that moved has to be told. A snapshot is sent to a
       node that needs one in chunks of at most --snapshot-chunk bytes
       (default 1048576; 0: in one message). Writes and consistent queries
-      wait up to --timeout-ms for the node (default 5000)
-  client --nodes ADDR,ADDR,... <command> [--timeout-ms N] [--patience-ms N]
+      wait up to --timeout-ms for the node (default 5000). With --secret-file,
+      every connection, from another node or from a client, has to prove it
+      knows the secret in FILE: at least 16 random bytes, for instance made
+      by `head -c 32 /dev/urandom | base64 > FILE`, readable by its owner
+      only. All the nodes and clients of a cluster use the same one. It
+      authenticates the peer and every byte that follows, but nothing is
+      encrypted, and whoever has the secret is trusted with everything
+  client --nodes ADDR,ADDR,... <command> [--timeout-ms N] [--patience-ms N] [--secret-file FILE]
       talk to a cluster through the client addresses of its nodes. Commands:
         status                 every node: role, term, leader, voters, log positions
         ping                   every node: PONG, or why not; fails if any node
@@ -93,8 +99,10 @@ commands:
         shutdown               stop every node
       The leader is looked for among the nodes for up to --patience-ms
       (default 10000); --timeout-ms (default 10000) limits each connection
-      and each wait for a reply. A write that fails with a timeout or a lost
-      connection may or may not have been applied
+      and each wait for a reply. --secret-file is the secret of the cluster
+      (see `serve`): nodes that have one answer nothing without it. A write
+      that fails with a timeout or a lost connection may or may not have been
+      applied
 
 storage options (ingest, write, query, kv-bench):
   --sync 0|1        fsync every write (default 1)
@@ -636,6 +644,13 @@ fn node_id(flag: &str, s: &str) -> Res<NodeId> {
     Ok(s.parse().map_err(|_| format!("{flag}: invalid node id {s:?}"))?)
 }
 
+/// The secret in the file `--secret-file` names, if there is one.
+fn secret(a: &Args) -> Res<Option<Secret>> {
+    Ok(a.get("secret-file")
+        .map(|path| Secret::from_file(Path::new(path)))
+        .transpose()?)
+}
+
 /// Runs a node until a client stops it; `announce` is given the line that
 /// says where it listens, as soon as it does.
 fn serve_node(a: &Args, announce: &dyn Fn(String)) -> Res<String> {
@@ -649,6 +664,7 @@ fn serve_node(a: &Args, announce: &dyn Fn(String)) -> Res<String> {
         "snapshot-every",
         "snapshot-chunk",
         "timeout-ms",
+        "secret-file",
     ])?;
     let id = node_id("--id", a.req("id")?)?;
     let dir = Path::new(a.req("dir")?);
@@ -666,7 +682,8 @@ fn serve_node(a: &Args, announce: &dyn Fn(String)) -> Res<String> {
         peers.push((node_id("--peer", peer)?, socket_addr("--peer", addr)?));
     }
     let defaults = ClusterOptions::default();
-    let opts = ClusterOptions {
+    let secret = secret(a)?;
+    let mut opts = ClusterOptions {
         raft: ServerOptions {
             snapshot_every: a.num("snapshot-every", defaults.raft.snapshot_every)?,
             ..defaults.raft
@@ -674,9 +691,10 @@ fn serve_node(a: &Args, announce: &dyn Fn(String)) -> Res<String> {
         snapshot_chunk: a.num("snapshot-chunk", defaults.snapshot_chunk)?,
         ..defaults
     };
+    opts.raft.net.secret = secret.clone();
     let timeout = Duration::from_millis(a.num("timeout-ms", 5_000)?);
     let db = Arc::new(ReplicatedDb::open(dir, id, raft, &voters, &peers, opts)?);
-    let server = ClientServer::start(db.clone(), client, timeout)?;
+    let server = ClientServer::start_with(db.clone(), client, timeout, secret)?;
     announce(format!(
         "node {id} listening: raft {}, client {}",
         db.local_addr(),
@@ -738,6 +756,7 @@ fn client(a: &Args) -> Res<String> {
         "nodes",
         "timeout-ms",
         "patience-ms",
+        "secret-file",
         "local",
         "measurement",
         "field",
@@ -754,6 +773,7 @@ fn client(a: &Args) -> Res<String> {
     let timeout = Duration::from_millis(a.num("timeout-ms", 10_000)?);
     let patience = Duration::from_millis(a.num("patience-ms", 10_000)?);
     let mut c = ClusterClient::new(nodes, timeout, patience);
+    c.set_secret(secret(a)?);
     let command = a.pos(1, "client command")?;
     // The request, and for one that goes to every node: whether it is strict.
     let (req, every) = match command {
@@ -1300,6 +1320,77 @@ mod tests {
             taken.local_addr().unwrap()
         ));
         assert!(e.contains("in use"), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_secret_file_is_read_and_checked() {
+        let d = tmp("secret-file");
+        let (short, good) = (d.join("short"), d.join("good"));
+        std::fs::write(&short, "tiny\n").unwrap();
+        std::fs::write(&good, "a-secret-for-the-bench-tests\n").unwrap();
+        let base = format!(
+            "serve --id 1 --dir {} --raft 127.0.0.1:0 --client 127.0.0.1:0",
+            d.join("n").display()
+        );
+        for command in [base.as_str(), "client --nodes 127.0.0.1:1 status"] {
+            let e = err(&format!("{command} --secret-file {}", short.display()));
+            assert!(e.starts_with(&short.display().to_string()), "{e}");
+            assert!(e.contains("at least 16 bytes, this one has 4"), "{e}");
+            let e = err(&format!("{command} --secret-file {}", d.join("missing").display()));
+            assert!(e.contains("No such file"), "{e}");
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn serve_and_client_share_a_secret() {
+        let d = tmp("secret-run");
+        let (good, other) = (d.join("good"), d.join("other"));
+        std::fs::write(&good, "a-secret-for-the-bench-tests\n").unwrap();
+        std::fs::write(&other, "not-the-secret-of-this-cluster").unwrap();
+        let words: Vec<String> = format!(
+            "serve --id 1 --dir {} --raft 127.0.0.1:0 --client 127.0.0.1:0 --voters 1 --secret-file {}",
+            d.join("n").display(),
+            good.display()
+        )
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+        let a = Args::parse(&words).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // (not a scope: if an assertion below fails, the test must fail, not
+        // wait for a node that nobody stops)
+        let node = std::thread::spawn(move || serve_node(&a, &|line| tx.send(line).unwrap()).ok());
+        let stopped = {
+            let line = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            let addr: SocketAddr = line.split_once(", client ").unwrap().1.parse().unwrap();
+            let c = |secret: &Path, rest: &str| {
+                let flags = "--timeout-ms 400 --patience-ms 100";
+                cmd(&format!(
+                    "client --nodes {addr} {flags} --secret-file {} {rest}",
+                    secret.display()
+                ))
+            };
+            assert_eq!(c(&good, "ping").unwrap(), format!("{addr}: PONG\n"));
+            // Another secret: nothing is answered, and the client is told why.
+            let e = c(&other, "ping").unwrap_err().to_string();
+            assert!(e.starts_with("1 of 1 nodes failed:"), "{e}");
+            assert!(e.contains("same secret"), "{e}");
+            let status = c(&other, "status").unwrap();
+            assert!(status.starts_with(&format!("{addr}: unreachable: ")), "{status}");
+            assert!(c(&other, "shutdown").is_err());
+            // None at all.
+            let e = err(&format!(
+                "client --nodes {addr} --timeout-ms 400 --patience-ms 100 ping"
+            ));
+            assert!(e.starts_with("1 of 1 nodes failed:"), "{e}");
+            // (the node may not have elected itself yet)
+            assert!(c(&good, "status").unwrap().contains(": id=1 role="));
+            assert_eq!(c(&good, "shutdown").unwrap(), format!("{addr}: stopping\n"));
+            node.join().unwrap()
+        };
+        assert_eq!(stopped.as_deref(), Some("node 1 stopped\n"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

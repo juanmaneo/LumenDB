@@ -241,3 +241,84 @@ fn processes_form_a_cluster_that_replicates_fails_over_and_grows() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A client that is quick to give up, with this secret file (or none).
+fn quick(nodes: &str, secret: Option<&str>, rest: &[&str]) -> (bool, String) {
+    let mut args = vec!["--timeout-ms", "300", "--patience-ms", "100"];
+    if let Some(file) = secret {
+        args.extend(["--secret-file", file]);
+    }
+    args.extend(rest);
+    client(nodes, &args)
+}
+
+#[test]
+fn processes_with_a_secret_answer_only_those_who_have_it() {
+    let dir = std::env::temp_dir().join(format!("bench-secure-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |name: &str, text: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let (secret, other) = (
+        file("secret", "the-secret-of-this-cluster\n"),
+        file("other", "not-this-cluster-s-secret"),
+    );
+    let lp = file("in.lp", "cpu,host=a usage=1 10\ncpu,host=a usage=3 20\n");
+    let sum = ["query", "--measurement", "cpu", "--field", "usage", "--agg", "sum"];
+    let sum_is = format!("cpu,host=a\t{}\t4\n1 rows\n", i64::MIN);
+
+    let mut nodes: Vec<Node> = (1..=3)
+        .map(|id| spawn(&dir, id, &["--voters", "1,2,3", "--secret-file", &secret]))
+        .collect();
+    let all = addrs(&nodes);
+    let with = |rest: &[&str]| {
+        let mut args = vec!["--secret-file", secret.as_str()];
+        args.extend(rest);
+        client_ok(&all, &args)
+    };
+    for n in &nodes {
+        with(&["peer", &n.id.to_string(), &n.raft]);
+    }
+    // The nodes elect a leader and replicate to each other over connections
+    // that are authenticated, too.
+    assert_eq!(with(&["write", &lp]), "wrote 2 points\n");
+    let mut args = vec!["--secret-file", secret.as_str()];
+    args.extend(sum);
+    assert_eq!(client_ok(&all, &args), sum_is);
+    args.extend(["--local", "1"]);
+    for n in &nodes {
+        eventually("a node to have the write", || {
+            client(&n.client, &args) == (true, sum_is.clone())
+        });
+    }
+    assert_eq!(with(&["ping"]).matches(": PONG\n").count(), 3);
+
+    // Without the secret, or with another, nothing is answered, and nothing
+    // is changed: not even a stop.
+    for given in [None, Some(other.as_str())] {
+        for rest in [&["ping"][..], &["write", &lp], &["shutdown"]] {
+            let (ok, text) = quick(&all, given, rest);
+            assert!(!ok, "{rest:?} with {given:?} worked: {text}");
+            if given.is_some() {
+                assert!(text.contains("same secret"), "{rest:?}: {text}");
+            }
+        }
+        // (`status` says what each node answered, and is not strict)
+        let (ok, text) = quick(&all, given, &["status"]);
+        assert!(ok && text.matches("unreachable: ").count() == 3, "{text}");
+    }
+    assert_eq!(with(&["ping"]).matches(": PONG\n").count(), 3);
+    let mut args = vec!["--secret-file", secret.as_str()];
+    args.extend(sum);
+    assert_eq!(client_ok(&all, &args), sum_is);
+
+    // The secret stops them all.
+    assert_eq!(with(&["shutdown"]).matches(": stopping").count(), 3);
+    for n in &mut nodes {
+        assert!(n.child.wait().unwrap().success());
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

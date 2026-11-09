@@ -16,10 +16,18 @@
 //!   the connection on a bad checksum, an oversized frame or garbage; the
 //!   sender simply reconnects.
 //!
-//! Every drop is counted ([`Transport::stats`]). There is no authentication
-//! and no encryption: run it on a trusted network, or wrap it (a VPN, or
-//! stunnel). A message says who it is from, and the transport believes it.
+//! Every drop is counted ([`Transport::stats`]).
+//!
+//! **Authentication.** With [`NetOptions::secret`] set, every connection
+//! first proves that both ends know the secret, and everything on it is
+//! checked (see [`crate::auth`]): a stranger can neither join nor inject a
+//! message, and a message cannot be altered or replayed on the way. Without
+//! it, a message says who it is from, and the transport believes it. Either
+//! way there is **no encryption**: run it on a trusted network, or wrap it (a
+//! VPN, or stunnel). Every node of a cluster must have the same setting. With
+//! a secret, any node that holds it can pose as any other.
 
+use crate::auth::{AuthStream, Secret};
 use crate::message::Message;
 use crate::wire::{decode, encode, read_frame, MAX_FRAME};
 use crate::NodeId;
@@ -32,6 +40,10 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// What the handshake of a connection between nodes is for: see
+/// [`crate::auth`].
+const PURPOSE: &str = "raft";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetOptions {
@@ -46,6 +58,14 @@ pub struct NetOptions {
     pub write_timeout: Duration,
     /// After a failed connect, messages for that peer are dropped this long.
     pub retry_after: Duration,
+    /// The secret every node shares, if connections are to be authenticated:
+    /// a node without it cannot be heard, and does not hear.
+    pub secret: Option<Secret>,
+    /// The longest a handshake may take (with a secret only). A peer that
+    /// is silent for this long, or has the wrong secret or none, costs the
+    /// connection, and the messages for it are dropped like those for a
+    /// peer that is down.
+    pub handshake_timeout: Duration,
 }
 
 impl Default for NetOptions {
@@ -56,6 +76,8 @@ impl Default for NetOptions {
             connect_timeout: Duration::from_millis(500),
             write_timeout: Duration::from_secs(5),
             retry_after: Duration::from_millis(100),
+            secret: None,
+            handshake_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -73,8 +95,12 @@ pub struct NetStats {
     pub dropped_unreachable: u64,
     /// Failed writes: the message is lost, the connection is closed.
     pub write_errors: u64,
-    /// Inbound connections closed for sending bad frames.
+    /// Inbound connections closed for sending bad frames (or, with a secret,
+    /// records that fail their check).
     pub bad_frames: u64,
+    /// Connections, inbound or outbound, whose handshake failed: the peer
+    /// has another secret, none, or did not answer in time.
+    pub auth_failed: u64,
 }
 
 #[derive(Default)]
@@ -85,11 +111,16 @@ struct Counters {
     dropped_unreachable: AtomicU64,
     write_errors: AtomicU64,
     bad_frames: AtomicU64,
+    auth_failed: AtomicU64,
 }
 
 impl Counters {
     fn bump(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn bump_if(counter: &AtomicU64, condition: bool) {
+        counter.fetch_add(u64::from(condition), Ordering::Relaxed);
     }
 }
 
@@ -133,8 +164,8 @@ impl Transport {
         });
         let (inbox_tx, inbox) = mpsc::channel();
         let acceptor = {
-            let (shared, max) = (shared.clone(), opts.max_frame);
-            thread::spawn(move || accept_loop(listener, shared, inbox_tx, max))
+            let (shared, opts) = (shared.clone(), opts.clone());
+            thread::spawn(move || accept_loop(listener, shared, inbox_tx, opts))
         };
         Ok(Transport {
             local,
@@ -199,6 +230,7 @@ impl Transport {
             dropped_unreachable: get(&c.dropped_unreachable),
             write_errors: get(&c.write_errors),
             bad_frames: get(&c.bad_frames),
+            auth_failed: get(&c.auth_failed),
         }
     }
 
@@ -225,7 +257,7 @@ impl Drop for Transport {
 }
 
 /// Accepts connections until told to stop, a reader thread for each.
-fn accept_loop(listener: TcpListener, shared: Arc<Shared>, inbox: mpsc::Sender<Message>, max: usize) {
+fn accept_loop(listener: TcpListener, shared: Arc<Shared>, inbox: mpsc::Sender<Message>, opts: NetOptions) {
     while !shared.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -235,9 +267,9 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>, inbox: mpsc::Sender<M
                 let id = shared.next_inbound.fetch_add(1, Ordering::Relaxed);
                 // A connection that cannot be copied just cannot be closed from here.
                 shared.inbound.lock().extend(stream.try_clone().map(|copy| (id, copy)));
-                let (shared, inbox) = (shared.clone(), inbox.clone());
+                let (shared, inbox, opts) = (shared.clone(), inbox.clone(), opts.clone());
                 thread::spawn(move || {
-                    read_loop(stream, &inbox, max, &shared.counters);
+                    serve_inbound(stream, &inbox, &opts, &shared.counters);
                     shared.inbound.lock().remove(&id);
                 });
             }
@@ -247,11 +279,23 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>, inbox: mpsc::Sender<M
     }
 }
 
-/// Decodes frames from `stream` into `inbox` until the stream ends, a frame
+/// Authenticates an inbound connection if there is a secret, then reads it.
+fn serve_inbound(stream: TcpStream, inbox: &mpsc::Sender<Message>, opts: &NetOptions, counters: &Counters) {
+    let input = match &opts.secret {
+        None => AuthStream::plain(stream),
+        Some(secret) => match AuthStream::accept(stream, secret, PURPOSE, opts.handshake_timeout) {
+            Ok(input) => input,
+            Err(_) => return Counters::bump(&counters.auth_failed),
+        },
+    };
+    read_loop(input, inbox, opts.max_frame, counters);
+}
+
+/// Decodes frames from `input` into `inbox` until the stream ends, a frame
 /// is bad, or the inbox is gone.
-fn read_loop(mut stream: TcpStream, inbox: &mpsc::Sender<Message>, max: usize, counters: &Counters) {
+fn read_loop(mut input: AuthStream, inbox: &mpsc::Sender<Message>, max: usize, counters: &Counters) {
     loop {
-        let frame = match read_frame(&mut stream, max) {
+        let frame = match read_frame(&mut input, max) {
             Ok(Some(frame)) => frame,
             Ok(None) => return,
             Err(e) => {
@@ -274,7 +318,7 @@ fn read_loop(mut stream: TcpStream, inbox: &mpsc::Sender<Message>, max: usize, c
 
 /// Sends the frames queued for one peer over a connection it keeps open.
 fn write_loop(addr: SocketAddr, queue: Receiver<Vec<u8>>, shared: Arc<Shared>, opts: NetOptions) {
-    let mut conn: Option<TcpStream> = None;
+    let mut conn: Option<AuthStream> = None;
     let mut retry_at = Instant::now();
     let counters = &shared.counters;
     for frame in queue {
@@ -282,7 +326,7 @@ fn write_loop(addr: SocketAddr, queue: Receiver<Vec<u8>>, shared: Arc<Shared>, o
             return;
         }
         if conn.is_none() && Instant::now() >= retry_at {
-            conn = connect(addr, &opts);
+            conn = connect(addr, &opts, counters);
             retry_at = Instant::now() + opts.retry_after * u32::from(conn.is_none());
         }
         let Some(stream) = conn.as_mut() else {
@@ -299,13 +343,23 @@ fn write_loop(addr: SocketAddr, queue: Receiver<Vec<u8>>, shared: Arc<Shared>, o
     }
 }
 
-fn connect(addr: SocketAddr, opts: &NetOptions) -> Option<TcpStream> {
+/// Opens a connection to `addr`; with a secret, one that has passed the
+/// handshake.
+fn connect(addr: SocketAddr, opts: &NetOptions, counters: &Counters) -> Option<AuthStream> {
     let stream = TcpStream::connect_timeout(&addr, opts.connect_timeout).ok()?;
     // These fail only on a socket that is already gone, which the first
     // write finds out about.
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(opts.write_timeout));
-    Some(stream)
+    let Some(secret) = &opts.secret else {
+        return Some(AuthStream::plain(stream));
+    };
+    // Only the handshake reads on this connection: it waits this long for the
+    // other side.
+    let _ = stream.set_read_timeout(Some(opts.handshake_timeout));
+    let authenticated = AuthStream::connect(stream, secret, PURPOSE);
+    Counters::bump_if(&counters.auth_failed, authenticated.is_err());
+    authenticated.ok()
 }
 
 #[cfg(test)]
@@ -342,6 +396,32 @@ mod tests {
 
     fn vote(from: NodeId, to: NodeId, term: u64) -> Message {
         Message::request_vote(from, to, term, 7, 3)
+    }
+
+    /// Whether the other side closes (or resets) `s` without a word.
+    fn closed_by_peer(mut s: TcpStream) -> bool {
+        let mut b = [0u8; 1];
+        s.set_read_timeout(Some(LONG)).unwrap();
+        s.read(&mut b).unwrap_or(0) == 0
+    }
+
+    fn secret() -> Secret {
+        Secret::new(b"net-test-secret-0123456789").unwrap()
+    }
+
+    fn other_secret() -> Secret {
+        Secret::new(b"another-net-secret-0123456789").unwrap()
+    }
+
+    /// Options with a secret. A handshake that is meant to succeed gets
+    /// `LONG`, so that a loaded machine does not fail it; one that is meant
+    /// to time out gets less.
+    fn secured(secret: &Secret, handshake_timeout: Duration) -> NetOptions {
+        NetOptions {
+            secret: Some(secret.clone()),
+            handshake_timeout,
+            ..fast()
+        }
     }
 
     #[test]
@@ -445,11 +525,6 @@ mod tests {
         });
         let good = encode(&vote(3, 1, 4));
         let connect = || TcpStream::connect(t.local_addr()).unwrap();
-        let closed_by_peer = |mut s: TcpStream| {
-            let mut b = [0u8; 1];
-            s.set_read_timeout(Some(LONG)).unwrap();
-            s.read(&mut b).unwrap_or(0) == 0
-        };
         // A flipped bit.
         let mut flipped = good.clone();
         flipped[12] ^= 1;
@@ -483,6 +558,98 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_transports_exchange_messages_both_ways() {
+        let s = secret();
+        let (a, b) = (transport(secured(&s, LONG)), transport(secured(&s, LONG)));
+        a.set_peer(2, b.local_addr());
+        b.set_peer(1, a.local_addr());
+        for term in 1..=50 {
+            assert!(a.send(&vote(1, 2, term)));
+        }
+        for term in 1..=50 {
+            assert_eq!(b.recv_timeout(LONG), Some(vote(1, 2, term)));
+        }
+        // A message of many records.
+        let big = Message::append_entries(2, 1, 1, 0, 0, vec![LogEntry::new(1, 1, vec![7; 3 << 20])], 0);
+        assert!(b.send(&big));
+        assert_eq!(a.recv_timeout(LONG), Some(big));
+        wait_until("the counters", || a.stats().sent == 50 && b.stats().sent == 1);
+        for t in [&a, &b] {
+            let stats = t.stats();
+            assert_eq!(
+                stats.auth_failed + stats.bad_frames + stats.write_errors,
+                0,
+                "{stats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_with_another_secret_is_refused_by_both_sides() {
+        let (a, b) = (
+            transport(secured(&secret(), LONG)),
+            transport(secured(&other_secret(), LONG)),
+        );
+        a.set_peer(2, b.local_addr());
+        assert!(a.send(&vote(1, 2, 1)));
+        wait_until("both sides to refuse", || {
+            a.stats().auth_failed == 1 && b.stats().auth_failed == 1 && a.stats().dropped_unreachable == 1
+        });
+        assert_eq!(b.recv_timeout(Duration::from_millis(30)), None);
+        assert_eq!((a.stats().sent, b.stats().received), (0, 0));
+    }
+
+    #[test]
+    fn a_node_with_a_secret_and_one_without_do_not_hear_each_other() {
+        let s = secret();
+        // It has a secret, the other end does not speak the handshake: it
+        // waits for a challenge that never comes.
+        let (a, plain) = (transport(secured(&s, Duration::from_millis(150))), transport(fast()));
+        a.set_peer(2, plain.local_addr());
+        assert!(a.send(&vote(1, 2, 1)));
+        wait_until("the handshake to time out", || a.stats().auth_failed == 1);
+        assert_eq!(plain.recv_timeout(Duration::from_millis(30)), None);
+        assert_eq!(plain.stats().bad_frames, 0);
+        // It has none, and sends a frame where the proof should be.
+        let (plain, b) = (transport(fast()), transport(secured(&s, LONG)));
+        plain.set_peer(2, b.local_addr());
+        let frame = Message::append_entries(1, 2, 1, 0, 0, vec![LogEntry::new(1, 1, vec![7; 1000])], 0);
+        assert!(plain.send(&frame));
+        wait_until("the proof to fail", || b.stats().auth_failed == 1);
+        assert_eq!(b.recv_timeout(Duration::from_millis(30)), None);
+        assert_eq!(b.stats().received, 0);
+    }
+
+    #[test]
+    fn records_that_fail_their_check_close_the_connection() {
+        let s = secret();
+        let t = transport(secured(&s, LONG));
+        let handshake = || {
+            let raw = TcpStream::connect(t.local_addr()).unwrap();
+            raw.set_read_timeout(Some(LONG)).unwrap();
+            let authenticated = AuthStream::connect(raw.try_clone().unwrap(), &s, PURPOSE).unwrap();
+            assert!(authenticated.is_authenticated());
+            (raw, authenticated)
+        };
+        // Bytes that are no record: far too long a length.
+        let (mut raw, _stream) = handshake();
+        raw.write_all(&[0xAA; 100]).unwrap();
+        assert!(closed_by_peer(raw));
+        // A record of the right shape that was not made with the key.
+        let (mut raw, _stream) = handshake();
+        let mut forged = 5u32.to_le_bytes().to_vec();
+        forged.extend_from_slice(&[0; 5 + 32]);
+        raw.write_all(&forged).unwrap();
+        assert!(closed_by_peer(raw));
+        wait_until("two bad records", || t.stats().bad_frames == 2);
+        // A real frame, through the same handshake, still arrives.
+        let (_raw, mut stream) = handshake();
+        stream.write_all(&encode(&vote(3, 1, 4))).unwrap();
+        assert_eq!(t.recv_timeout(LONG), Some(vote(3, 1, 4)));
+        assert_eq!(t.stats().auth_failed, 0);
+    }
+
+    #[test]
     fn finished_connections_are_forgotten() {
         let t = transport(fast());
         let mut s = TcpStream::connect(t.local_addr()).unwrap();
@@ -502,7 +669,7 @@ mod tests {
         drop(rx);
         client.write_all(&encode(&vote(3, 1, 4))).unwrap();
         let counters = Counters::default();
-        read_loop(server, &tx, MAX_FRAME, &counters);
+        read_loop(AuthStream::plain(server), &tx, MAX_FRAME, &counters);
         assert_eq!(counters.received.load(Ordering::Relaxed), 0);
     }
 
@@ -540,6 +707,7 @@ mod tests {
         let o = NetOptions::default();
         assert_eq!(o.max_frame, MAX_FRAME);
         assert!(o.outbox > 0 && o.retry_after < o.write_timeout);
+        assert!(o.secret.is_none() && !o.handshake_timeout.is_zero());
         // An address that is not this machine's.
         let elsewhere: SocketAddr = "192.0.2.1:0".parse().unwrap();
         assert!(Transport::bind(elsewhere, NetOptions::default()).is_err());

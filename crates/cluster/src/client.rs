@@ -35,10 +35,24 @@
 //!
 //! **Limits.** A request line is at most [`MAX_HEADER`] bytes and a write
 //! at most [`MAX_BODY`] bytes.
+//!
+//! **Authentication.** With a [`Secret`] ([`ClientServer::start_with`],
+//! [`Client::connect_with`], [`ClusterClient::set_secret`]), a connection
+//! starts with a handshake that proves both ends know it, and everything
+//! after is checked (see [`raft::auth`]). A client that has none, or another,
+//! never gets a reply, so it cannot write, read or change the membership: with
+//! another secret it is told so, and with none it just times out (or cannot
+//! read what it gets). This is the same secret as the nodes use
+//! among themselves, and whoever has it is trusted with everything: there are
+//! no roles. There is **no encryption**: the requests and rows cross the
+//! network as they are. The handshake of a connection that is not
+//! authenticated waits as long as the server's `timeout`, and costs a thread
+//! until then. Both sides must agree: a server without a secret does not
+//! speak the handshake.
 
 use crate::{Error, ReplicatedDb};
 use parking_lot::{Condvar, Mutex};
-use raft::NodeId;
+use raft::{AuthStream, NodeId, Secret};
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -54,6 +68,9 @@ pub const MAX_HEADER: u64 = 64 * 1024;
 
 /// The most line protocol one `WRITE` carries, in bytes.
 pub const MAX_BODY: u64 = 64 * 1024 * 1024;
+
+/// What the handshake of a client connection is for: see [`raft::auth`].
+const PURPOSE: &str = "client";
 
 /// The longest line a client accepts in a reply (a row).
 const MAX_REPLY_LINE: u64 = 1024 * 1024;
@@ -586,6 +603,17 @@ impl ClientServer {
     /// [`ClientServer::local_addr`]). A write or a consistent read waits up
     /// to `timeout` for the node.
     pub fn start(db: Arc<ReplicatedDb>, listen: SocketAddr, timeout: Duration) -> io::Result<ClientServer> {
+        ClientServer::start_with(db, listen, timeout, None)
+    }
+
+    /// [`ClientServer::start`], and with a `secret` a client has to prove it
+    /// knows it first, within `timeout`: see the module docs.
+    pub fn start_with(
+        db: Arc<ReplicatedDb>,
+        listen: SocketAddr,
+        timeout: Duration,
+        secret: Option<Secret>,
+    ) -> io::Result<ClientServer> {
         let listener = TcpListener::bind(listen)?;
         // Neither can fail on a socket that has just been bound.
         listener
@@ -602,7 +630,7 @@ impl ClientServer {
         let handlers = Arc::new(Mutex::new(Vec::new()));
         let acceptor = {
             let (shared, handlers) = (shared.clone(), handlers.clone());
-            thread::spawn(move || accept_loop(&listener, &db, &shared, &handlers, timeout))
+            thread::spawn(move || accept_loop(&listener, &db, &shared, &handlers, timeout, secret))
         };
         Ok(ClientServer {
             addr,
@@ -654,6 +682,7 @@ fn accept_loop(
     shared: &Arc<Shared>,
     handlers: &Mutex<Vec<JoinHandle<()>>>,
     timeout: Duration,
+    secret: Option<Secret>,
 ) {
     while !shared.stop.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -664,9 +693,9 @@ fn accept_loop(
                 let id = shared.next_conn.fetch_add(1, Ordering::Relaxed);
                 // A connection that cannot be copied just cannot be closed from here.
                 shared.conns.lock().extend(stream.try_clone().map(|copy| (id, copy)));
-                let (db, shared) = (db.clone(), shared.clone());
+                let (db, shared, secret) = (db.clone(), shared.clone(), secret.clone());
                 let handler = thread::spawn(move || {
-                    serve_connection(&stream, &db, &shared, timeout);
+                    serve_connection(stream, &db, &shared, timeout, secret.as_ref());
                     shared.conns.lock().remove(&id);
                 });
                 let mut handlers = handlers.lock();
@@ -680,12 +709,20 @@ fn accept_loop(
 }
 
 /// Answers the requests of one connection until it ends, a request is
-/// malformed, or one asks the node to stop.
-fn serve_connection(stream: &TcpStream, db: &ReplicatedDb, shared: &Shared, timeout: Duration) {
-    let mut reader = BufReader::new(stream);
-    let mut writer = stream;
+/// malformed, or one asks the node to stop. With a secret, a client that
+/// cannot prove it knows it is dropped without a reply.
+fn serve_connection(stream: TcpStream, db: &ReplicatedDb, shared: &Shared, timeout: Duration, secret: Option<&Secret>) {
+    let stream = match secret {
+        None => AuthStream::plain(stream),
+        // (a timeout of zero would mean no timeout at all)
+        Some(secret) => match AuthStream::accept(stream, secret, PURPOSE, timeout.max(Duration::from_millis(1))) {
+            Ok(stream) => stream,
+            Err(_) => return,
+        },
+    };
+    let mut conn = BufReader::new(stream);
     loop {
-        let req = match read_request(&mut reader) {
+        let req = match read_request(&mut conn) {
             Ok(Some(req)) => req,
             Ok(None) => return,
             Err(e) => {
@@ -693,11 +730,11 @@ fn serve_connection(stream: &TcpStream, db: &ReplicatedDb, shared: &Shared, time
                     code: Code::Bad,
                     text: e.to_string(),
                 };
-                let _ = writer.write_all(&bad.encode());
+                let _ = conn.get_mut().write_all(&bad.encode());
                 return;
             }
         };
-        let sent = writer.write_all(&execute(db, &req, timeout).encode());
+        let sent = conn.get_mut().write_all(&execute(db, &req, timeout).encode());
         // The reply is on its way before the owner is told to stop.
         let stop = req == Request::Shutdown;
         if stop {
@@ -711,19 +748,30 @@ fn serve_connection(stream: &TcpStream, db: &ReplicatedDb, shared: &Shared, time
 
 /// A connection to one node.
 pub struct Client {
-    stream: BufReader<TcpStream>,
+    stream: BufReader<AuthStream>,
 }
 
 impl Client {
     /// Connects, waiting up to `timeout`; the same time limits every wait for
     /// a reply later.
     pub fn connect(addr: SocketAddr, timeout: Duration) -> io::Result<Client> {
+        Client::connect_with(addr, timeout, None)
+    }
+
+    /// [`Client::connect`], and with a `secret` the handshake that proves
+    /// both ends know it, which also has to finish within `timeout`. The
+    /// server must have the same secret.
+    pub fn connect_with(addr: SocketAddr, timeout: Duration, secret: Option<&Secret>) -> io::Result<Client> {
         let stream = TcpStream::connect_timeout(&addr, timeout)?;
         // These fail only on a socket that is already gone, which the first
         // call finds out about.
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
+        let stream = match secret {
+            None => AuthStream::plain(stream),
+            Some(secret) => AuthStream::connect(stream, secret, PURPOSE)?,
+        };
         Ok(Client {
             stream: BufReader::new(stream),
         })
@@ -745,6 +793,7 @@ pub struct ClusterClient {
     patience: Duration,
     /// Where the next call starts: the node that answered the last one.
     first: usize,
+    secret: Option<Secret>,
 }
 
 impl ClusterClient {
@@ -757,7 +806,14 @@ impl ClusterClient {
             timeout,
             patience,
             first: 0,
+            secret: None,
         }
+    }
+
+    /// Authenticates to the nodes from now on, which must have the same
+    /// secret; `None` goes back to none.
+    pub fn set_secret(&mut self, secret: Option<Secret>) {
+        self.secret = secret;
     }
 
     /// Sends `req` to the nodes in turn until one that is the leader (or,
@@ -771,7 +827,7 @@ impl ClusterClient {
         loop {
             for k in 0..self.nodes.len() {
                 let i = (self.first + k) % self.nodes.len();
-                let mut client = match Client::connect(self.nodes[i], self.timeout) {
+                let mut client = match Client::connect_with(self.nodes[i], self.timeout, self.secret.as_ref()) {
                     Ok(client) => client,
                     Err(e) => {
                         last = Err(e);
@@ -798,7 +854,9 @@ impl ClusterClient {
 
     /// Sends `req` to every node, whatever it answers.
     pub fn each(&self, req: &Request) -> Vec<(SocketAddr, io::Result<Reply>)> {
-        let ask = |addr| Client::connect(addr, self.timeout).and_then(|mut client| client.call(req));
+        let ask = |addr| {
+            Client::connect_with(addr, self.timeout, self.secret.as_ref()).and_then(|mut client| client.call(req))
+        };
         self.nodes.iter().map(|&addr| (addr, ask(addr))).collect()
     }
 }
@@ -893,14 +951,32 @@ mod tests {
     }
 
     fn node(db: ReplicatedDb, dir: PathBuf) -> Node {
+        node_with(db, dir, None)
+    }
+
+    fn node_with(db: ReplicatedDb, dir: PathBuf, secret: Option<&Secret>) -> Node {
         let db = Arc::new(db);
-        let gate = ClientServer::start(db.clone(), any_local(), LONG).unwrap();
+        let gate = ClientServer::start_with(db.clone(), any_local(), LONG, secret.cloned()).unwrap();
         Node { db, gate, dir }
+    }
+
+    fn secret() -> Secret {
+        Secret::new(b"client-test-secret-0123456789").unwrap()
+    }
+
+    fn other_secret() -> Secret {
+        Secret::new(b"another-client-secret-012345").unwrap()
     }
 
     /// Nodes `1..=n`, all voters, that know each other.
     fn start(name: &str, n: u64) -> Vec<Node> {
-        let opts = fast();
+        start_secure(name, n, None)
+    }
+
+    /// [`start`], with the nodes and their clients sharing a secret.
+    fn start_secure(name: &str, n: u64, secret: Option<&Secret>) -> Vec<Node> {
+        let mut opts = fast();
+        opts.raft.net.secret = secret.cloned();
         let ids: Vec<NodeId> = (1..=n).collect();
         // Bound now and kept, so that no other test can take the ports.
         let transports: Vec<Transport> = (ids.iter())
@@ -915,7 +991,7 @@ mod tests {
             .map(|(&id, t)| {
                 let dir = tmpdir(&format!("{name}-{id}"));
                 let db = ReplicatedDb::open_on(&dir, id, t, &ids, &addrs, opts.clone()).unwrap();
-                node(db, dir)
+                node_with(db, dir, secret)
             })
             .collect()
     }
@@ -1436,6 +1512,72 @@ mod tests {
         let pings = c.each(&Request::Ping);
         assert_eq!(pings.iter().filter(|(_, reply)| reply.is_err()).count(), 1);
         assert_eq!(pings.iter().filter(|(_, reply)| reply.is_ok()).count(), 2);
+    }
+
+    #[test]
+    fn an_authenticated_cluster_serves_only_those_who_know_the_secret() {
+        let s = secret();
+        let nodes = start_secure("secure", 3, Some(&s));
+        let addrs: Vec<SocketAddr> = nodes.iter().map(Node::addr).collect();
+        let mut c = ClusterClient::new(addrs.clone(), LONG, LONG);
+        c.set_secret(Some(s.clone()));
+        // The nodes elect a leader, and replicate to each other, with the
+        // secret on the Raft port too.
+        assert_eq!(
+            c.call(&Request::Write("m v=5 5\n".to_string())).unwrap(),
+            Reply::Ok("1".to_string())
+        );
+        let local = Request::Query {
+            consistent: false,
+            query: Query::new("m", "v"),
+            top: None,
+        };
+        let copy = Reply::Rows(vec![row("m", 5, "5")]);
+        wait_until("every node to have the write", || {
+            let copies = c.each(&local);
+            (copies.iter().all(|(_, reply)| reply.as_ref().ok() == Some(&copy))).then_some(())
+        });
+
+        // A client has to know it, and gets told when it does not.
+        let short = Duration::from_millis(300);
+        let wrong = Client::connect_with(addrs[0], short, Some(&other_secret()))
+            .err()
+            .unwrap();
+        assert!(wrong.to_string().contains("same secret"), "{wrong}");
+        let mut none = Client::connect(addrs[0], short).unwrap();
+        assert!(none.call(&Request::Ping).is_err());
+        let mut none = ClusterClient::new(addrs.clone(), short, short);
+        assert!(none.call(&Request::Ping).is_err());
+        assert!(none.each(&Request::Ping).iter().all(|(_, reply)| reply.is_err()));
+        let mut wrong = ClusterClient::new(addrs.clone(), short, short);
+        wrong.set_secret(Some(other_secret()));
+        let refused = wrong.call(&Request::Write("m v=6 6\n".to_string())).unwrap_err();
+        assert!(refused.to_string().contains("same secret"), "{refused}");
+        // Bytes that are no handshake end the connection.
+        let mut raw = TcpStream::connect(addrs[0]).unwrap();
+        raw.set_read_timeout(Some(LONG)).unwrap();
+        raw.read_exact(&mut [0u8; 32]).unwrap();
+        raw.write_all(&[0xAA; 100]).unwrap();
+        assert_eq!(raw.read(&mut [0u8; 1]).unwrap_or(0), 0);
+        // Nothing of that got in, and the cluster is as it was.
+        assert_eq!(c.call(&local).unwrap(), copy);
+        assert_eq!(
+            c.each(&Request::Ping).iter().filter(|(_, reply)| reply.is_ok()).count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_client_with_a_secret_gives_up_on_a_server_that_has_none() {
+        let nodes = start("plain-server", 1);
+        let short = Duration::from_millis(300);
+        let e = Client::connect_with(nodes[0].addr(), short, Some(&secret()))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("same secret"), "{e}");
+        // And the server is as it was.
+        let mut client = Client::connect(nodes[0].addr(), LONG).unwrap();
+        assert_eq!(client.call(&Request::Ping).unwrap(), Reply::Ok("PONG".to_string()));
     }
 
     #[test]

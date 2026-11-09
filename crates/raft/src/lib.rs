@@ -9,6 +9,7 @@
 //! The node's time is purely logical (Lamport clocks) — never the wall clock.
 //! Only [`Server`] ties a tick to real time.
 
+pub mod auth;
 pub mod clock;
 pub mod error;
 pub mod log;
@@ -22,6 +23,7 @@ pub mod storage;
 pub mod swim;
 pub mod wire;
 
+pub use auth::{AuthStream, Secret};
 pub use clock::LamportClock;
 pub use error::{Error, LogError, Result};
 pub use log::{EntryKind, Log, LogEntry};

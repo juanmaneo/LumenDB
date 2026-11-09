@@ -10,7 +10,7 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 | crate | what it is | inspired by |
 |---|---|---|
 | [`flashkv`](crates/flashkv) | crash-safe ordered key-value store (LSM) | LevelDB, LMDB, FoundationDB, eguan/ibs |
-| [`raft`](crates/raft) | Raft consensus, SWIM membership, Lamport clocks | Raft paper, CockroachDB, Serf/dkron |
+| [`raft`](crates/raft) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron |
 | [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
 | [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli |
 | [`cluster`](crates/cluster) | tsvdb replicated by raft: writes through the leader, every node holds a copy | TigerBeetle, CockroachDB |
@@ -179,8 +179,44 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   messages (the simulator proves it): `send` never blocks, one writer thread
   per peer reconnects after failures and drops what it cannot deliver, and a
   reader drops a connection that sends a bad frame. Every drop is counted.
-  There is no authentication or encryption; run it on a trusted network or
-  behind a tunnel.
+  Without a secret (see the next item), anyone who can reach the port is
+  believed, and nothing is encrypted: use a trusted network or a tunnel.
+- **Authentication with a shared secret** (`raft::auth`, `std` only: SHA-256
+  and HMAC are written in the crate and checked against the FIPS 180-4 and
+  RFC 4231 test vectors). With `NetOptions::secret`, a connection starts
+  with a challenge and response: the side that accepted sends a nonce, the
+  side that connected answers with its own nonce and a proof, and the
+  accepting side answers with a proof. A proof is an HMAC-SHA256 of both
+  nonces under the secret, so each side shows that it knows the secret
+  without sending it, and a recorded handshake is of no use later. What
+  follows travels in records `len | payload | tag`, where the tag is an HMAC
+  under a key of its own for each direction, over the record's number, length
+  and payload. A record that was altered, replayed, reordered, reflected or
+  removed from the middle ends the connection. A purpose (`raft`, `client`)
+  is mixed into every proof and key, so a handshake for one port is of no use
+  on the other. The handshake and the records are not part of the Raft wire
+  format: its frames travel inside them unchanged (`VERSION` stays 2). Every
+  node of a cluster has the same secret, or none.
+
+  What it does **not** give:
+  - **Confidentiality.** Everything is readable by whoever can see the
+    network. TLS would need a dependency, and this project has none for it:
+    use WireGuard, stunnel or another tunnel where that matters.
+  - **Roles.** Everyone who holds the secret is trusted with everything: a
+    node can pose as any other, and a client can write, stop nodes and change
+    the membership.
+  - **Protection against a weak secret.** Someone who recorded a handshake
+    can test guesses against it offline. Use a long random one, readable by
+    its owner only: `head -c 32 /dev/urandom | base64 > secret; chmod 600 secret`.
+    It is at least 16 bytes, and a trailing newline in the file is dropped.
+  - **Rotation or revocation.** Nodes that have different secrets do not
+    hear each other, so a new secret means restarting every node and client.
+  - **Protection against denial of service.** A connection that has not
+    proved anything costs a thread until the handshake times out
+    (`handshake_timeout`; `--timeout-ms` on the client port).
+  - **An audit.** The primitives are standard and checked against test
+    vectors, but they were written here, not reviewed by a cryptographer. On
+    a hostile network, put a tunnel in front of it as well.
 - **Server** (`raft::server`). `Server` runs a node on a clock: it steps the
   node with what the transport receives, ticks it, sends its messages, hands
   committed entries, snapshots and confirmed reads to the application's
@@ -249,7 +285,7 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   asked for), a leader that steps down on losing its
   quorum (it keeps leading until it hears a higher term, but cannot commit or
   confirm reads), pipelined replication (one append, and one snapshot chunk,
-  is in flight per follower), and authentication or encryption on the wire.
+  is in flight per follower), and encryption on the wire.
 - **SWIM** membership: round-robin probes, indirect `PingReq` probes,
   suspicion, death, incarnation-based refutation, and piggybacked gossip.
 - **Lamport clocks** stamp every message. Ordering never depends on wall
@@ -360,7 +396,10 @@ linearizable read on the leader (`query` reads the local copy, which may lag).
   or a lost connection may or may not have been applied, and the client does
   not guess. The test suite starts real `bench serve` processes, writes
   through them, hands leadership to another node, kills the leader with no
-  warning, restarts it, adds a fourth node and stops them all.
+  warning, restarts it, adds a fourth node and stops them all, and with a
+  secret, that clients without it, or with another, get nothing.
+  `serve --secret-file FILE` and `client --secret-file FILE` turn on the
+  authentication above, for the Raft port and the client port alike.
 
 ## Usage
 
@@ -413,6 +452,23 @@ c add-voter 4                                          # refused until it has ca
 c transfer 4                                           # hand leadership to node 4; it returns once 4 leads
 c shutdown                                             # stop the nodes in $NODES
 ```
+
+To authenticate the nodes and the clients, give every `serve` and every
+`client` the same secret file (see *Authentication* above for what that does
+and does not protect against):
+
+```sh
+head -c 32 /dev/urandom | base64 > /tmp/secret && chmod 600 /tmp/secret
+$B serve --id 1 --dir /tmp/n1 --raft 127.0.0.1:7001 --client 127.0.0.1:8001 --voters 1,2,3 $P \
+         --secret-file /tmp/secret &
+# ... likewise for the other nodes
+$B client --nodes "$NODES" --secret-file /tmp/secret ping
+```
+
+A client with another secret is told so ("do both sides use the same
+secret?"). One with none is not: it sends a request and gets no answer, so it
+fails with a timeout or an unreadable reply. Either way the nodes do nothing
+it asks.
 
 Every storage-backed command accepts `--sync 0|1`, `--background 0|1` and
 `--fail-after N`. The last one injects an I/O error at the N-th filesystem
