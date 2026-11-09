@@ -28,6 +28,13 @@
 //! memory and travels in one message, so `snapshot_every` should be large
 //! for a large database; 0 never compacts, and the log grows.
 //!
+//! **Addresses are remembered.** Where the other nodes listen is kept in the
+//! `peers` file of the node's directory, so that a restarted node finds the
+//! cluster again without being told: [`ReplicatedDb::open`] starts from the
+//! saved addresses, the `peers` it is given win over them, and
+//! [`ReplicatedDb::set_peer`] saves every change. A missing or damaged file
+//! means no saved addresses (the node can be told again).
+//!
 //! **Reads.** [`ReplicatedDb::query`] reads this node's copy, which lags the
 //! leader by at most the entries not yet applied. [`ReplicatedDb::query_consistent`]
 //! is linearizable and served by the leader.
@@ -42,8 +49,8 @@ use raft::{
 };
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,15 +165,56 @@ struct Shared {
     note: PathBuf,
 }
 
+/// The payload of a file that holds one CRC-framed record; a missing or
+/// damaged file has none.
+fn read_framed(path: &Path) -> Option<Vec<u8>> {
+    let bytes = fs::read(path).ok()?;
+    let (records, end) = flashkv::log::parse(&bytes);
+    match records.as_slice() {
+        [r] if end == bytes.len() => Some(r.to_vec()),
+        _ => None,
+    }
+}
+
+/// Replaces the file by one that holds `payload` as a CRC-framed record: it is
+/// written and synced aside, and then renamed over the old one.
+fn write_framed(path: &Path, payload: &[u8]) -> io::Result<()> {
+    let mut framed = Vec::new();
+    flashkv::log::frame(&mut framed, payload);
+    let tmp = path.with_extension("tmp");
+    File::create(&tmp).and_then(|mut f| f.write_all(&framed).and_then(|()| f.sync_all()))?;
+    fs::rename(&tmp, path)
+}
+
 /// The note: the index, in one CRC-framed record. A missing or damaged note
 /// means 0: replay from the start of the log.
 fn read_note(path: &Path) -> Index {
-    let Ok(bytes) = fs::read(path) else { return 0 };
-    let (records, end) = flashkv::log::parse(&bytes);
-    match records.as_slice() {
-        [r] if (r.len() == 8) & (end == bytes.len()) => u64::from_le_bytes(r[..8].try_into().expect("8 bytes")),
-        _ => 0,
-    }
+    read_framed(path)
+        .and_then(|r| <[u8; 8]>::try_from(r).ok())
+        .map_or(0, u64::from_le_bytes)
+}
+
+type Peers = BTreeMap<NodeId, SocketAddr>;
+
+/// The saved peers: one `id address` line each, in one framed record. A file
+/// that is missing, damaged or not what it should be has none.
+fn read_peers(path: &Path) -> Peers {
+    let parse = |text: String| -> Option<Peers> {
+        let line = |line: &str| {
+            let (id, addr) = line.split_once(' ')?;
+            Some((id.parse().ok()?, addr.parse().ok()?))
+        };
+        text.lines().map(line).collect()
+    };
+    read_framed(path)
+        .and_then(|r| String::from_utf8(r).ok())
+        .and_then(parse)
+        .unwrap_or_default()
+}
+
+fn write_peers(path: &Path, peers: &Peers) -> io::Result<()> {
+    let text: String = peers.iter().map(|(id, addr)| format!("{id} {addr}\n")).collect();
+    write_framed(path, text.as_bytes())
 }
 
 impl Shared {
@@ -177,11 +225,7 @@ impl Shared {
     /// Writes the note for the entry applied last.
     fn write_note(&self) -> io::Result<()> {
         let mut progress = self.progress.lock();
-        let mut framed = Vec::new();
-        flashkv::log::frame(&mut framed, &progress.0.to_le_bytes());
-        let tmp = self.note.with_extension("tmp");
-        fs::write(&tmp, framed)?;
-        fs::rename(&tmp, &self.note)?;
+        write_framed(&self.note, &progress.0.to_le_bytes())?;
         progress.1 = progress.0;
         Ok(())
     }
@@ -269,6 +313,9 @@ fn now_ns() -> i64 {
 pub struct ReplicatedDb {
     server: Server,
     shared: Arc<Shared>,
+    /// Where the peers are saved, and the lock that keeps two saves apart.
+    peers_file: PathBuf,
+    peers_lock: Mutex<()>,
 }
 
 impl ReplicatedDb {
@@ -277,7 +324,8 @@ impl ReplicatedDb {
     /// applied. It listens on `listen`; `peers` are the addresses of the
     /// other nodes, including nodes that are not in the cluster yet (a
     /// leader can only add a node whose address it knows, and a node that is
-    /// added must know where the leader is). `voters` are the voters of a new
+    /// added must know where the leader is). They are added to the addresses
+    /// saved by an earlier run, and win over them. `voters` are the voters of a new
     /// cluster, the same on every node that starts it; an empty list makes a
     /// node that waits to be added with `server().node().add_learner(id)` and
     /// `add_voter(id)` on the leader. A node that has a log goes by that.
@@ -321,8 +369,15 @@ impl ReplicatedDb {
             ..base
         };
         let node = Node::new(cfg, storage)?;
-        for &(peer, addr) in peers {
+        let peers_file = dir.join("peers");
+        let saved = read_peers(&peers_file);
+        let mut known = saved.clone();
+        known.extend(peers.iter().copied());
+        for (&peer, &addr) in &known {
             transport.set_peer(peer, addr);
+        }
+        if known != saved {
+            write_peers(&peers_file, &known)?;
         }
         let applied = read_note(&note);
         let shared = Arc::new(Shared {
@@ -334,7 +389,12 @@ impl ReplicatedDb {
         });
         let app = App { shared: shared.clone() };
         let server = Server::start(node, transport, app, opts.raft);
-        Ok(ReplicatedDb { server, shared })
+        Ok(ReplicatedDb {
+            server,
+            shared,
+            peers_file,
+            peers_lock: Mutex::new(()),
+        })
     }
 
     pub fn id(&self) -> NodeId {
@@ -347,6 +407,14 @@ impl ReplicatedDb {
 
     pub fn is_leader(&self) -> bool {
         self.server.node().role() == raft::NodeState::Leader
+    }
+
+    /// Says where node `id` listens, and saves it, so that it is still known
+    /// after a restart. The address is in use even if saving it fails.
+    pub fn set_peer(&self, id: NodeId, addr: SocketAddr) -> Result<()> {
+        let _one_at_a_time = self.peers_lock.lock();
+        self.server.set_peer(id, addr);
+        Ok(write_peers(&self.peers_file, &self.server.transport().peers())?)
     }
 
     /// The Raft server: role, leader, voters, membership changes.
@@ -997,6 +1065,74 @@ mod tests {
         two.extend(&good);
         write(&two);
         assert_eq!(read_note(&note), 0, "two records");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn peers_are_read_defensively() {
+        let dir = tmpdir("peers-read");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("peers");
+        assert!(read_peers(&file).is_empty(), "no file");
+        let framed = |payload: &[u8]| {
+            let mut out = Vec::new();
+            flashkv::log::frame(&mut out, payload);
+            fs::write(&file, out).unwrap();
+            read_peers(&file)
+        };
+        let want: Peers = [(2, addr("127.0.0.1:7002")), (3, addr("[::1]:7003"))].into();
+        assert_eq!(framed(b"2 127.0.0.1:7002\n3 [::1]:7003\n"), want);
+        assert!(framed(b"").is_empty(), "an empty list");
+        // Whatever is not an `id address` line per peer means no peers.
+        assert!(framed(b"2 127.0.0.1:7002\n3\n").is_empty(), "no address");
+        assert!(framed(b"x 127.0.0.1:7002\n").is_empty(), "bad id");
+        assert!(framed(b"2 nowhere\n").is_empty(), "bad address");
+        assert!(framed(&[0xff, 0xfe]).is_empty(), "not text");
+        // ... and so does a file that is not one intact record.
+        fs::write(&file, b"2 127.0.0.1:7002\n").unwrap();
+        assert!(read_peers(&file).is_empty(), "no framing");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn peers_survive_a_restart() {
+        let dir = tmpdir("peers");
+        let (two, three, four) = (addr("127.0.0.1:7002"), addr("127.0.0.1:7003"), addr("127.0.0.1:7004"));
+        let peers = |node: &ReplicatedDb| node.server().transport().peers();
+        let open = |known: &[(NodeId, SocketAddr)]| ReplicatedDb::open(&dir, 1, any_local(), &[1], known, fast(0));
+        let node = open(&[(2, two)]).unwrap();
+        assert_eq!(peers(&node), [(2, two)].into());
+        // Told afterwards: saved as well.
+        node.set_peer(3, three).unwrap();
+        assert_eq!(peers(&node), [(2, two), (3, three)].into());
+        drop(node);
+        // A restart without being told finds both again.
+        let node = open(&[]).unwrap();
+        assert_eq!(peers(&node), [(2, two), (3, three)].into());
+        assert_eq!(read_peers(&dir.join("peers")), peers(&node));
+        drop(node);
+        // What the node is told wins over what it saved, and is saved too.
+        let node = open(&[(3, four)]).unwrap();
+        assert_eq!(peers(&node), [(2, two), (3, four)].into());
+        drop(node);
+        assert_eq!(read_peers(&dir.join("peers")), [(2, two), (3, four)].into());
+        // A damaged file is the same as none.
+        fs::write(dir.join("peers"), b"junk").unwrap();
+        let node = open(&[(5, two)]).unwrap();
+        assert_eq!(peers(&node), [(5, two)].into());
+        // Saving can fail: the address is in use anyway, and the error says so.
+        fs::create_dir_all(dir.join("peers.tmp")).unwrap();
+        let err = node.set_peer(6, three).unwrap_err();
+        assert!(err.to_string().starts_with("io: "), "{err}");
+        assert_eq!(peers(&node), [(5, two), (6, three)].into());
+        drop(node);
+        // ... and so can saving at the start, which stops the node opening.
+        let err = open(&[(7, four)]).err().unwrap().to_string();
+        assert!(err.starts_with("io: "), "{err}");
         let _ = fs::remove_dir_all(dir);
     }
 

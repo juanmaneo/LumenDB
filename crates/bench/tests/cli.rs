@@ -179,15 +179,9 @@ fn processes_form_a_cluster_that_replicates_fails_over_and_grows() {
     assert_eq!(status.matches("unreachable").count(), 1, "{status}");
     assert_eq!(status.matches(" role=leader ").count(), 1, "{status}");
 
-    // It comes back from its files, on another port; the others are told.
-    let peers: Vec<String> = (nodes.iter().filter(|n| n.id != leader_id))
-        .map(|n| format!("{}={}", n.id, n.raft))
-        .collect();
-    let mut extra = vec!["--voters", "1,2,3"];
-    for p in &peers {
-        extra.extend(["--peer", p.as_str()]);
-    }
-    nodes[at] = spawn(&dir, leader_id, &extra);
+    // It comes back from its files, on another port. It is not told where
+    // the others are (it saved that); the others are told where it is.
+    nodes[at] = spawn(&dir, leader_id, &["--voters", "1,2,3"]);
     let all = addrs(&nodes);
     client_ok(&all, &["peer", &leader_id.to_string(), &nodes[at].raft]);
     eventually("the restarted node to catch up", || {

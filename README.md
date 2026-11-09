@@ -310,8 +310,9 @@ linearizable read on the leader (`query` reads the local copy, which may lag).
 - **Adding a server**: start it with no voters, `add_learner` it on the leader,
   and `add_voter` it once it has caught up (from the snapshot). Addresses are
   static: every node is told where every other node lives, the ones that are
-  not in the cluster yet included. A node keeps no addresses on disk, so a
-  restarted node is told again, and so are the others if it moved.
+  not in the cluster yet included. A node saves the addresses it is told (the
+  `peers` file of its directory), so a restarted node finds the others again;
+  only the others have to be told if it moved.
 - **Processes and clients** (`cluster::client`, `bench serve`, `bench client`).
   `serve` runs one node until a client sends `SHUTDOWN`: Raft on one port and
   a client protocol on another.

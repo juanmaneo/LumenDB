@@ -70,9 +70,10 @@ commands:
       which). --voters starts a cluster and is the same on every node; a node
       without it waits to be added (client add-learner, then add-voter), and a
       node that has a log goes by that. --peer says where another node's Raft
-      listens (more can be told later: client peer). Nodes keep no addresses
-      on disk, so they must be told again after a restart. Writes and
-      consistent queries wait up to --timeout-ms for the node (default 5000)
+      listens (more can be told later: client peer). The addresses a node is
+      told are saved in DIR/peers, so after a restart it finds the others
+      again; only a node that moved has to be told. Writes and consistent
+      queries wait up to --timeout-ms for the node (default 5000)
   client --nodes ADDR,ADDR,... <command> [--timeout-ms N] [--patience-ms N]
       talk to a cluster through the client addresses of its nodes. Commands:
         status                 every node: role, term, leader, voters, log positions

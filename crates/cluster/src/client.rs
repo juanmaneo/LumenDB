@@ -12,7 +12,7 @@
 //! | `STATUS` | `OK id=1 role=leader term=3 leader=1 voters=1,2,3 learners= commit=9 applied=9 snapshot=0 raft=ADDR` |
 //! | `WRITE <bytes>`, a newline, then that many bytes of line protocol | `OK <points>` |
 //! | `QUERY <consistent\|local> <measurement> <field> [start=NS] [end=NS] [agg=A] [every=NS] [top=N] [where=<tag>=<value>]...` | `ROWS <n>`, then n lines `series TAB ts TAB value` |
-//! | `PEER <id> <addr>` | `OK ok`: where to send messages to node `id` |
+//! | `PEER <id> <addr>` | `OK ok`: where to send messages to node `id` (saved: it is still known after a restart) |
 //! | `ADD-LEARNER <id>`, `REMOVE-LEARNER <id>` | `OK added`, `OK removed` |
 //! | `ADD-VOTER <id>`, `REMOVE-VOTER <id>` | `OK <index of the configuration entry>` |
 //! | `SHUTDOWN` | `OK stopping`, and the node stops |
@@ -536,10 +536,7 @@ pub fn execute(db: &ReplicatedDb, req: &Request, timeout: Duration) -> Reply {
         Request::Shutdown => Ok(Reply::Ok("stopping".to_string())),
         Request::Write(text) => db.write_lines(text, timeout).map(|n| Reply::Ok(n.to_string())),
         Request::Query { consistent, query, top } => run_query(db, *consistent, query, *top, timeout),
-        Request::Peer(id, addr) => {
-            db.server().set_peer(*id, *addr);
-            Ok(Reply::Ok("ok".to_string()))
-        }
+        Request::Peer(id, addr) => db.set_peer(*id, *addr).map(|()| Reply::Ok("ok".to_string())),
         Request::Member(change, id) => change_membership(db, *change, *id).map(Reply::Ok),
     };
     done.unwrap_or_else(|e| error_reply(&e))
