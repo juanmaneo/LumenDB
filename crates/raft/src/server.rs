@@ -22,7 +22,7 @@
 use crate::error::{Error, Result};
 use crate::log::{EntryKind, LogEntry};
 use crate::net::{NetOptions, Transport};
-use crate::node::Node;
+use crate::node::{Node, NodeState};
 use crate::storage::Snapshot;
 use crate::{Index, NodeId};
 use parking_lot::{Condvar, Mutex};
@@ -193,6 +193,35 @@ impl Server {
             }
             if self.inner.changed.wait_until(&mut st, deadline).timed_out() {
                 st.waiting.remove(&id);
+                return Err(Error::Timeout);
+            }
+        }
+    }
+
+    /// Hands leadership to the voter `target` ([`Node::transfer_leadership`])
+    /// and waits until this node hears from it as the leader. Leader only. It
+    /// fails with [`Error::Transfer`] if the request is refused or the target
+    /// did not take over within an election timeout (this node leads again),
+    /// and with [`Error::Timeout`] if `timeout` passes first.
+    pub fn transfer_leadership(&self, target: NodeId, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let node = &self.inner.node;
+        let mut st = self.inner.state.lock();
+        if st.stopped {
+            return Err(Error::Stopped);
+        }
+        node.transfer_leadership(target)?;
+        loop {
+            if node.leader() == Some(target) {
+                return Ok(());
+            }
+            if (node.role() == NodeState::Leader) & node.transferring().is_none() {
+                return Err(Error::Transfer("the target did not take over in time"));
+            }
+            if st.stopped {
+                return Err(Error::Stopped);
+            }
+            if self.inner.changed.wait_until(&mut st, deadline).timed_out() {
                 return Err(Error::Timeout);
             }
         }
@@ -536,6 +565,75 @@ mod tests {
             l.shutdown();
             assert_eq!(waiter.join().unwrap(), Err(Error::Stopped));
         });
+    }
+
+    #[test]
+    fn leadership_is_handed_to_the_server_asked() {
+        let servers = cluster(3, 0, 0);
+        let old = find_leader(&servers, &[]);
+        let first = old.propose(number(1)).unwrap();
+        old.wait_applied(first, LONG).unwrap();
+        let old_id = old.node().id();
+        let target = servers.iter().find(|s| s.node().id() != old_id).unwrap();
+        let target_id = target.node().id();
+        // Refused: the leader itself, a server that is not one, a follower.
+        assert_eq!(
+            old.transfer_leadership(old_id, LONG),
+            Err(Error::Transfer("the target is this node"))
+        );
+        assert_eq!(
+            old.transfer_leadership(9, LONG),
+            Err(Error::Transfer("the target is not a voter"))
+        );
+        assert_eq!(
+            target.transfer_leadership(old_id, LONG),
+            Err(Error::NotLeader(Some(old_id)))
+        );
+        old.transfer_leadership(target_id, LONG).unwrap();
+        // Done means the old leader has heard from the new one.
+        assert_eq!(old.node().leader(), Some(target_id));
+        assert_eq!(old.node().role(), NodeState::Follower);
+        assert_eq!(target.node().role(), NodeState::Leader);
+        let second = target.propose(number(10)).unwrap();
+        for s in &servers {
+            s.wait_applied(second, LONG).unwrap();
+            assert_eq!(s.with_app(|c| c.sum), 11);
+        }
+        assert_eq!(old.propose(number(1)), Err(Error::NotLeader(Some(target_id))));
+    }
+
+    #[test]
+    fn a_transfer_that_does_not_complete_is_reported() {
+        let servers = cluster(3, 0, 0);
+        let leader = find_leader(&servers, &[]);
+        let index = leader.propose(number(1)).unwrap();
+        for s in &servers {
+            s.wait_applied(index, LONG).unwrap();
+        }
+        let leader_id = leader.node().id();
+        let target = servers.iter().find(|s| s.node().id() != leader_id).unwrap();
+        // The target is gone: it takes over from nobody. Within an election
+        // timeout the leader gives up, and says so.
+        target.shutdown();
+        let target_id = target.node().id();
+        assert_eq!(
+            leader.transfer_leadership(target_id, LONG),
+            Err(Error::Transfer("the target did not take over in time"))
+        );
+        assert_eq!(leader.node().transferring(), None);
+        // ... or the caller gives up first.
+        assert_eq!(
+            leader.transfer_leadership(target_id, Duration::from_millis(20)),
+            Err(Error::Timeout)
+        );
+        // The server stops while it waits, or has stopped.
+        thread::scope(|scope| {
+            let waiter = scope.spawn(|| leader.transfer_leadership(target_id, LONG));
+            wait_until("the transfer to start", || leader.node().transferring());
+            leader.shutdown();
+            assert_eq!(waiter.join().unwrap(), Err(Error::Stopped));
+        });
+        assert_eq!(leader.transfer_leadership(target_id, LONG), Err(Error::Stopped));
     }
 
     #[test]

@@ -48,6 +48,7 @@ fn type_code(t: MsgType) -> u8 {
         MsgType::PreVoteReply => 5,
         MsgType::InstallSnapshot => 6,
         MsgType::InstallSnapshotReply => 7,
+        MsgType::TimeoutNow => 8,
     }
 }
 
@@ -61,6 +62,7 @@ fn type_of(code: u8) -> Option<MsgType> {
         5 => MsgType::PreVoteReply,
         6 => MsgType::InstallSnapshot,
         7 => MsgType::InstallSnapshotReply,
+        8 => MsgType::TimeoutNow,
         _ => return None,
     })
 }
@@ -266,6 +268,7 @@ mod tests {
             empty_voters,
             chunk,
             progress,
+            Message::timeout_now(1, 2, 6),
         ]
     }
 
@@ -316,7 +319,7 @@ mod tests {
         };
         assert_eq!(with(0, VERSION + 1), Err(Error::BadMessage("unknown version")));
         assert_eq!(with(0, 1), Err(Error::BadMessage("unknown version")), "the old format");
-        assert_eq!(with(1, 8), Err(Error::BadMessage("unknown message type")));
+        assert_eq!(with(1, 9), Err(Error::BadMessage("unknown message type")));
         assert_eq!(with(2, 4), Err(Error::BadMessage("unknown flags")));
         // The first entry's kind byte follows the header, the entry count
         // (1 byte) and the entry's index and term.
@@ -408,9 +411,9 @@ mod tests {
 
     #[test]
     fn type_codes_roundtrip() {
-        for code in 0..8 {
+        for code in 0..9 {
             assert_eq!(type_code(type_of(code).unwrap()), code);
         }
-        assert_eq!(type_of(8), None);
+        assert_eq!(type_of(9), None);
     }
 }

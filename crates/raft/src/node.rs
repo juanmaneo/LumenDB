@@ -75,6 +75,18 @@
 //! entry the configured voters apply ([`Config::voters`]); an empty list makes
 //! a node that waits to be added ([`Config::joiner`]).
 //!
+//! Leadership transfer (Raft thesis section 3.10): [`Node::transfer_leadership`]
+//! hands leadership to a voter, so that a leader can be taken out of service
+//! without the cluster waiting out an election timeout. The leader takes no
+//! writes or membership changes meanwhile, so the log stops growing; it keeps
+//! replicating to the target, and once the target holds the whole log it sends
+//! `TimeoutNow`. The target then campaigns at once, with no pre-vote, and as
+//! its log is as good as the leader's it wins, the old leader stepping down
+//! on seeing the higher term. A transfer that has not made the target leader
+//! within an election timeout is abandoned, and the leader takes writes again.
+//! Only liveness depends on any of it: a `TimeoutNow` is just a reason to
+//! campaign, and campaigning is always safe.
+//!
 //! A new leader appends an empty entry of its term at once (Raft thesis
 //! section 6.4). Entries of earlier terms commit only together with an entry
 //! of the leader's own term, so without it they could stay uncommitted, and
@@ -146,6 +158,14 @@ struct SnapOut {
     offset: usize,
     /// The tick a chunk was last sent on.
     sent: u64,
+}
+
+/// Leader: leadership is being handed to `target`.
+#[derive(Clone, Copy)]
+struct Transfer {
+    target: NodeId,
+    /// The tick it started on.
+    started: u64,
 }
 
 /// Follower: a snapshot that is being received.
@@ -256,6 +276,8 @@ struct Inner {
     snap_out: BTreeMap<NodeId, SnapOut>,
     /// A snapshot being received from the leader.
     incoming: Option<Incoming>,
+    /// Leader only: the transfer of leadership that is under way.
+    transfer: Option<Transfer>,
     /// Leader only: servers that get the log without being voters, so that
     /// they can catch up before they are added.
     learners: BTreeSet<NodeId>,
@@ -335,6 +357,7 @@ impl Node {
                 ticks: 0,
                 snap_out: BTreeMap::new(),
                 incoming: None,
+                transfer: None,
                 learners: BTreeSet::new(),
             }),
             cfg,
@@ -477,12 +500,46 @@ impl Node {
         Ok(())
     }
 
+    /// Hands leadership to the voter `target` (see the module docs). Leader
+    /// only, and the target must be a voter other than this node. It returns
+    /// at once, with the transfer started: [`Node::leader`] is the target
+    /// once it has taken over, and [`Node::transferring`] says whether the
+    /// transfer is still going. Until then this node refuses `propose` and
+    /// membership changes with [`Error::NotReady`]. A new request replaces
+    /// the one under way.
+    pub fn transfer_leadership(&self, target: NodeId) -> Result<()> {
+        let mut s = self.state.lock();
+        if s.role != NodeState::Leader {
+            return Err(Error::NotLeader(s.leader_id));
+        }
+        if target == self.cfg.id {
+            return Err(Error::Transfer("the target is this node"));
+        }
+        if !self.voters_of(&s).contains(&target) {
+            return Err(Error::Transfer("the target is not a voter"));
+        }
+        s.transfer = Some(Transfer {
+            target,
+            started: s.ticks,
+        });
+        Ok(())
+    }
+
+    /// The server leadership is being handed to, if this node leads and is
+    /// handing it over.
+    pub fn transferring(&self) -> Option<NodeId> {
+        self.state.lock().transfer.map(|t| t.target)
+    }
+
     /// Appends `data` to the leader's log (durably); it commits once a
     /// majority has it. Returns its index.
     pub fn propose(&self, data: Vec<u8>) -> Result<Index> {
         let mut s = self.state.lock();
         if s.role != NodeState::Leader {
             return Err(Error::NotLeader(s.leader_id));
+        }
+        if s.transfer.is_some() {
+            return Err(Error::NotReady);
         }
         let entry = LogEntry::new(s.log.last_index() + 1, s.term, data);
         let batch = std::slice::from_ref(&entry);
@@ -574,6 +631,9 @@ impl Node {
         if s.role != NodeState::Leader {
             return Err(Error::NotLeader(s.leader_id));
         }
+        if s.transfer.is_some() {
+            return Err(Error::NotReady);
+        }
         self.need_current_term_commit(s)?;
         if s.log.config_index() > s.commit_index {
             return Err(Error::BadConfig("the previous change is not committed yet"));
@@ -627,6 +687,7 @@ impl Node {
         s.match_index.clear();
         s.read_acked.clear();
         s.snap_out.clear();
+        s.transfer = None;
     }
 
     /// A leader that has no committed entry of its own term does not know its
@@ -725,6 +786,7 @@ impl Node {
                     messages.push(Self::send(&mut s, m));
                 }
             }
+            self.drive_transfer(&mut s, &mut messages);
             self.maybe_commit(&mut s);
         } else {
             s.election_elapsed += 1;
@@ -793,6 +855,7 @@ impl Node {
             s.role = NodeState::Follower;
             s.learners.clear();
             s.incoming = None;
+            s.transfer = None;
         }
         let replies: Vec<Message> = if msg.term < s.term {
             self.stale_reply(&s, &msg).into_iter().collect()
@@ -816,6 +879,7 @@ impl Node {
                     reply.read_ctx = msg.read_ctx;
                     vec![reply]
                 }
+                MsgType::TimeoutNow => self.on_timeout_now(&mut s, &msg)?,
                 MsgType::PreVote => vec![self.on_pre_vote(&s, &msg)],
                 MsgType::PreVoteReply => self.on_pre_vote_reply(&mut s, &msg)?,
             }
@@ -838,8 +902,36 @@ impl Node {
             MsgType::RequestVoteReply
             | MsgType::AppendEntriesReply
             | MsgType::PreVoteReply
-            | MsgType::InstallSnapshotReply => None,
+            | MsgType::InstallSnapshotReply
+            | MsgType::TimeoutNow => None,
         }
+    }
+
+    /// A transfer is under way: once the target holds the whole log, tell it
+    /// to campaign (again on every tick until it has, which costs nothing: a
+    /// copy that arrives after it started campaigning is of an older term and
+    /// is ignored), and give up when it has taken too long.
+    fn drive_transfer(&self, s: &mut Inner, out: &mut Vec<Message>) {
+        let Some(Transfer { target, started }) = s.transfer else {
+            return;
+        };
+        if s.ticks - started >= self.cfg.election_timeout_min {
+            s.transfer = None;
+        } else if s.match_index.get(&target).copied().unwrap_or(0) >= s.log.last_index() {
+            let m = Message::timeout_now(self.cfg.id, target, s.term);
+            out.push(Self::send(s, m));
+        }
+    }
+
+    /// The leader this node follows asks it to campaign now. Voters that
+    /// hold the whole log of the leader, as this one does, win.
+    fn on_timeout_now(&self, s: &mut Inner, msg: &Message) -> Result<Vec<Message>> {
+        let mut out = Vec::new();
+        let asked = (s.leader_id == Some(msg.from)) & self.is_voter(s) & !s.recovering;
+        if asked {
+            self.campaign(s, &mut out)?;
+        }
+        Ok(out)
     }
 
     /// An election timeout: ask for pre-votes, or campaign right away when
@@ -927,6 +1019,7 @@ impl Node {
         s.match_index.clear();
         s.read_acked.clear();
         s.snap_out.clear();
+        s.transfer = None;
         s.read_round = 0;
         self.sync_targets(s);
         // Heartbeat on the very next tick.
@@ -2417,6 +2510,148 @@ mod tests {
             net.run(20, &[]);
             assert_eq!(net.node(lag).log_snapshot().1, net.node(leader).log_snapshot().1);
         }
+    }
+
+    #[test]
+    fn leadership_moves_to_the_target_and_nobody_else_is_disturbed() {
+        // Pre-vote is on: a plain election would be refused while a leader is
+        // heard from, so the target's campaign is not one of those.
+        let mut net = Net::new(3);
+        net.run(60, &[]);
+        let old = net.leaders(&[])[0];
+        let target = (1..=3).find(|&i| i != old).unwrap();
+        let term = net.node(old).term();
+        net.node(old).propose(b"before".to_vec()).unwrap();
+        net.run(10, &[]);
+        net.node(old).transfer_leadership(target).unwrap();
+        assert_eq!(net.node(old).transferring(), Some(target));
+        // The leader takes no writes and no membership changes while it does.
+        assert_eq!(net.node(old).propose(b"x".to_vec()), Err(Error::NotReady));
+        assert_eq!(net.node(old).remove_voter(target), Err(Error::NotReady));
+        assert_eq!(net.node(old).add_voter(9), Err(Error::NotReady));
+        net.run(1, &[]);
+        assert_eq!(net.leaders(&[]), vec![target]);
+        net.run(5, &[]);
+        // One election, the target's, and everybody follows it.
+        for n in &net.nodes {
+            assert_eq!(n.term(), term + 1);
+            assert_eq!(n.leader(), Some(target));
+        }
+        assert_eq!(net.node(old).role(), NodeState::Follower);
+        assert_eq!(net.node(old).transferring(), None);
+        assert_eq!(
+            net.node(old).propose(b"x".to_vec()),
+            Err(Error::NotLeader(Some(target)))
+        );
+        // The new leader takes writes, and every log agrees.
+        net.node(target).propose(b"after".to_vec()).unwrap();
+        net.run(10, &[]);
+        let want = net.node(target).log_snapshot().1;
+        assert_eq!(want.last().unwrap().data, b"after");
+        for (n, applied) in net.nodes.iter().zip(&net.applied) {
+            assert_eq!(n.log_snapshot().1, want);
+            assert_eq!(applied, &want);
+        }
+    }
+
+    #[test]
+    fn a_transfer_waits_for_the_target_to_have_the_log_and_is_abandoned_in_time() {
+        let node = Node::new(classic(1, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        // Not a leader yet.
+        assert_eq!(node.transfer_leadership(2), Err(Error::NotLeader(None)));
+        campaign(&node);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        assert_eq!(node.role(), NodeState::Leader);
+        assert_eq!(
+            node.transfer_leadership(1),
+            Err(Error::Transfer("the target is this node"))
+        );
+        assert_eq!(
+            node.transfer_leadership(9),
+            Err(Error::Transfer("the target is not a voter"))
+        );
+        assert_eq!(node.transferring(), None);
+        let timeouts = |node: &Node| {
+            let out = node.tick().unwrap();
+            out.messages
+                .into_iter()
+                .filter(|m| m.msg_type == MsgType::TimeoutNow)
+                .collect::<Vec<_>>()
+        };
+        node.transfer_leadership(3).unwrap();
+        assert_eq!(node.transferring(), Some(3));
+        // Peer 3 does not have the leader's entry yet: it is not told.
+        assert!(timeouts(&node).is_empty());
+        node.step(Message::append_entries_reply(3, 1, t, true, 1)).unwrap();
+        let now = timeouts(&node);
+        assert_eq!((now.len(), now[0].to, now[0].term, now[0].lc > 0), (1, 3, t, true));
+        // It is told again until it takes over: a lost message costs a tick.
+        assert_eq!(timeouts(&node).len(), 1);
+        // A target that never has the log: the transfer ends after an election
+        // timeout, and the leader takes writes and changes again.
+        node.transfer_leadership(2).unwrap();
+        assert_eq!(node.propose(b"x".to_vec()), Err(Error::NotReady));
+        for _ in 0..9 {
+            assert!(timeouts(&node).is_empty());
+        }
+        assert_eq!(node.transferring(), Some(2));
+        assert!(timeouts(&node).is_empty());
+        assert_eq!(node.transferring(), None);
+        node.propose(b"x".to_vec()).unwrap();
+        // Another request replaces one under way.
+        node.transfer_leadership(2).unwrap();
+        node.transfer_leadership(3).unwrap();
+        assert_eq!(node.transferring(), Some(3));
+        // A leader that steps down by a higher term has nothing to hand over.
+        node.step(Message::request_vote(2, 1, t + 1, 99, 99)).unwrap();
+        assert_eq!((node.role(), node.transferring()), (NodeState::Follower, None));
+    }
+
+    #[test]
+    fn only_a_voter_that_follows_the_sender_campaigns_on_timeout_now() {
+        let follower = |cfg: Config, storage: Arc<dyn Storage>| {
+            let node = Node::new(cfg, storage).unwrap();
+            node.step(Message::append_entries(1, node.id(), 1, 0, 0, vec![], 0))
+                .unwrap();
+            assert_eq!(node.leader(), Some(1));
+            node
+        };
+        let ask =
+            |node: &Node, from: NodeId, term: Term| node.step(Message::timeout_now(from, node.id(), term)).unwrap();
+        // Its leader asks: it campaigns, in the next term, at once.
+        let node = follower(Config::cluster(2, vec![1, 2, 3]), MemoryStorage::new());
+        let votes = ask(&node, 1, 1);
+        assert_eq!((node.role(), node.term()), (NodeState::Candidate, 2));
+        assert_eq!(votes.len(), 2);
+        assert!(votes.iter().all(|m| m.msg_type == MsgType::RequestVote && m.term == 2));
+        // Somebody that is not its leader asks: nothing happens.
+        let node = follower(Config::cluster(2, vec![1, 2, 3]), MemoryStorage::new());
+        assert!(ask(&node, 3, 1).is_empty());
+        assert_eq!((node.role(), node.term()), (NodeState::Follower, 1));
+        // A request of an older term is stale.
+        assert!(ask(&node, 1, 0).is_empty());
+        assert_eq!((node.role(), node.term()), (NodeState::Follower, 1));
+        // A server that is not a voter, or is recovering, does not campaign.
+        let learner = follower(Config::joiner(4), MemoryStorage::new());
+        assert!(ask(&learner, 1, 1).is_empty());
+        assert_eq!((learner.role(), learner.term()), (NodeState::Follower, 1));
+        let recovering = Node::new(Config::cluster(2, vec![1, 2, 3]), damaged(1, &[entry(1, 1, b"a")])).unwrap();
+        // (the leader has more than this node holds, so it stays recovering)
+        let mut hello = Message::append_entries(1, 2, 1, 1, 1, vec![], 0);
+        hello.leader_last_index = 9;
+        recovering.step(hello).unwrap();
+        assert!(recovering.recovering() && recovering.leader() == Some(1));
+        assert!(ask(&recovering, 1, 1).is_empty());
+        assert_eq!((recovering.role(), recovering.term()), (NodeState::Follower, 1));
+        // A campaign that cannot be made durable is an error.
+        let cfg = Config::cluster(2, vec![1, 2, 3]);
+        let node = Node::new(cfg, Failing::new(2)).unwrap();
+        node.step(Message::append_entries(1, 2, 0, 0, 0, vec![], 0)).unwrap();
+        assert_eq!(
+            node.step(Message::timeout_now(1, 2, 0)),
+            Err(Error::Storage("disk gone".into()))
+        );
     }
 
     /// Ticks `node` until it asks for pre-votes; returns those messages.

@@ -26,6 +26,9 @@ pub enum MsgType {
     /// `snap_offset < snap_total`, it has `snap_offset` bytes of the snapshot
     /// at `last_log_index` and wants the rest from there.
     InstallSnapshotReply,
+    /// From the leader to a voter that holds its whole log: campaign now,
+    /// without a pre-vote, as the leader is handing leadership over.
+    TimeoutNow,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +150,13 @@ impl Message {
             ..Self::install_snapshot_reply(from, to, term, true, 0)
         }
     }
+    /// The leader's `term` is the one it leads in.
+    pub fn timeout_now(from: NodeId, to: NodeId, term: Term) -> Self {
+        Message {
+            msg_type: MsgType::TimeoutNow,
+            ..Self::request_vote(from, to, term, 0, 0)
+        }
+    }
     /// A pre-vote asks for `term`, the term the sender would campaign in.
     pub fn pre_vote(from: NodeId, to: NodeId, term: Term, last_idx: Index, last_term: Term) -> Self {
         Message {
@@ -252,6 +262,8 @@ mod tests {
         assert_eq!((p.msg_type, p.term, p.last_log_index), (MsgType::PreVote, 4, 10));
         let p = Message::pre_vote_reply(2, 1, 4, true);
         assert_eq!((p.msg_type, p.vote_granted), (MsgType::PreVoteReply, true));
+        let t = Message::timeout_now(1, 2, 4);
+        assert_eq!((t.msg_type, t.from, t.to, t.term), (MsgType::TimeoutNow, 1, 2, 4));
         let snap = Arc::new(Snapshot {
             index: 10,
             term: 3,

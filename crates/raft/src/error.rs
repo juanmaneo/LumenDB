@@ -63,9 +63,13 @@ pub enum Error {
     BadConfig(&'static str),
     /// Proposal sent to a non-leader; carries the known leader, if any.
     NotLeader(Option<NodeId>),
-    /// A linearizable read needs an entry of the leader's own term to be
-    /// committed first; one is on its way, retry shortly.
+    /// The leader cannot take this now, retry shortly: a linearizable read
+    /// or a membership change needs an entry of its own term committed (one
+    /// is on its way), and while it hands leadership over it takes no writes.
     NotReady,
+    /// A leadership transfer that was refused, or that the target did not
+    /// complete: the reason.
+    Transfer(&'static str),
     /// A snapshot the node cannot take: the reason.
     BadSnapshot(&'static str),
     /// Bytes that are not a message: the reason (see [`crate::wire`]).
@@ -87,7 +91,11 @@ impl fmt::Display for Error {
             Error::NotConfigured => write!(f, "node not in peer set"),
             Error::BadConfig(why) => write!(f, "membership change refused: {why}"),
             Error::NotLeader(hint) => write!(f, "not leader (leader hint: {hint:?})"),
-            Error::NotReady => write!(f, "leader has not committed an entry of its term yet, retry"),
+            Error::NotReady => write!(
+                f,
+                "the leader is not ready (no entry of its term committed yet, or handing over), retry"
+            ),
+            Error::Transfer(why) => write!(f, "leadership transfer failed: {why}"),
             Error::BadSnapshot(why) => write!(f, "bad snapshot: {why}"),
             Error::BadMessage(why) => write!(f, "malformed message: {why}"),
             Error::Timeout => write!(f, "timed out"),
@@ -132,6 +140,10 @@ mod tests {
         assert_eq!(
             Error::BadMessage("unknown version").to_string(),
             "malformed message: unknown version"
+        );
+        assert_eq!(
+            Error::Transfer("not a voter").to_string(),
+            "leadership transfer failed: not a voter"
         );
         assert_eq!(Error::Timeout.to_string(), "timed out");
         assert_eq!(Error::Stopped.to_string(), "the server has stopped");

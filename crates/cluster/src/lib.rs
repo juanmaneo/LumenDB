@@ -782,6 +782,26 @@ mod tests {
     }
 
     #[test]
+    fn leadership_is_handed_over_on_request_and_writes_follow_it() {
+        let c = Cluster::start("handover", 3, 0, fast(0));
+        c.write("cpu,host=a usage=1 10\n");
+        let old = c.leader();
+        let target = c.up().find(|n| n.id() != old.id()).unwrap().id();
+        let asked = client::execute(old, &Request::Transfer(target), LONG);
+        assert_eq!(asked, Reply::Ok("transferred".to_string()));
+        assert_eq!(c.leader().id(), target);
+        // A write goes to the new leader and reaches every copy, and the old
+        // leader says where to go.
+        c.write("cpu,host=a usage=2 20\n");
+        same_everywhere(&c, &usage("a"), 2);
+        let err = old.write_lines("cpu,host=a usage=3 30", LONG).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("raft: not leader (leader hint: Some({target}))")
+        );
+    }
+
+    #[test]
     fn the_cluster_survives_losing_its_leader() {
         let mut c = Cluster::start("failover", 3, 0, fast(0));
         c.write("cpu,host=a usage=1 10");

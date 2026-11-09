@@ -28,6 +28,10 @@
 //!   a snapshot carries must be the committed one at its index. Election
 //!   safety, leader completeness and state machine safety are what catch two
 //!   disjoint majorities;
+//! - leadership transfer: the operator also asks the leader to hand
+//!   leadership to a voter, which then campaigns at once. This changes which
+//!   server leads and when, and nothing else, so the properties above are all
+//!   there is to check; the run counts the hand-overs that succeed;
 //! - log matching (every few ticks): two logs with the same term at an index
 //!   are identical up to it, over the part both still have.
 //!
@@ -80,6 +84,8 @@ pub struct Faults {
     pub snapshot: u32,
     /// Per tick: the operator asks the leader for a membership change.
     pub membership: u32,
+    /// Per tick: the operator asks the leader to hand leadership to a voter.
+    pub transfer: u32,
 }
 
 impl Default for Faults {
@@ -97,6 +103,7 @@ impl Default for Faults {
             read: 150_000,
             snapshot: 30_000,
             membership: 25_000,
+            transfer: 10_000,
         }
     }
 }
@@ -157,6 +164,10 @@ pub struct Report {
     pub restores: u64,
     /// Membership changes that committed.
     pub reconfigs: u64,
+    /// Leadership transfers a leader accepted.
+    pub transfers: u64,
+    /// Transfers after which the next leader elected was the target.
+    pub handovers: u64,
 }
 
 impl Report {
@@ -177,6 +188,8 @@ impl Report {
         self.snapshots_sent += o.snapshots_sent;
         self.restores += o.restores;
         self.reconfigs += o.reconfigs;
+        self.transfers += o.transfers;
+        self.handovers += o.handovers;
     }
 
     /// The counters, without the seed.
@@ -184,7 +197,8 @@ impl Report {
         format!(
             "committed {}, elections {}, crashes {}, corruptions {}, recoveries {}, io errors {}, \
              partitions {}, reads {} served / {} failed, snapshots {} taken / {} sent / {} restored, \
-             membership changes {}, messages {} delivered / {} dropped",
+             membership changes {}, leadership transfers {} done of {} asked, \
+             messages {} delivered / {} dropped",
             self.committed,
             self.elections,
             self.crashes,
@@ -198,6 +212,8 @@ impl Report {
             self.snapshots_sent,
             self.restores,
             self.reconfigs,
+            self.handovers,
+            self.transfers,
             self.delivered,
             self.dropped
         )
@@ -448,6 +464,9 @@ struct Sim {
     /// Reads asked and not yet answered, by (replica, id): the highest index
     /// known to be committed when each was asked.
     reads: BTreeMap<(usize, u64), Index>,
+    /// The target of the last transfer a leader accepted, until the next
+    /// election.
+    transfer: Option<NodeId>,
     report: Report,
 }
 
@@ -483,6 +502,7 @@ impl Sim {
             partition: None,
             payload: 0,
             reads: BTreeMap::new(),
+            transfer: None,
             report: Report {
                 seed,
                 ..Report::default()
@@ -542,6 +562,9 @@ impl Sim {
         }
         if (self.now < self.cfg.ticks + self.cfg.heal_ticks / 2) & self.rng.chance(self.cfg.faults.membership) {
             self.reconfigure()?;
+        }
+        if (self.now < self.cfg.ticks + self.cfg.heal_ticks / 2) & self.rng.chance(self.cfg.faults.transfer) {
+            self.hand_over();
         }
         self.deliver()?;
         if self.now.is_multiple_of(16) {
@@ -716,6 +739,7 @@ impl Sim {
         let view = || (node.snapshot_index(), node.log_snapshot().1);
         if (node.role() == NodeState::Leader) && self.check.leader(id, term, &view)? {
             self.report.elections += 1;
+            self.report.handovers += u64::from(self.transfer.take() == Some(id));
         }
         if commit > r.seen_commit {
             // Entries a snapshot covers were never in this log to see.
@@ -781,12 +805,29 @@ impl Sim {
         }
     }
 
+    /// The operator asks the leader to hand leadership to another voter. A
+    /// leader only refuses for a target that is not a voter or is itself,
+    /// which this never asks for, so it takes the request.
+    fn hand_over(&mut self) {
+        let Some(i) = self.newest_leader() else { return };
+        let node = self.replicas[i].node.as_ref().expect("a leader is up");
+        let others: Vec<NodeId> = (node.voters().into_iter()).filter(|&v| v != node.id()).collect();
+        if others.is_empty() {
+            return;
+        }
+        let target = others[self.rng.below(others.len() as u64) as usize];
+        node.transfer_leadership(target).expect("a voter, not itself");
+        self.report.transfers += 1;
+        self.transfer = Some(target);
+    }
+
     fn propose(&mut self) -> Result<(), String> {
         let Some(i) = self.newest_leader() else { return Ok(()) };
         self.payload += 1;
         let data = self.payload.to_le_bytes().to_vec();
+        // A leader that is handing leadership over takes no writes.
         match self.replicas[i].node.as_ref().map(|n| n.propose(data)) {
-            Some(Err(e)) => self.failed(i, e),
+            Some(Err(e)) if e != Error::NotReady => self.failed(i, e),
             _ => self.observe(i),
         }
     }
@@ -1423,6 +1464,43 @@ mod tests {
             5,
             "no more than there are servers"
         );
+    }
+
+    #[test]
+    fn leadership_is_handed_over_in_the_simulator() {
+        let cfg = |transfer| SimConfig {
+            replicas: 5,
+            voters: 5,
+            ticks: 600,
+            heal_ticks: 400,
+            faults: Faults {
+                drop: 0,
+                duplicate: 0,
+                partition: 0,
+                crash: 0,
+                io_error: 0,
+                membership: 0,
+                transfer,
+                ..Faults::default()
+            },
+        };
+        let none = run(2, &cfg(0)).unwrap();
+        assert_eq!((none.transfers, none.handovers), (0, 0));
+        let r = run(2, &cfg(30_000)).unwrap();
+        assert!(r.transfers > 5 && r.handovers > 5 && r.handovers <= r.transfers, "{r}");
+        assert!(r.to_string().contains(" leadership transfers "), "{r}");
+        let mut sum = Report::default();
+        sum.add(&r);
+        sum.add(&r);
+        assert_eq!((sum.transfers, sum.handovers), (2 * r.transfers, 2 * r.handovers));
+        // Nothing to ask while there is no leader, and nobody to hand over to
+        // in a cluster of one.
+        let mut sim = started(quick(3));
+        sim.hand_over();
+        assert_eq!(sim.report.transfers, 0);
+        let mut sim = idle_leader(Faults::default());
+        sim.hand_over();
+        assert_eq!(sim.report.transfers, 0);
     }
 
     #[test]

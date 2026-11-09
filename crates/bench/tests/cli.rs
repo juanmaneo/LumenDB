@@ -114,6 +114,13 @@ fn addrs(nodes: &[Node]) -> String {
     all.join(",")
 }
 
+/// The id of the node whose `status` line says it is the leader.
+fn leader_id(status: &str) -> u64 {
+    let line = status.lines().find(|l| l.contains(" role=leader ")).unwrap();
+    let id = line.split_whitespace().find_map(|w| w.strip_prefix("id=")).unwrap();
+    id.parse().unwrap()
+}
+
 fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
@@ -161,15 +168,18 @@ fn processes_form_a_cluster_that_replicates_fails_over_and_grows() {
     assert_eq!(status.lines().count(), 3, "{status}");
     assert_eq!(status.matches(" role=leader ").count(), 1, "{status}");
 
+    // Leadership is handed to another node on request, and the cluster goes
+    // on with it.
+    let heir = (1..=3).find(|&id| id != leader_id(&status)).unwrap();
+    assert_eq!(client_ok(&all, &["transfer", &heir.to_string()]), "transferred\n");
+    eventually("the heir to lead alone", || {
+        let status = client_ok(&all, &["status"]);
+        status.matches(" role=leader ").count() == 1 && leader_id(&status) == heir
+    });
+
     // Kill the leader without any goodbye. The others elect a new one, and
     // the client goes around the node that is gone.
-    let line = status.lines().find(|l| l.contains(" role=leader ")).unwrap();
-    let leader_id: u64 = line
-        .split_whitespace()
-        .find_map(|w| w.strip_prefix("id="))
-        .unwrap()
-        .parse()
-        .unwrap();
+    let leader_id = heir;
     let at = nodes.iter().position(|n| n.id == leader_id).unwrap();
     nodes[at].child.kill().unwrap();
     nodes[at].child.wait().unwrap();

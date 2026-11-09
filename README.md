@@ -138,6 +138,19 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   entry only on the server it removes, and the rest could not win without it.
   Snapshots carry the configuration, as the entries that set it are gone.
   The application sees committed configuration entries too, and ignores them.
+- **Leadership transfer** (Raft thesis, section 3.10). `Node::transfer_leadership`
+  hands leadership to a voter, to take the leader out of service without the
+  cluster waiting out an election timeout. The leader takes no writes or
+  membership changes meanwhile (`NotReady`, which clients retry), so the log
+  stops growing. It keeps replicating to the target, and once the target
+  holds the whole log it sends `TimeoutNow`: the target campaigns at once,
+  with no pre-vote, and as its log is as good as the leader's it wins, and
+  the old leader steps down on seeing the higher term. A transfer that has
+  not made the target leader within an election timeout is abandoned. Only
+  liveness depends on it: `TimeoutNow` is just a reason to campaign, which is
+  always safe, and a copy that arrives late is of an older term and ignored.
+  `Server::transfer_leadership` waits until the old leader has heard from the
+  new one.
 - **Snapshots and log compaction.** The application owns the state machine,
   so it decides when to snapshot: `Node::compact(index, data)` stores the
   serialized state machine as of an applied index, durably, and drops the log
@@ -188,8 +201,8 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   run of a 3 to 7 replica cluster, each replica on its own `MemEnv` with the
   real `FileStorage`: message loss, duplication and reordering, partitions,
   crashes, power loss with torn writes, bit flips in the Raft log, and I/O
-  errors, while an operator keeps adding and removing servers through
-  whichever replica leads. After every event the simulator checks election safety (one leader
+  errors, while an operator keeps adding and removing servers, and handing
+  leadership to voters, through whichever replica leads. After every event the simulator checks election safety (one leader
   per term), leader completeness, state machine safety (no two replicas
   commit or apply different entries at an index), log matching, and
   linearizable reads (a read, even one sent to a stale leader, must include
@@ -231,8 +244,9 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   the log damaged, so the node recovers), and the property itself by the
   simulator's log-matching and state-machine checks on every event. A chain
   would change the log, state and wire formats and cost a hash per entry.
-- **Not implemented**: leadership transfer (a leader that removes itself is
-  replaced after an election timeout), a leader that steps down on losing its
+- **Not implemented**: handing leadership over automatically (a leader that
+  removes itself is replaced after an election timeout; a transfer has to be
+  asked for), a leader that steps down on losing its
   quorum (it keeps leading until it hears a higher term, but cannot commit or
   confirm reads), pipelined replication (one append, and one snapshot chunk,
   is in flight per follower), and authentication or encryption on the wire.
@@ -338,15 +352,15 @@ linearizable read on the leader (`query` reads the local copy, which may lag).
   ```
 
   The protocol is one request per line over TCP (`WRITE`, `QUERY`, `STATUS`,
-  `PEER`, the four membership changes, `SHUTDOWN`; replies `OK`, `ROWS` or
+  `PEER`, the four membership changes, `TRANSFER`, `SHUTDOWN`; replies `OK`, `ROWS` or
   `ERR <code>`), documented in `cluster::client`. A node that is not the
   leader answers `ERR notleader <id>`; `ClusterClient` tries the nodes it
   knows until one is. It retries only what cannot have been applied: a node
   that is down, `notleader` and `notready`. A write that fails with a timeout
   or a lost connection may or may not have been applied, and the client does
   not guess. The test suite starts real `bench serve` processes, writes
-  through them, kills the leader with no warning, restarts it, adds a fourth
-  node and stops them all.
+  through them, hands leadership to another node, kills the leader with no
+  warning, restarts it, adds a fourth node and stops them all.
 
 ## Usage
 
@@ -395,6 +409,7 @@ NODES=127.0.0.1:8002,127.0.0.1:8003,127.0.0.1:8004
 c peer 4 127.0.0.1:7004
 c add-learner 4
 c add-voter 4                                          # refused until it has caught up: retry
+c transfer 4                                           # hand leadership to node 4; it returns once 4 leads
 c shutdown                                             # stop the nodes in $NODES
 ```
 

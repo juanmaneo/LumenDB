@@ -15,6 +15,7 @@
 //! | `PEER <id> <addr>` | `OK ok`: where to send messages to node `id` (saved: it is still known after a restart) |
 //! | `ADD-LEARNER <id>`, `REMOVE-LEARNER <id>` | `OK added`, `OK removed` |
 //! | `ADD-VOTER <id>`, `REMOVE-VOTER <id>` | `OK <index of the configuration entry>` |
+//! | `TRANSFER <id>` | `OK transferred`: leadership is handed to voter `id`, which now leads |
 //! | `SHUTDOWN` | `OK stopping`, and the node stops |
 //!
 //! Anything can fail with `ERR <code> <text>`; see [`Code`]. A request that
@@ -25,8 +26,8 @@
 //! are written `\\`, `\t`, `\n` and `\r`.
 //!
 //! **Which node.** Writes, consistent queries and membership changes only
-//! work on the leader: elsewhere the reply is `ERR notleader <id of the
-//! leader, or "unknown">`. A [`ClusterClient`] tries the nodes it was given
+//! work on the leader (so does `TRANSFER`): elsewhere the reply is `ERR
+//! notleader <id of the leader, or "unknown">`. A [`ClusterClient`] tries the nodes it was given
 //! until one is the leader. It retries only when the request cannot have
 //! been applied: a node that cannot be reached, `notleader` and `notready`.
 //! A write that fails with `timeout` or a lost connection may or may not have
@@ -121,6 +122,8 @@ pub enum Request {
     /// Messages for this node go to this address.
     Peer(NodeId, SocketAddr),
     Member(Change, NodeId),
+    /// Hand leadership to this voter.
+    Transfer(NodeId),
     Shutdown,
 }
 
@@ -135,7 +138,8 @@ pub enum Code {
     Timeout,
     /// The node is shutting down.
     Stopped,
-    /// A membership change the leader refuses: the text says why.
+    /// A membership change or a leadership transfer the leader refuses, or
+    /// that the target did not complete: the text says why.
     Refused,
     /// The write committed and the database refused it (for example, a
     /// field that already has another type).
@@ -299,6 +303,7 @@ impl Request {
             Request::Write(text) => format!("WRITE {}", text.len()),
             Request::Peer(id, addr) => format!("PEER {id} {addr}"),
             Request::Member(change, id) => format!("{} {id}", change.verb()),
+            Request::Transfer(id) => format!("TRANSFER {id}"),
             Request::Query { consistent, query, top } => query_line(*consistent, query, *top),
         };
         out.push('\n');
@@ -364,6 +369,7 @@ fn parse_request(line: &str) -> Parse<Request> {
         ["SHUTDOWN"] => Request::Shutdown,
         ["PEER", id, addr] => Request::Peer(uint(id)?, addr.parse().map_err(|_| format!("bad address {addr:?}"))?),
         ["QUERY", mode, measurement, field, ref options @ ..] => parse_query(mode, measurement, field, options)?,
+        ["TRANSFER", id] => Request::Transfer(uint(id)?),
         [verb, id] => Request::Member(Change::parse(verb)?, uint(id)?),
         _ => return Err(MALFORMED.to_string()),
     })
@@ -463,7 +469,7 @@ fn error_reply(e: &Error) -> Reply {
         Error::Raft(raft::Error::NotReady) => (Code::NotReady, e.to_string()),
         Error::Raft(raft::Error::Timeout) => (Code::Timeout, e.to_string()),
         Error::Raft(raft::Error::Stopped) => (Code::Stopped, e.to_string()),
-        Error::Raft(raft::Error::BadConfig(_)) => (Code::Refused, e.to_string()),
+        Error::Raft(raft::Error::BadConfig(_) | raft::Error::Transfer(_)) => (Code::Refused, e.to_string()),
         Error::Rejected(_) => (Code::Rejected, e.to_string()),
         Error::Db(tsvdb::Error::Parse { .. } | tsvdb::Error::Query(_) | tsvdb::Error::Schema(_)) => {
             (Code::Bad, e.to_string())
@@ -526,8 +532,13 @@ fn change_membership(db: &ReplicatedDb, change: Change, id: NodeId) -> crate::Re
     Ok(done?)
 }
 
+fn transfer(db: &ReplicatedDb, id: NodeId, timeout: Duration) -> crate::Result<String> {
+    db.server().transfer_leadership(id, timeout)?;
+    Ok("transferred".to_string())
+}
+
 /// Does what `req` asks on `db`; waits up to `timeout` for a write to be
-/// applied or a read barrier to be reached. `SHUTDOWN` only answers: stopping
+/// applied, a read barrier to be reached or a leadership transfer to be done. `SHUTDOWN` only answers: stopping
 /// is up to the caller ([`ClientServer`] does it).
 pub fn execute(db: &ReplicatedDb, req: &Request, timeout: Duration) -> Reply {
     let done = match req {
@@ -538,6 +549,7 @@ pub fn execute(db: &ReplicatedDb, req: &Request, timeout: Duration) -> Reply {
         Request::Query { consistent, query, top } => run_query(db, *consistent, query, *top, timeout),
         Request::Peer(id, addr) => db.set_peer(*id, *addr).map(|()| Reply::Ok("ok".to_string())),
         Request::Member(change, id) => change_membership(db, *change, *id).map(Reply::Ok),
+        Request::Transfer(id) => transfer(db, *id, timeout).map(Reply::Ok),
     };
     done.unwrap_or_else(|e| error_reply(&e))
 }
@@ -947,6 +959,7 @@ mod tests {
             },
         ];
         all.extend(Change::ALL.map(|change| Request::Member(change, 4)));
+        all.push(Request::Transfer(4));
         all
     }
 
@@ -1005,6 +1018,8 @@ mod tests {
             ("PEER x 127.0.0.1:1\n", "not a number"),
             ("PEER 1 nope\n", "bad address"),
             ("ADD-VOTER x\n", "not a number"),
+            ("TRANSFER x\n", "not a number"),
+            ("TRANSFER\n", MALFORMED),
             ("QUERY now m f\n", "the query mode is consistent or local"),
             ("QUERY local %zz f\n", "bad %-escape"),
             ("QUERY local m %zz\n", "bad %-escape"),
@@ -1138,6 +1153,7 @@ mod tests {
             (Error::Raft(R::Timeout), Code::Timeout, None),
             (Error::Raft(R::Stopped), Code::Stopped, None),
             (Error::Raft(R::BadConfig("already a voter")), Code::Refused, None),
+            (Error::Raft(R::Transfer("not a voter")), Code::Refused, None),
             (Error::Rejected("nope".to_string()), Code::Rejected, None),
             (
                 db(tsvdb::Error::Parse {
@@ -1218,6 +1234,16 @@ mod tests {
         let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert_eq!(run(Request::Peer(9, elsewhere)), Reply::Ok("ok".to_string()));
         assert_eq!(n.db.server().transport().peers().get(&9), Some(&elsewhere));
+
+        // Nobody to hand leadership to in a cluster of one.
+        assert_eq!(
+            run(Request::Transfer(1)).to_string(),
+            "refused raft: leadership transfer failed: the target is this node"
+        );
+        assert_eq!(
+            run(Request::Transfer(2)).to_string(),
+            "refused raft: leadership transfer failed: the target is not a voter"
+        );
     }
 
     #[test]

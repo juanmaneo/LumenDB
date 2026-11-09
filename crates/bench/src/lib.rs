@@ -84,6 +84,9 @@ commands:
                                on the first node that answers with --local 1
         add-learner ID, add-voter ID, remove-voter ID, remove-learner ID
                                change the membership, through the leader
+        transfer ID            hand leadership to voter ID (to take the
+                               leader out of service without an election
+                               timeout); it returns once ID leads
         peer ID ADDR           tell every node where node ID's Raft listens
         shutdown               stop every node
       The leader is looked for among the nodes for up to --patience-ms
@@ -759,6 +762,7 @@ fn client(a: &Args) -> Res<String> {
             let addr = socket_addr("peer", a.pos(3, "address")?)?;
             (Request::Peer(id, addr), Some(true))
         }
+        "transfer" => (Request::Transfer(node_id("transfer", a.pos(2, "node id")?)?), None),
         "write" => {
             let text = std::fs::read_to_string(a.pos(2, "line protocol file")?)?;
             (Request::Write(text), None)
@@ -1150,6 +1154,15 @@ mod tests {
             format!("{refused}not a learner, add it as one first")
         );
         assert_eq!(c("peer 9 127.0.0.1:9").unwrap(), format!("{node}: ok\n"));
+        // Leadership: nobody to hand it to in a cluster of one.
+        assert_eq!(
+            c("transfer 1").unwrap_err().to_string(),
+            "refused raft: leadership transfer failed: the target is this node"
+        );
+        assert_eq!(
+            c("transfer 7").unwrap_err().to_string(),
+            "refused raft: leadership transfer failed: the target is not a voter"
+        );
 
         for (args, want) in [
             ("--x 1 status", "unknown flag --x"),
@@ -1162,6 +1175,8 @@ mod tests {
             ("peer 1 nope", "peer: bad address \"nope\""),
             ("write", "missing line protocol file"),
             ("add-voter", "missing node id"),
+            ("transfer", "missing node id"),
+            ("transfer x", "transfer: invalid node id \"x\""),
             ("add-voter x", "add-voter: invalid node id \"x\""),
             ("query --top z", "--top: invalid number \"z\""),
             ("query --local z", "--local: invalid number \"z\""),
