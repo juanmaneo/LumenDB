@@ -2,11 +2,11 @@
 //! project automation written in Rust, run with `cargo xtask <task>` through
 //! the alias in `.cargo/config.toml`.
 //!
-//! - `dev-check`: fails on the first failing step of `cargo fmt --check`, `cargo clippy -D warnings`,
-//!   `cargo test --workspace` and the coverage gate
-//!   (`cargo llvm-cov --fail-under-lines 100 --fail-under-regions 100`).
-//!   `--no-coverage` skips the gate; without it a missing cargo-llvm-cov is an
-//!   error. CI runs it without flags.
+//! - `dev-check`: fails on the first failing step of `cargo fmt --check`, `cargo clippy -D warnings`
+//!   and the coverage gate (`cargo llvm-cov --fail-under-lines 100 --fail-under-regions 100`),
+//!   which runs every test, so there is no separate `cargo test` before it.
+//!   `--no-coverage` replaces the gate with a plain `cargo test --workspace`;
+//!   without it a missing cargo-llvm-cov is an error. CI runs it without flags.
 //! - `kani`: proves the harnesses of the `proofs` crate (`cargo kani -p proofs`),
 //!   with virtual memory capped at [`KANI_MEMORY_KIB`] (`ulimit -v`): a proof
 //!   that blows up fails instead of driving the machine into the OOM killer.
@@ -30,7 +30,8 @@ pub const USAGE: &str = "\
 usage: cargo xtask <task>
 
 tasks:
-  dev-check [--no-coverage]  fmt --check, clippy -D warnings, test, 100% coverage gate
+  dev-check [--no-coverage]  fmt --check, clippy -D warnings, the tests under a 100% coverage
+                             gate (--no-coverage: the tests alone)
   kani                       run the kani proofs (cargo kani -p proofs), memory capped at 8 GiB
   bench [--packets N] [--min-mpps X]
                              generate a synthetic capture (default 4800000 packets, about
@@ -128,10 +129,14 @@ pub fn dev_check(ctx: &Ctx, no_coverage: bool) -> Result<String, String> {
     }
     ctx.step(&["fmt", "--all", "--", "--check"])?;
     ctx.step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
-    ctx.step(&["test", "--workspace"])?;
     if no_coverage {
+        ctx.step(&["test", "--workspace"])?;
         return Ok("dev-check passed (coverage gate skipped)\n".into());
     }
+    // The gate runs every test (and fails on a failing one): a plain run
+    // before it would only build and run them a second time. (There are no
+    // doctests, which coverage does not run: if one is added, so must a
+    // `cargo test --doc` step be.)
     ctx.step(&[
         "llvm-cov",
         "--workspace",
@@ -273,7 +278,7 @@ pub(crate) mod tests {
         assert_eq!(
             log(&d),
             "llvm-cov --version\nfmt --all -- --check\nclippy --workspace --all-targets -- -D warnings\n\
-             test --workspace\nllvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100\n"
+             llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100\n"
         );
         fs::remove_dir_all(&d).unwrap();
     }
@@ -287,7 +292,6 @@ pub(crate) mod tests {
                 "clippy*",
                 "`cargo clippy --workspace --all-targets -- -D warnings` failed",
             ),
-            ("test*", "`cargo test --workspace` failed"),
             (
                 "llvm-cov\\ --workspace*",
                 "`cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100` failed",
@@ -307,6 +311,12 @@ pub(crate) mod tests {
         let out = run(&args("dev-check --no-coverage"), &ctx(&d, "llvm-cov*")).unwrap();
         assert!(out.contains("coverage gate skipped"));
         assert!(!log(&d).contains("llvm-cov"));
+        assert!(log(&d).ends_with("clippy --workspace --all-targets -- -D warnings\ntest --workspace\n"));
+        fs::remove_dir_all(&d).unwrap();
+        // Without the gate, the tests are run on their own.
+        let d = tmp("nocov-fail");
+        let e = run(&args("dev-check --no-coverage"), &ctx(&d, "test*")).unwrap_err();
+        assert_eq!(e, "`cargo test --workspace` failed");
         fs::remove_dir_all(&d).unwrap();
     }
 

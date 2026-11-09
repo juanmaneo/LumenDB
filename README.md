@@ -451,8 +451,8 @@ pattern. The alias lives in `.cargo/config.toml`.
 
 | command | does |
 |---|---|
-| `cargo xtask dev-check` | fails on the first failing step: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, then `cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100` |
-| `cargo xtask dev-check --no-coverage` | the same without the coverage gate (for machines without cargo-llvm-cov) |
+| `cargo xtask dev-check` | fails on the first failing step: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, then `cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100`, which runs every test (a failing test fails the gate, so there is no separate `cargo test`) |
+| `cargo xtask dev-check --no-coverage` | the same with a plain `cargo test --workspace` in place of the coverage gate (for machines without cargo-llvm-cov) |
 | `cargo xtask kani` | `cargo kani -p proofs`, with virtual memory capped at 8 GiB (`ulimit -v`) so a runaway proof fails instead of triggering the OOM killer |
 | `cargo xtask vopr [--seeds N] [--start N] [--replicas N]` | in release mode, runs the Raft cluster simulation for `N` seeds (default 200, about 0.1 s each) and checks the safety properties after every event. A failing seed is printed with the command that replays it, for example `bench vopr --start 42 --seeds 1` |
 | `cargo xtask bench [--packets N] [--min-mpps X]` | in release mode, writes a synthetic capture (default 4.8 million packets, about 3.6 GB) to `target/bench/capture.pcap`, then runs `bench parse-bench` on it: one warm-up pass and 5 timed runs. With `--min-mpps`, it fails if the best wall-clock rate is below `X` Mpkt/s |
@@ -518,8 +518,11 @@ even for a one-entry log and a one-entry batch.
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on
 `ubuntu-latest`:
 
-1. `cargo xtask dev-check`: fmt, clippy `-D warnings`, tests and the 100%
-   line and region coverage gate.
+1. `cargo xtask dev-check`: fmt, clippy `-D warnings`, and the tests under
+   the 100% line and region coverage gate. The job builds without debuginfo
+   (`CARGO_PROFILE_DEV_DEBUG=0`). On 4 cores from a cold cache, that and
+   running the tests once instead of twice took the steps from about 76 s to
+   about 37 s.
 2. `cargo xtask kani`: the proofs. Kani is pinned to one version
    (`KANI_VERSION` in the workflow). [`install-kani.sh`](.github/scripts/install-kani.sh)
    downloads its release bundle with retries and the workflow caches it, because
