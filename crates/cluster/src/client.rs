@@ -830,6 +830,7 @@ mod tests {
             },
             election_timeout: (50, 100),
             heartbeat: 3,
+            snapshot_chunk: raft::node::SNAPSHOT_CHUNK,
             db,
         }
     }

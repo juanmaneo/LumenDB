@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetOptions {
-    /// The largest frame a reader accepts; it must cover the largest snapshot.
+    /// The largest frame a reader accepts. It must cover the largest message:
+    /// a batch of entries, and a chunk of a snapshot (`Config::snapshot_chunk`),
+    /// or the whole snapshot where chunking is off.
     pub max_frame: usize,
     /// Messages queued for one peer before new ones are dropped.
     pub outbox: usize,

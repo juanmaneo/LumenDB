@@ -38,10 +38,17 @@
 //! it decides when to snapshot. [`Node::compact`] takes the serialized state
 //! machine as of an applied index, stores it durably and drops the log up to
 //! there. A leader whose follower needs entries it has dropped sends the
-//! snapshot instead (`InstallSnapshot`, in one message). The follower stores
-//! it, and `tick()` hands it to the application as [`TickOutcome::snapshot`]
-//! to restore the state machine from, before any entries after it. After a
-//! restart the first tick does the same with the stored snapshot.
+//! snapshot instead (`InstallSnapshot`), in chunks of at most
+//! [`Config::snapshot_chunk`] bytes, one in flight per follower: the follower
+//! answers each with how many bytes it holds, and the leader goes on from
+//! there. A chunk that is lost, repeated or out of order, a follower that
+//! restarted, and a leader that took a newer snapshot all cost a resend and
+//! nothing else; a follower that has not heard an answer within a heartbeat
+//! gets the chunk again. The follower collects the chunks in memory and, when
+//! it holds all of them, stores the snapshot; `tick()` hands it to the
+//! application as [`TickOutcome::snapshot`] to restore the state machine from,
+//! before any entries after it. After a restart the first tick does the same
+//! with the stored snapshot.
 //!
 //! Membership changes (Raft thesis section 4.1, one server at a time): the
 //! cluster configuration is a voter set held in [`crate::EntryKind::Config`] log
@@ -92,6 +99,9 @@ use std::sync::Arc;
 /// Maximum entries shipped in one AppendEntries.
 pub const MAX_BATCH: usize = 64;
 
+/// The default [`Config::snapshot_chunk`]: 1 MiB.
+pub const SNAPSHOT_CHUNK: usize = 1 << 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeState {
     Follower,
@@ -128,6 +138,25 @@ pub struct ReadState {
     pub index: Option<Index>,
 }
 
+/// Leader: how much of its snapshot a follower has acknowledged.
+struct SnapOut {
+    /// The snapshot this is about, by the index it ends at.
+    index: Index,
+    /// Where the next chunk starts.
+    offset: usize,
+    /// The tick a chunk was last sent on.
+    sent: u64,
+}
+
+/// Follower: a snapshot that is being received.
+struct Incoming {
+    /// Which snapshot: who sends it, in which term, the index it ends at and
+    /// its length. Two servers' snapshots at one index may differ in bytes.
+    key: (NodeId, Term, Index, u64),
+    /// The bytes received so far, from the start.
+    data: Vec<u8>,
+}
+
 /// A read waiting for a majority to confirm the leader.
 struct PendingRead {
     id: u64,
@@ -148,6 +177,9 @@ pub struct Config {
     pub seed: u64,
     /// Ask for pre-votes before campaigning.
     pub pre_vote: bool,
+    /// The most bytes of a snapshot a leader sends in one message (0: the
+    /// whole snapshot, in one).
+    pub snapshot_chunk: usize,
 }
 
 impl Config {
@@ -160,6 +192,7 @@ impl Config {
             heartbeat_interval: 2,
             seed: 0x1234_5678_9abc_def0,
             pre_vote: true,
+            snapshot_chunk: SNAPSHOT_CHUNK,
         }
     }
 
@@ -179,6 +212,7 @@ impl Config {
             heartbeat_interval: 3,
             seed: 0x0fed_cba9_8765_4321,
             pre_vote: true,
+            snapshot_chunk: SNAPSHOT_CHUNK,
         }
     }
 }
@@ -216,6 +250,12 @@ struct Inner {
     snapshot: Option<Arc<Snapshot>>,
     /// A snapshot the next tick hands to the application.
     install: Option<Arc<Snapshot>>,
+    /// Ticks so far.
+    ticks: u64,
+    /// Leader only: the followers that are being sent the snapshot.
+    snap_out: BTreeMap<NodeId, SnapOut>,
+    /// A snapshot being received from the leader.
+    incoming: Option<Incoming>,
     /// Leader only: servers that get the log without being voters, so that
     /// they can catch up before they are added.
     learners: BTreeSet<NodeId>,
@@ -292,6 +332,9 @@ impl Node {
                 reads_failed: Vec::new(),
                 install: snapshot.clone(),
                 snapshot,
+                ticks: 0,
+                snap_out: BTreeMap::new(),
+                incoming: None,
                 learners: BTreeSet::new(),
             }),
             cfg,
@@ -564,6 +607,7 @@ impl Node {
         s.next_index.retain(|p, _| wanted.contains(p));
         s.match_index.retain(|p, _| wanted.contains(p));
         s.read_acked.retain(|p, _| wanted.contains(p));
+        s.snap_out.retain(|p, _| wanted.contains(p));
         let next = s.log.last_index() + 1;
         for p in wanted {
             s.next_index.entry(p).or_insert(next);
@@ -582,6 +626,7 @@ impl Node {
         s.next_index.clear();
         s.match_index.clear();
         s.read_acked.clear();
+        s.snap_out.clear();
     }
 
     /// A leader that has no committed entry of its own term does not know its
@@ -650,6 +695,7 @@ impl Node {
     pub fn tick(&self) -> Result<TickOutcome> {
         let mut s = self.state.lock();
         let mut messages = Vec::new();
+        s.ticks += 1;
         Self::fail_unconfirmed_reads(&mut s);
         if s.role == NodeState::Leader {
             s.heartbeat_elapsed += 1;
@@ -668,7 +714,13 @@ impl Node {
                 }
                 let targets: Vec<NodeId> = s.next_index.keys().copied().collect();
                 for p in targets {
-                    let mut m = self.replicate(&s, p);
+                    // A chunk of a snapshot went out less than a heartbeat
+                    // ago, and its answer sends the next one: do not repeat it.
+                    let waiting = (s.snap_out.get(&p)).is_some_and(|o| s.ticks - o.sent < self.cfg.heartbeat_interval);
+                    if waiting & !reads_due {
+                        continue;
+                    }
+                    let mut m = self.replicate(&mut s, p);
                     m.read_ctx = round;
                     messages.push(Self::send(&mut s, m));
                 }
@@ -740,6 +792,7 @@ impl Node {
             s.leader_id = None;
             s.role = NodeState::Follower;
             s.learners.clear();
+            s.incoming = None;
         }
         let replies: Vec<Message> = if msg.term < s.term {
             self.stale_reply(&s, &msg).into_iter().collect()
@@ -873,6 +926,7 @@ impl Node {
         s.next_index.clear();
         s.match_index.clear();
         s.read_acked.clear();
+        s.snap_out.clear();
         s.read_round = 0;
         self.sync_targets(s);
         // Heartbeat on the very next tick.
@@ -906,17 +960,32 @@ impl Node {
         }
     }
 
-    /// What `peer` needs next: entries, or the snapshot when it needs
-    /// entries this log no longer has.
-    fn replicate(&self, s: &Inner, peer: NodeId) -> Message {
-        match &s.snapshot {
-            Some(snap) if s.next_index[&peer] <= snap.index => {
-                let mut m = Message::install_snapshot(self.cfg.id, peer, s.term, snap.clone(), s.commit_index);
-                m.leader_last_index = s.log.last_index();
-                m
-            }
-            _ => self.append_for(s, peer),
-        }
+    /// What `peer` needs next: entries, or when it needs entries this log no
+    /// longer has, the chunk of the snapshot that starts where `peer` has
+    /// told us it is (at the start, if it has not).
+    fn replicate(&self, s: &mut Inner, peer: NodeId) -> Message {
+        let Some(snap) = s.snapshot.clone().filter(|snap| s.next_index[&peer] <= snap.index) else {
+            s.snap_out.remove(&peer);
+            return self.append_for(s, peer);
+        };
+        let offset = (s.snap_out.get(&peer))
+            .filter(|o| o.index == snap.index)
+            .map_or(0, |o| o.offset);
+        let out = SnapOut {
+            index: snap.index,
+            offset,
+            sent: s.ticks,
+        };
+        s.snap_out.insert(peer, out);
+        let chunk = match self.cfg.snapshot_chunk {
+            0 => usize::MAX,
+            n => n,
+        };
+        let end = offset.saturating_add(chunk).min(snap.data.len());
+        let range = (offset, end);
+        let mut m = Message::install_snapshot_chunk(self.cfg.id, peer, s.term, &snap, range, s.commit_index);
+        m.leader_last_index = s.log.last_index();
+        m
     }
 
     /// AppendEntries for `peer`; its `next_index` must be above the base.
@@ -997,22 +1066,51 @@ impl Node {
         ))
     }
 
-    /// Takes the leader's snapshot, unless this node already committed
-    /// everything it covers. The application gets it on the next tick.
+    /// Takes a chunk of the leader's snapshot, and the snapshot once it holds
+    /// all of it, unless this node already committed everything it covers.
+    /// The application gets it on the next tick. A chunk that does not
+    /// continue what this node holds (the first one, a repeat, one after a
+    /// gap, a different snapshot) is answered with how much it does hold, and
+    /// the leader goes on from there.
     fn on_install_snapshot(&self, s: &mut Inner, msg: &Message) -> Result<Message> {
         s.role = NodeState::Follower;
         s.leader_id = Some(msg.from);
         s.election_elapsed = 0;
-        let Some(snapshot) = msg.snapshot.clone() else {
+        let Some(chunk) = msg.snapshot.as_ref() else {
             return Err(Error::BadSnapshot("InstallSnapshot without a snapshot"));
         };
-        let index = snapshot.index;
-        let reply = |s: &Inner, matched| Message::install_snapshot_reply(self.cfg.id, msg.from, s.term, true, matched);
+        let (index, term) = (chunk.index, s.term);
+        let (offset, total) = (msg.snap_offset, msg.snap_total);
+        let reply = |matched| Message::install_snapshot_reply(self.cfg.id, msg.from, term, true, matched);
         if index <= s.commit_index {
             // Committed entries are the same on every node, so this log
             // matches the leader's up to its commit index.
-            return Ok(reply(s, s.commit_index));
+            s.incoming = None;
+            return Ok(reply(s.commit_index));
         }
+        if offset.saturating_add(chunk.data.len() as u64) > total {
+            return Err(Error::BadSnapshot("a chunk reaches beyond the end of the snapshot"));
+        }
+        let progress = |have| Message::install_snapshot_progress(self.cfg.id, msg.from, term, index, (have, total));
+        let key = (msg.from, term, index, total);
+        let mut incoming = match (s.incoming.take().filter(|i| i.key == key), offset) {
+            (Some(incoming), _) => incoming,
+            (None, 0) => Incoming { key, data: Vec::new() },
+            (None, _) => return Ok(progress(0)),
+        };
+        if offset == incoming.data.len() as u64 {
+            incoming.data.extend_from_slice(&chunk.data);
+        }
+        let have = incoming.data.len() as u64;
+        if have < total {
+            s.incoming = Some(incoming);
+            return Ok(progress(have));
+        }
+        let snapshot = Arc::new(Snapshot {
+            data: incoming.data,
+            voters: chunk.voters.clone(),
+            ..**chunk
+        });
         self.storage.install_snapshot(snapshot.clone())?;
         s.log
             .install_snapshot(index, snapshot.term, snapshot.voters.clone())
@@ -1025,7 +1123,17 @@ impl Node {
             self.storage.mark_repaired()?;
             s.recovering = false;
         }
-        Ok(reply(s, index))
+        Ok(reply(index))
+    }
+
+    /// A follower holds `snap_offset` bytes of the snapshot: send it the rest.
+    /// An answer about a snapshot that is not being sent to it is old news.
+    fn on_snapshot_progress(&self, s: &mut Inner, msg: &Message) -> Option<Message> {
+        let len = s.snapshot.as_ref().map_or(0, |snap| snap.data.len() as u64);
+        let out =
+            (s.snap_out.get_mut(&msg.from)).filter(|o| (o.index == msg.last_log_index) & (len == msg.snap_total))?;
+        out.offset = msg.snap_offset as usize;
+        Some(self.replicate(s, msg.from))
     }
 
     fn on_append_reply(&self, s: &mut Inner, msg: &Message) -> Option<Message> {
@@ -1040,6 +1148,15 @@ impl Node {
             let acked = s.read_acked.entry(msg.from).or_insert(0);
             *acked = (*acked).max(msg.read_ctx);
             self.confirm_reads(s);
+        }
+        // How far a follower is in a snapshot is not a log position. An
+        // answer that is not that says the transfer is over.
+        let snapshot_reply = msg.msg_type == MsgType::InstallSnapshotReply;
+        if snapshot_reply & msg.success & (msg.snap_offset < msg.snap_total) {
+            return self.on_snapshot_progress(s, msg);
+        }
+        if snapshot_reply {
+            s.snap_out.remove(&msg.from);
         }
         let next = if msg.success {
             // Trust the reply even if it is lower than before: a follower
@@ -1108,12 +1225,18 @@ mod tests {
         }
 
         fn with_pre_vote(n: u64, pre_vote: bool) -> Self {
+            Self::with_config(n, pre_vote, SNAPSHOT_CHUNK)
+        }
+
+        /// Snapshots travel in chunks of `chunk` bytes.
+        fn with_config(n: u64, pre_vote: bool, chunk: usize) -> Self {
             let voters: Vec<NodeId> = (1..=n).collect();
             let nodes: Vec<Node> = voters
                 .iter()
                 .map(|&id| {
                     let cfg = Config {
                         pre_vote,
+                        snapshot_chunk: chunk,
                         ..Config::cluster(id, voters.clone())
                     };
                     Node::new(cfg, MemoryStorage::new()).unwrap()
@@ -1942,6 +2065,358 @@ mod tests {
         assert_eq!(net.node(lag).log_snapshot().1, want);
         assert_eq!(net.node(lag).commit_index(), applied + 1);
         assert_eq!(net.applied[(lag - 1) as usize].last(), want.last());
+    }
+
+    /// Chunk `[offset, end)` of a snapshot of ten bytes that ends at `index`,
+    /// from node 1 in term 1 to node 2.
+    fn chunk_of(index: Index, (offset, end): (usize, usize)) -> Message {
+        let snap = Arc::new(snapshot_of(index, 1, &[1, 2, 3], b"0123456789"));
+        Message::install_snapshot_chunk(1, 2, 1, &snap, (offset, end), index)
+    }
+
+    /// What `node` answers to `m`, a message of a snapshot transfer:
+    /// (success, match index, snapshot index, offset, total).
+    fn answer(node: &Node, m: Message) -> (bool, Index, Index, u64, u64) {
+        let r = node.step(m).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].msg_type, MsgType::InstallSnapshotReply);
+        (
+            r[0].success,
+            r[0].match_index,
+            r[0].last_log_index,
+            r[0].snap_offset,
+            r[0].snap_total,
+        )
+    }
+
+    #[test]
+    fn a_follower_assembles_a_snapshot_from_chunks() {
+        let storage = MemoryStorage::new();
+        let node = Node::new(classic(2, vec![1, 2, 3]), storage.clone()).unwrap();
+        let have = |n: u64| (true, 0, 5, n, 10);
+        assert_eq!(answer(&node, chunk_of(5, (0, 4))), have(4));
+        // Nothing is installed, or handed out, before the last byte is in.
+        assert_eq!((node.snapshot_index(), node.commit_index()), (0, 0));
+        assert!(node.tick().unwrap().snapshot.is_none());
+        assert!(storage.load().unwrap().snapshot.is_none());
+        // A repeat and a chunk after a gap are answered with what is held.
+        assert_eq!(answer(&node, chunk_of(5, (0, 4))), have(4));
+        assert_eq!(answer(&node, chunk_of(5, (6, 10))), have(4));
+        // The next one continues, and repeating it is harmless.
+        assert_eq!(answer(&node, chunk_of(5, (4, 8))), have(8));
+        assert_eq!(answer(&node, chunk_of(5, (4, 8))), have(8));
+        // The last one completes it: installed whole, as one message would.
+        assert_eq!(answer(&node, chunk_of(5, (8, 10))), (true, 5, 0, 0, 0));
+        assert_eq!((node.snapshot_index(), node.commit_index()), (5, 5));
+        let whole = snapshot_of(5, 1, &[1, 2, 3], b"0123456789");
+        assert_eq!(node.tick().unwrap().snapshot.as_deref(), Some(&whole));
+        assert_eq!(storage.load().unwrap().snapshot.as_deref(), Some(&whole));
+        assert_eq!(node.voters(), vec![1, 2, 3]);
+        // A chunk that arrives late, or of an older snapshot, finds it covered.
+        for m in [chunk_of(5, (4, 8)), chunk_of(3, (0, 4))] {
+            assert_eq!(answer(&node, m), (true, 5, 0, 0, 0));
+        }
+        assert!(node.tick().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn a_chunk_of_another_snapshot_makes_the_transfer_start_over() {
+        let node = Node::new(classic(2, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        let have = |index: Index, n: u64, total: u64| (true, 0, index, n, total);
+        // A chunk from the middle, with nothing held (a restarted follower):
+        // the leader is asked for the start.
+        assert_eq!(answer(&node, chunk_of(5, (4, 8))), have(5, 0, 10));
+        assert_eq!(answer(&node, chunk_of(5, (0, 4))), have(5, 4, 10));
+        // The leader took a newer snapshot: its first chunk replaces what is
+        // held, and the rest of the old one is not taken for part of it.
+        assert_eq!(answer(&node, chunk_of(6, (0, 4))), have(6, 4, 10));
+        assert_eq!(answer(&node, chunk_of(5, (4, 8))), have(5, 0, 10));
+        // The same index but another length, or sender, is another snapshot.
+        let shorter = Arc::new(snapshot_of(5, 1, &[1, 2, 3], b"01234567"));
+        let first = Message::install_snapshot_chunk(1, 2, 1, &shorter, (0, 4), 5);
+        assert_eq!(answer(&node, first), have(5, 4, 8));
+        assert_eq!(answer(&node, chunk_of(5, (4, 8))), have(5, 0, 10));
+        assert_eq!(answer(&node, chunk_of(5, (0, 4))), have(5, 4, 10));
+        let third = Message {
+            from: 3,
+            ..chunk_of(5, (4, 8))
+        };
+        assert_eq!(answer(&node, third), have(5, 0, 10));
+        // A later term starts over too: its leader's bytes may differ.
+        assert_eq!(answer(&node, chunk_of(5, (0, 4))), have(5, 4, 10));
+        let later = Message {
+            term: 2,
+            ..chunk_of(5, (4, 8))
+        };
+        let r = node.step(later).unwrap();
+        assert_eq!((r[0].term, r[0].snap_offset), (2, 0));
+        // Commits that overtake the snapshot make it moot.
+        assert_eq!(
+            answer(
+                &node,
+                Message {
+                    term: 2,
+                    ..chunk_of(7, (0, 4))
+                }
+            ),
+            have(7, 4, 10)
+        );
+        let log: Vec<LogEntry> = (1..=6).map(|i| entry(i, 2, b"e")).collect();
+        node.step(Message::append_entries(1, 2, 2, 0, 0, log, 6)).unwrap();
+        assert_eq!(node.commit_index(), 6);
+        assert_eq!(
+            answer(
+                &node,
+                Message {
+                    term: 2,
+                    ..chunk_of(6, (4, 8))
+                }
+            ),
+            (true, 6, 0, 0, 0)
+        );
+        assert_eq!(
+            answer(
+                &node,
+                Message {
+                    term: 2,
+                    ..chunk_of(7, (4, 8))
+                }
+            ),
+            have(7, 0, 10)
+        );
+    }
+
+    #[test]
+    fn chunks_must_lie_within_the_snapshot_and_an_empty_snapshot_is_whole() {
+        let node = Node::new(classic(2, vec![1, 2, 3]), MemoryStorage::new()).unwrap();
+        let beyond = Err(Error::BadSnapshot("a chunk reaches beyond the end of the snapshot"));
+        assert_eq!(
+            node.step(Message {
+                snap_offset: 8,
+                ..chunk_of(5, (0, 4))
+            }),
+            beyond
+        );
+        assert_eq!(
+            node.step(Message {
+                snap_offset: u64::MAX,
+                ..chunk_of(5, (0, 4))
+            }),
+            beyond
+        );
+        assert_eq!(
+            node.step(Message {
+                snap_total: 3,
+                ..chunk_of(5, (0, 4))
+            }),
+            beyond
+        );
+        assert_eq!(node.snapshot_index(), 0);
+        // Only data counts: a chunk of nothing at the end is in range.
+        assert_eq!(answer(&node, chunk_of(5, (0, 4))), (true, 0, 5, 4, 10));
+        // An empty snapshot, which is the cluster's configuration and nothing
+        // else, is complete in its one message.
+        let empty = Arc::new(snapshot_of(7, 1, &[1, 2, 3], b""));
+        let m = Message::install_snapshot_chunk(1, 2, 1, &empty, (0, 0), 7);
+        assert_eq!(answer(&node, m), (true, 7, 0, 0, 0));
+        assert_eq!(node.snapshot_index(), 7);
+        assert!(node.tick().unwrap().snapshot.unwrap().data.is_empty());
+    }
+
+    /// A leader of node 1 in a classic cluster of three, with a snapshot of
+    /// ten bytes at index 2 (peer 3 needs it) sent in chunks of `chunk` bytes.
+    fn snapshotting_leader(chunk: usize) -> (Node, Term) {
+        let cfg = Config {
+            snapshot_chunk: chunk,
+            ..classic(1, vec![1, 2, 3])
+        };
+        let node = Node::new(cfg, MemoryStorage::new()).unwrap();
+        campaign(&node);
+        let t = node.term();
+        node.step(Message::request_vote_reply(2, 1, t, true)).unwrap();
+        node.propose(b"x".to_vec()).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, 2)).unwrap();
+        assert_eq!(node.tick().unwrap().committed.len(), 2);
+        node.compact(2, b"0123456789".to_vec()).unwrap();
+        (node, t)
+    }
+
+    /// What `node` sends to peer 3 on its next tick.
+    fn tick_for_3(node: &Node) -> Vec<Message> {
+        let out = node.tick().unwrap();
+        out.messages.into_iter().filter(|m| m.to == 3).collect()
+    }
+
+    /// (offset, total, data) of a chunk of a snapshot ending at 2.
+    fn chunk_data(m: &Message) -> (u64, u64, Vec<u8>) {
+        assert_eq!(
+            (m.msg_type, m.last_log_index, m.commit_index),
+            (MsgType::InstallSnapshot, 2, 2)
+        );
+        assert_eq!(m.leader_last_index, 2);
+        (m.snap_offset, m.snap_total, m.snapshot.as_ref().unwrap().data.clone())
+    }
+
+    #[test]
+    fn a_leader_sends_a_snapshot_one_chunk_at_a_time_and_repeats_a_lost_one() {
+        let (node, t) = snapshotting_leader(4);
+        let ack = |from, index, have| {
+            node.step(Message::install_snapshot_progress(from, 1, t, index, (have, 10)))
+                .unwrap()
+        };
+        assert!(tick_for_3(&node).is_empty());
+        assert!(tick_for_3(&node).is_empty());
+        let first = tick_for_3(&node);
+        assert_eq!(first.len(), 1);
+        assert_eq!(chunk_data(&first[0]), (0, 10, b"0123".to_vec()));
+        // The follower says what it holds, and gets the chunk after it at once.
+        assert!(tick_for_3(&node).is_empty());
+        let next = ack(3, 2, 4);
+        assert_eq!(next.len(), 1);
+        assert_eq!((next[0].to, chunk_data(&next[0])), (3, (4, 10, b"4567".to_vec())));
+        // The next heartbeat would repeat it, but it went out a moment ago.
+        assert!(tick_for_3(&node).is_empty());
+        assert!(tick_for_3(&node).is_empty(), "the heartbeat of the third tick");
+        assert!(tick_for_3(&node).is_empty());
+        assert!(tick_for_3(&node).is_empty());
+        // Silence for a whole heartbeat: that chunk was lost, send it again.
+        let again = tick_for_3(&node);
+        assert_eq!(again.len(), 1);
+        assert_eq!(chunk_data(&again[0]), (4, 10, b"4567".to_vec()));
+        // A repeated answer is answered by the same chunk again, not skipped.
+        let next = ack(3, 2, 8);
+        assert_eq!(chunk_data(&next[0]), (8, 10, b"89".to_vec()));
+        // Answers about no transfer to that peer, another snapshot or another
+        // length are ignored.
+        assert!(ack(2, 2, 4).is_empty());
+        assert!(ack(3, 9, 4).is_empty());
+        let other_length = Message::install_snapshot_progress(3, 1, t, 2, (4, 11));
+        assert!(node.step(other_length).unwrap().is_empty());
+        // Done: nothing more is sent, the follower is current, and the
+        // heartbeat after it carries entries again.
+        assert!(node
+            .step(Message::install_snapshot_reply(3, 1, t, true, 2))
+            .unwrap()
+            .is_empty());
+        node.propose(b"y".to_vec()).unwrap();
+        let after = (0..3).flat_map(|_| tick_for_3(&node)).collect::<Vec<_>>();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            (after[0].msg_type, after[0].last_log_index),
+            (MsgType::AppendEntries, 2)
+        );
+        assert_eq!(after[0].entries.len(), 1);
+    }
+
+    #[test]
+    fn a_new_snapshot_in_the_middle_of_a_transfer_restarts_it() {
+        let (node, t) = snapshotting_leader(4);
+        assert!(tick_for_3(&node).is_empty() && tick_for_3(&node).is_empty());
+        assert_eq!(chunk_data(&tick_for_3(&node)[0]).0, 0);
+        let r = node
+            .step(Message::install_snapshot_progress(3, 1, t, 2, (4, 10)))
+            .unwrap();
+        assert_eq!(chunk_data(&r[0]).0, 4);
+        // The leader commits one more entry and snapshots again.
+        node.propose(b"y".to_vec()).unwrap();
+        node.step(Message::append_entries_reply(2, 1, t, true, 3)).unwrap();
+        assert_eq!(node.tick().unwrap().committed.len(), 1);
+        node.compact(3, b"ABCDEFGHIJ".to_vec()).unwrap();
+        // The answer for the old one gets the first chunk of the new one.
+        let r = node
+            .step(Message::install_snapshot_progress(3, 1, t, 2, (8, 10)))
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].last_log_index, r[0].snap_offset, r[0].snap_total), (3, 0, 10));
+        assert_eq!(r[0].snapshot.as_ref().unwrap().data, b"ABCD");
+        // Its answers continue it.
+        let r = node
+            .step(Message::install_snapshot_progress(3, 1, t, 3, (4, 10)))
+            .unwrap();
+        assert_eq!((r[0].last_log_index, r[0].snap_offset), (3, 4));
+        assert_eq!(r[0].snapshot.as_ref().unwrap().data, b"EFGH");
+    }
+
+    #[test]
+    fn a_snapshot_goes_in_one_message_when_chunks_are_off_or_big_enough() {
+        for chunk in [0, 10, 11, usize::MAX] {
+            let (node, _) = snapshotting_leader(chunk);
+            assert!(tick_for_3(&node).is_empty() && tick_for_3(&node).is_empty());
+            let m = &tick_for_3(&node)[0];
+            assert_eq!(chunk_data(m), (0, 10, b"0123456789".to_vec()), "chunk {chunk}");
+        }
+        let (node, _) = snapshotting_leader(9);
+        assert!(tick_for_3(&node).is_empty() && tick_for_3(&node).is_empty());
+        assert_eq!(chunk_data(&tick_for_3(&node)[0]).2, b"012345678");
+    }
+
+    #[test]
+    fn snapshot_answers_confirm_reads_and_a_read_round_is_not_held_back() {
+        let (node, t) = snapshotting_leader(4);
+        assert!(tick_for_3(&node).is_empty() && tick_for_3(&node).is_empty());
+        assert_eq!(chunk_data(&tick_for_3(&node)[0]).0, 0);
+        let r = node
+            .step(Message::install_snapshot_progress(3, 1, t, 2, (4, 10)))
+            .unwrap();
+        assert_eq!(chunk_data(&r[0]).0, 4);
+        // A read asked now starts a round at once, to peer 3 as well, though
+        // it was just sent a chunk.
+        let id = node.read_index().unwrap();
+        let m = tick_for_3(&node);
+        assert_eq!(m.len(), 1);
+        assert_eq!((chunk_data(&m[0]).0, m[0].read_ctx), (4, 1));
+        // Its answer, partial as it is, shows the leader is still accepted.
+        let mut ack = Message::install_snapshot_progress(3, 1, t, 2, (8, 10));
+        ack.read_ctx = 1;
+        let r = node.step(ack).unwrap();
+        assert_eq!(chunk_data(&r[0]).0, 8);
+        let reads = node.tick().unwrap().reads;
+        assert_eq!(reads, vec![ReadState { id, index: Some(2) }]);
+    }
+
+    #[test]
+    fn a_leader_that_stops_leading_forgets_its_transfers() {
+        let (node, t) = snapshotting_leader(4);
+        assert!(tick_for_3(&node).is_empty() && tick_for_3(&node).is_empty());
+        assert_eq!(chunk_data(&tick_for_3(&node)[0]).0, 0);
+        // A leader of a later term takes over; this node follows it, and
+        // answers for its own transfer are not for it any more.
+        node.step(Message::append_entries(2, 1, t + 1, 0, 0, vec![], 0))
+            .unwrap();
+        assert_eq!(node.role(), NodeState::Follower);
+        assert!(node
+            .step(Message::install_snapshot_progress(3, 1, t + 1, 2, (4, 10)))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_lagging_follower_catches_up_through_a_snapshot_in_chunks() {
+        for chunk in [1, 3, 7, 20, 21] {
+            let mut net = Net::with_config(3, true, chunk);
+            net.run(60, &[]);
+            let leader = net.leaders(&[])[0];
+            let lag = (1..=3).find(|&i| i != leader).unwrap();
+            for i in 0..10u8 {
+                net.node(leader).propose(vec![i]).unwrap();
+            }
+            net.run(20, &[lag]);
+            let applied = net.applied[(leader - 1) as usize].len() as Index;
+            assert!(applied >= 10 && net.node(lag).commit_index() < applied);
+            let state = b"the state of the machine";
+            net.node(leader).compact(applied, state.to_vec()).unwrap();
+            net.run(30, &[]);
+            let got = &net.snapshots[(lag - 1) as usize];
+            assert_eq!(got.len(), 1, "chunk {chunk}");
+            assert_eq!(got[0].data, state);
+            assert_eq!(got[0].index, applied);
+            assert_eq!(net.node(lag).snapshot_index(), applied);
+            assert_eq!(net.node(lag).commit_index(), applied);
+            // It keeps replicating normally from there.
+            net.node(leader).propose(b"after".to_vec()).unwrap();
+            net.run(20, &[]);
+            assert_eq!(net.node(lag).log_snapshot().1, net.node(leader).log_snapshot().1);
+        }
     }
 
     /// Ticks `node` until it asks for pre-votes; returns those messages.

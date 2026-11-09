@@ -63,7 +63,7 @@ commands:
       how long to wait for an election, a write to be applied or the nodes to
       catch up (default 10000)
   serve --id N --dir DIR --raft ADDR --client ADDR [--voters 1,2,3] [--peer ID=ADDR]...
-        [--snapshot-every N] [--timeout-ms N]
+        [--snapshot-every N] [--snapshot-chunk BYTES] [--timeout-ms N]
       run one node of a replicated tsvdb cluster, in this process, until a
       client sends SHUTDOWN. Raft listens on --raft and the client protocol
       on --client (port 0 lets the system pick; the first line printed says
@@ -72,8 +72,10 @@ commands:
       node that has a log goes by that. --peer says where another node's Raft
       listens (more can be told later: client peer). The addresses a node is
       told are saved in DIR/peers, so after a restart it finds the others
-      again; only a node that moved has to be told. Writes and consistent
-      queries wait up to --timeout-ms for the node (default 5000)
+      again; only a node that moved has to be told. A snapshot is sent to a
+      node that needs one in chunks of at most --snapshot-chunk bytes
+      (default 1048576; 0: in one message). Writes and consistent queries
+      wait up to --timeout-ms for the node (default 5000)
   client --nodes ADDR,ADDR,... <command> [--timeout-ms N] [--patience-ms N]
       talk to a cluster through the client addresses of its nodes. Commands:
         status                 every node: role, term, leader, voters, log positions
@@ -640,6 +642,7 @@ fn serve_node(a: &Args, announce: &dyn Fn(String)) -> Res<String> {
         "voters",
         "peer",
         "snapshot-every",
+        "snapshot-chunk",
         "timeout-ms",
     ])?;
     let id = node_id("--id", a.req("id")?)?;
@@ -663,6 +666,7 @@ fn serve_node(a: &Args, announce: &dyn Fn(String)) -> Res<String> {
             snapshot_every: a.num("snapshot-every", defaults.raft.snapshot_every)?,
             ..defaults.raft
         },
+        snapshot_chunk: a.num("snapshot-chunk", defaults.snapshot_chunk)?,
         ..defaults
     };
     let timeout = Duration::from_millis(a.num("timeout-ms", 5_000)?);
@@ -1197,7 +1201,7 @@ mod tests {
         let d = tmp("serve-run");
         let words: Vec<String> = format!(
             "serve --id 1 --dir {} --raft 127.0.0.1:0 --client 127.0.0.1:0 --voters 1 \
-             --peer 2=127.0.0.1:9 --snapshot-every 5 --timeout-ms 3000",
+             --peer 2=127.0.0.1:9 --snapshot-every 5 --snapshot-chunk 64 --timeout-ms 3000",
             d.join("n").display()
         )
         .split_whitespace()
@@ -1257,6 +1261,7 @@ mod tests {
             ("--peer z=127.0.0.1:1", "--peer: invalid node id \"z\""),
             ("--peer 2=nope", "--peer: bad address \"nope\""),
             ("--snapshot-every z", "--snapshot-every: invalid number \"z\""),
+            ("--snapshot-chunk z", "--snapshot-chunk: invalid number \"z\""),
             ("--timeout-ms z", "--timeout-ms: invalid number \"z\""),
             // a node that is not among the voters it is asked to start
             ("--voters 2,3", "raft: node not in peer set"),

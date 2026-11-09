@@ -25,8 +25,10 @@
 //! **Snapshots are dumps.** To compact the Raft log the node dumps the whole
 //! database as compressed line protocol ([`tsvdb::Db::dump`]); a node that
 //! is too far behind, or new, is restored from it. A snapshot is held in
-//! memory and travels in one message, so `snapshot_every` should be large
-//! for a large database; 0 never compacts, and the log grows.
+//! memory, on the node that sends it and on the one that receives it, and
+//! travels in chunks of [`ClusterOptions::snapshot_chunk`] bytes, so
+//! `snapshot_every` should be large for a large database; 0 never compacts,
+//! and the log grows.
 //!
 //! **Addresses are remembered.** Where the other nodes listen is kept in the
 //! `peers` file of the node's directory, so that a restarted node finds the
@@ -117,6 +119,9 @@ pub struct ClusterOptions {
     pub election_timeout: (u64, u64),
     /// Heartbeat interval, in ticks.
     pub heartbeat: u64,
+    /// The most bytes of a snapshot sent in one message (0: all of it).
+    /// `raft.net.max_frame` must cover a chunk.
+    pub snapshot_chunk: usize,
     pub db: DbOptions,
 }
 
@@ -129,6 +134,7 @@ impl Default for ClusterOptions {
             },
             election_timeout: (10, 20),
             heartbeat: 3,
+            snapshot_chunk: raft::node::SNAPSHOT_CHUNK,
             db: DbOptions::default(),
         }
     }
@@ -366,6 +372,7 @@ impl ReplicatedDb {
             election_timeout_min: opts.election_timeout.0,
             election_timeout_max: opts.election_timeout.1,
             heartbeat_interval: opts.heartbeat,
+            snapshot_chunk: opts.snapshot_chunk,
             ..base
         };
         let node = Node::new(cfg, storage)?;
@@ -537,6 +544,7 @@ mod tests {
             },
             election_timeout: (50, 100),
             heartbeat: 3,
+            snapshot_chunk: raft::node::SNAPSHOT_CHUNK,
             db,
         }
     }
@@ -736,7 +744,18 @@ mod tests {
 
     #[test]
     fn a_new_node_is_brought_up_from_a_snapshot() {
-        let c = Cluster::start("snapshot", 3, 1, fast(3));
+        // In chunks of a few bytes, and in one piece.
+        for (name, chunk) in [("snapshot-chunks", 16), ("snapshot-whole", 0)] {
+            brought_up_from_a_snapshot(name, chunk);
+        }
+    }
+
+    fn brought_up_from_a_snapshot(name: &str, snapshot_chunk: usize) {
+        let opts = ClusterOptions {
+            snapshot_chunk,
+            ..fast(3)
+        };
+        let c = Cluster::start(name, 3, 1, opts);
         for t in 1..=12 {
             c.write(&format!("cpu,host=a usage={t} {t}\n"));
         }

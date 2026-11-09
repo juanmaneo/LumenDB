@@ -9,13 +9,15 @@
 //! ```text
 //! version u8 | type u8 | flags u8 (1: vote granted, 2: success)
 //! from, to, term, last log index, last log term, commit index,
-//! match index, leader last index, read context, Lamport clock: u64 each
+//! match index, leader last index, read context, snapshot offset,
+//! snapshot total, Lamport clock: u64 each
 //! entry count (varint), then per entry: index u64, term u64, kind u8, data (len-prefixed)
 //! snapshot flag u8, then if 1: index u64, term u64, voters (len-prefixed), data (len-prefixed)
 //! ```
 //!
-//! A snapshot travels in one message, so frames can be as large as a
-//! snapshot; [`read_frame`] takes the largest size it accepts.
+//! A snapshot travels in chunks (see [`Message::install_snapshot_chunk`]), so
+//! a frame is as large as a chunk, unless a node is set not to chunk;
+//! [`read_frame`] takes the largest size it accepts.
 
 use crate::error::{Error, Result};
 use crate::log::{decode_voters, encode_voters, EntryKind, LogEntry};
@@ -28,7 +30,7 @@ use flashkv::varint::{put_len_prefixed, put_uvarint64};
 use std::io::{self, Read};
 use std::sync::Arc;
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// A frame size no sane cluster exceeds: 1 GiB.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -77,6 +79,8 @@ pub fn encode(m: &Message) -> Vec<u8> {
         m.match_index,
         m.leader_last_index,
         m.read_ctx,
+        m.snap_offset,
+        m.snap_total,
         m.lc,
     ] {
         p.extend_from_slice(&v.to_le_bytes());
@@ -113,9 +117,9 @@ pub fn decode(payload: &[u8]) -> Result<Message> {
     if flags & !(VOTE_GRANTED | SUCCESS) != 0 {
         return Err(bad("unknown flags"));
     }
-    let mut fields = [0u64; 10];
+    let mut fields = [0u64; 12];
     fields.iter_mut().for_each(|f| *f = d.u64());
-    let [from, to, term, last_log_index, last_log_term, commit_index, match_index, leader_last_index, read_ctx, lc] =
+    let [from, to, term, last_log_index, last_log_term, commit_index, match_index, leader_last_index, read_ctx, snap_offset, snap_total, lc] =
         fields;
     // Every entry takes at least 18 bytes: a corrupt count cannot spin.
     let count = d.varint().min(d.remaining() as u64);
@@ -171,6 +175,8 @@ pub fn decode(payload: &[u8]) -> Result<Message> {
         leader_last_index,
         read_ctx,
         snapshot,
+        snap_offset,
+        snap_total,
         lc,
     })
 }
@@ -238,6 +244,14 @@ mod tests {
         reply.read_ctx = 77;
         let mut empty_voters = Message::install_snapshot(1, 2, 4, Arc::new(Snapshot::default()), 0);
         empty_voters.lc = 5;
+        let whole = Arc::new(Snapshot {
+            index: 9,
+            term: 3,
+            voters: vec![1, 2, 5],
+            data: b"state of it".to_vec(),
+        });
+        let chunk = Message::install_snapshot_chunk(1, 2, 4, &whole, (3, 8), 9);
+        let progress = Message::install_snapshot_progress(2, 1, 4, 9, (8, 11));
         vec![
             Message::request_vote(1, 2, 5, 10, 4),
             Message::request_vote_reply(2, 1, 5, true),
@@ -250,6 +264,8 @@ mod tests {
             snap,
             Message::install_snapshot_reply(2, 1, 4, true, 9),
             empty_voters,
+            chunk,
+            progress,
         ]
     }
 
@@ -298,12 +314,13 @@ mod tests {
             p[at] = v;
             decode(&p)
         };
-        assert_eq!(with(0, 2), Err(Error::BadMessage("unknown version")));
+        assert_eq!(with(0, VERSION + 1), Err(Error::BadMessage("unknown version")));
+        assert_eq!(with(0, 1), Err(Error::BadMessage("unknown version")), "the old format");
         assert_eq!(with(1, 8), Err(Error::BadMessage("unknown message type")));
         assert_eq!(with(2, 4), Err(Error::BadMessage("unknown flags")));
         // The first entry's kind byte follows the header, the entry count
         // (1 byte) and the entry's index and term.
-        let kind = 3 + 10 * 8 + 1 + 16;
+        let kind = 3 + 12 * 8 + 1 + 16;
         assert_eq!(good[kind], 0);
         assert_eq!(with(kind, 2), Err(Error::BadMessage("unknown entry kind")));
         // The snapshot flag is the last byte of a message without one.
@@ -318,7 +335,7 @@ mod tests {
         assert_eq!(decode(&p), Err(Error::BadMessage("snapshot voters")));
         // A count that promises more entries than there are bytes.
         let mut p = payload(&Message::request_vote(1, 2, 3, 4, 5));
-        p[3 + 10 * 8] = 0x7f;
+        p[3 + 12 * 8] = 0x7f;
         assert!(decode(&p).is_err());
     }
 

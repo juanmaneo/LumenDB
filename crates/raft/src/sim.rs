@@ -17,8 +17,10 @@
 //!   asked, includes everything committed when it was asked;
 //! - snapshots: every replica has a state machine (a hash of the entries it
 //!   applied) that it snapshots, compacting its log, and restores from the
-//!   snapshot after a restart or when a leader sends one. No two replicas
-//!   may ever have different state at the same index;
+//!   snapshot after a restart or when a leader sends one, in chunks of a
+//!   few bytes (or whole, depending on the leader) over a network that
+//!   drops, repeats and reorders them. No two replicas may ever have
+//!   different state at the same index;
 //! - membership: an operator keeps changing the cluster through whichever
 //!   replica leads (add a learner, promote it, remove a voter, drop a
 //!   learner), while replicas crash and partitions come and go. Committed
@@ -651,9 +653,13 @@ impl Sim {
             true => Config::cluster(id, self.initial.clone()),
             false => Config::joiner(id),
         };
+        let seed = self.rng.next();
         let cfg = Config {
-            seed: self.rng.next(),
+            seed,
             pre_vote: self.rng.next() & 1 == 0,
+            // The state machine's snapshot is a few bytes: chunks of 3 or 5
+            // make it travel in pieces, 0 in one, and replicas differ.
+            snapshot_chunk: [0, 3, 5][(seed >> 33) as usize % 3],
             ..base
         };
         let node = Node::new(cfg, storage).expect("a configured node, and FileStorage::load cannot fail");

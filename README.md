@@ -142,9 +142,15 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   so it decides when to snapshot: `Node::compact(index, data)` stores the
   serialized state machine as of an applied index, durably, and drops the log
   up to there. A leader whose follower needs entries it has dropped sends
-  the snapshot instead (`InstallSnapshot`, in one message, so a transport
-  must handle messages as large as a snapshot). The follower stores it, and
-  `tick()` hands it over as `TickOutcome::snapshot` to restore the state
+  the snapshot instead (`InstallSnapshot`), in chunks of at most
+  `snapshot_chunk` bytes (1 MiB by default, 0 for one message), one in flight
+  per follower. The follower answers each chunk with how many bytes it holds
+  and the leader goes on from there, so a chunk that is lost, repeated or out
+  of order, a follower that restarted, and a leader that took a newer
+  snapshot all cost a resend and nothing else; a chunk nobody answered is
+  sent again after a heartbeat. The follower collects the chunks in memory
+  and stores the snapshot once it has all of them, and `tick()` hands it over
+  as `TickOutcome::snapshot` to restore the state
   machine from, before any entries after it. After a restart the first tick
   does the same with the stored snapshot. On disk the snapshot is its own
   file, named by index and written and synced before the state file points
@@ -201,7 +207,11 @@ time-series database. LumenDB is written entirely in Rust and depends only on
   lacks committed entry`, and a leader that confirms reads one acknowledgement
   early fails within the first few seeds with `stale read`; a snapshot that
   never reaches the state machine, or a restart that skips the stored one,
-  fails on seed 0 with `applied entry ... not as committed`. For membership,
+  fails on seed 0 with `applied entry ... not as committed`. A chunk that is
+  accepted twice corrupts the snapshot (seed 0: `got a snapshot with 9 bytes
+  of state`), chunks matched to the wrong transfer fail within five seeds
+  with a state mismatch, and a leader that never repeats a lost chunk leaves
+  no convergence. For membership,
   allowing several changes at once fails with `leader ... lacks committed
   entry`, a change of two servers fails on seed 0, a log that keeps
   configuration entries it truncated fails within a few dozen seeds, and a leader that never steps down after
@@ -224,8 +234,8 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 - **Not implemented**: leadership transfer (a leader that removes itself is
   replaced after an election timeout), a leader that steps down on losing its
   quorum (it keeps leading until it hears a higher term, but cannot commit or
-  confirm reads), chunked snapshot transfer, pipelined replication, and
-  authentication or encryption on the wire.
+  confirm reads), pipelined replication (one append, and one snapshot chunk,
+  is in flight per follower), and authentication or encryption on the wire.
 - **SWIM** membership: round-robin probes, indirect `PingReq` probes,
   suspicion, death, incarnation-based refutation, and piggybacked gossip.
 - **Lamport clocks** stamp every message. Ordering never depends on wall
@@ -305,7 +315,8 @@ linearizable read on the leader (`query` reads the local copy, which may lag).
   follow the log.
 - **Snapshots are dumps.** `Node::compact` stores a compressed dump of the
   database (`tsvdb::Db::dump`), and a node that is new or far behind is
-  restored from it. A snapshot lives in memory and travels in one message, so
+  restored from it. A snapshot lives in memory, on the node that sends it and
+  on the one that receives it, and travels in chunks (`--snapshot-chunk`), so
   raise `snapshot_every` for a large database (0 never compacts).
 - **Adding a server**: start it with no voters, `add_learner` it on the leader,
   and `add_voter` it once it has caught up (from the snapshot). Addresses are
