@@ -32,6 +32,10 @@
 //! leader by at most the entries not yet applied. [`ReplicatedDb::query_consistent`]
 //! is linearizable and served by the leader.
 
+pub mod client;
+
+pub use client::{Client, ClientServer, ClusterClient, Code, Reply, Request};
+
 use parking_lot::Mutex;
 use raft::{
     Config, FileStorage, Index, LogEntry, Node, NodeId, Server, ServerOptions, Snapshot, StateMachine, Transport,

@@ -1,6 +1,9 @@
 //! Runs the real `bench` binary end to end (covers `main.rs`).
 
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn bench(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_bench")).args(args).output().unwrap()
@@ -36,5 +39,192 @@ fn generates_and_ingests_a_capture() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("parsed 1000 packets"));
     let out = bench(&["query", "--db", db, "--agg", "count"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains(" rows"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A `bench serve` process. Killed when dropped, so that a failing test
+/// leaves nothing behind.
+struct Node {
+    id: u64,
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+    raft: String,
+    client: String,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Starts node `id` with the ports picked by the system, and reads where it
+/// listens from its first line.
+fn spawn(dir: &Path, id: u64, extra: &[&str]) -> Node {
+    let data = dir.join(id.to_string());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bench"))
+        .args(["serve", "--id", &id.to_string(), "--dir", data.to_str().unwrap()])
+        .args([
+            "--raft",
+            "127.0.0.1:0",
+            "--client",
+            "127.0.0.1:0",
+            "--timeout-ms",
+            "5000",
+        ])
+        .args(extra)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let prefix = format!("node {id} listening: raft ");
+    let rest = line.trim().strip_prefix(&prefix).expect("the startup line");
+    let (raft, client) = rest.split_once(", client ").expect("two addresses");
+    let (raft, client) = (raft.to_string(), client.to_string());
+    Node {
+        id,
+        child,
+        stdout,
+        raft,
+        client,
+    }
+}
+
+/// `bench client --nodes NODES REST...`: the output, and whether it succeeded.
+fn client(nodes: &str, rest: &[&str]) -> (bool, String) {
+    let mut args = vec!["client", "--nodes", nodes];
+    args.extend(rest);
+    let out = bench(&args);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    (out.status.success(), text + &String::from_utf8_lossy(&out.stderr))
+}
+
+/// Like `client`, for a command that must succeed.
+fn client_ok(nodes: &str, rest: &[&str]) -> String {
+    let (ok, text) = client(nodes, rest);
+    assert!(ok, "bench client {rest:?} failed: {text}");
+    text
+}
+
+fn addrs(nodes: &[Node]) -> String {
+    let all: Vec<&str> = nodes.iter().map(|n| n.client.as_str()).collect();
+    all.join(",")
+}
+
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn processes_form_a_cluster_that_replicates_fails_over_and_grows() {
+    let dir = std::env::temp_dir().join(format!("bench-processes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |name: &str, text: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let first = file("first.lp", "cpu,host=a usage=1 10\ncpu,host=a usage=3 20\n");
+    let second = file("second.lp", "cpu,host=a usage=5 30\n");
+    let sum = ["query", "--measurement", "cpu", "--field", "usage", "--agg", "sum"];
+    let sum_is = |n: u32| format!("cpu,host=a\t{}\t{n}\n1 rows\n", i64::MIN);
+
+    // Three nodes start a cluster. They learn each other's Raft addresses
+    // afterwards, so that no port has to be picked before they start.
+    let mut nodes: Vec<Node> = (1..=3).map(|id| spawn(&dir, id, &["--voters", "1,2,3"])).collect();
+    let all = addrs(&nodes);
+    for n in &nodes {
+        client_ok(&all, &["peer", &n.id.to_string(), &n.raft]);
+    }
+    assert_eq!(client_ok(&all, &["write", &first]), "wrote 2 points\n");
+    assert_eq!(client_ok(&all, &sum), sum_is(4));
+    // Every node ends up with the data.
+    for n in &nodes {
+        eventually("a node to have the write", || {
+            let mut args = sum.to_vec();
+            args.extend(["--local", "1"]);
+            client(&n.client, &args) == (true, sum_is(4))
+        });
+    }
+    let status = client_ok(&all, &["status"]);
+    assert_eq!(status.lines().count(), 3, "{status}");
+    assert_eq!(status.matches(" role=leader ").count(), 1, "{status}");
+
+    // Kill the leader without any goodbye. The others elect a new one, and
+    // the client goes around the node that is gone.
+    let line = status.lines().find(|l| l.contains(" role=leader ")).unwrap();
+    let leader_id: u64 = line
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("id="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let at = nodes.iter().position(|n| n.id == leader_id).unwrap();
+    nodes[at].child.kill().unwrap();
+    nodes[at].child.wait().unwrap();
+    assert_eq!(client_ok(&all, &["write", &second]), "wrote 1 points\n");
+    assert_eq!(client_ok(&all, &sum), sum_is(9));
+    let status = client_ok(&all, &["status"]);
+    assert_eq!(status.matches("unreachable").count(), 1, "{status}");
+    assert_eq!(status.matches(" role=leader ").count(), 1, "{status}");
+
+    // It comes back from its files, on another port; the others are told.
+    let peers: Vec<String> = (nodes.iter().filter(|n| n.id != leader_id))
+        .map(|n| format!("{}={}", n.id, n.raft))
+        .collect();
+    let mut extra = vec!["--voters", "1,2,3"];
+    for p in &peers {
+        extra.extend(["--peer", p.as_str()]);
+    }
+    nodes[at] = spawn(&dir, leader_id, &extra);
+    let all = addrs(&nodes);
+    client_ok(&all, &["peer", &leader_id.to_string(), &nodes[at].raft]);
+    eventually("the restarted node to catch up", || {
+        let mut args = sum.to_vec();
+        args.extend(["--local", "1"]);
+        client(&nodes[at].client, &args) == (true, sum_is(9))
+    });
+
+    // A fourth node joins: first as a learner, a voter once it has caught up.
+    let peers: Vec<String> = nodes.iter().map(|n| format!("{}={}", n.id, n.raft)).collect();
+    let mut extra = Vec::new();
+    for p in &peers {
+        extra.extend(["--peer", p.as_str()]);
+    }
+    nodes.push(spawn(&dir, 4, &extra));
+    let all = addrs(&nodes);
+    client_ok(&all, &["peer", "4", &nodes[3].raft]);
+    assert_eq!(client_ok(&all, &["add-learner", "4"]), "added\n");
+    eventually("the learner to be made a voter", || client(&all, &["add-voter", "4"]).0);
+    eventually("every node to list four voters", || {
+        let status = client_ok(&all, &["status"]);
+        status.matches(" voters=1,2,3,4 ").count() == 4
+    });
+    eventually("the new voter to have the data", || {
+        let mut args = sum.to_vec();
+        args.extend(["--local", "1"]);
+        client(&nodes[3].client, &args) == (true, sum_is(9))
+    });
+
+    // Stopping every node ends the processes.
+    let stopped = client_ok(&all, &["shutdown"]);
+    assert_eq!(stopped.matches(": stopping").count(), 4, "{stopped}");
+    for n in &mut nodes {
+        assert!(n.child.wait().unwrap().success());
+        let mut rest = String::new();
+        n.stdout.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, format!("node {} stopped\n", n.id));
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

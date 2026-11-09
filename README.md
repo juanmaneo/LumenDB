@@ -14,7 +14,7 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 | [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
 | [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli |
 | [`cluster`](crates/cluster) | tsvdb replicated by raft: writes through the leader, every node holds a copy | TigerBeetle, CockroachDB |
-| [`bench`](crates/bench) | command line: generate, ingest, query, benchmark | — |
+| [`bench`](crates/bench) | command line: generate, ingest, query, benchmark, run a cluster node (`serve`) and talk to a cluster (`client`) | — |
 | [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `bench` | cargo-xtask |
 | [`proofs`](proofs) | kani model-checking harnesses | — |
 
@@ -310,7 +310,31 @@ linearizable read on the leader (`query` reads the local copy, which may lag).
 - **Adding a server**: start it with no voters, `add_learner` it on the leader,
   and `add_voter` it once it has caught up (from the snapshot). Addresses are
   static: every node is told where every other node lives, the ones that are
-  not in the cluster yet included.
+  not in the cluster yet included. A node keeps no addresses on disk, so a
+  restarted node is told again, and so are the others if it moved.
+- **Processes and clients** (`cluster::client`, `bench serve`, `bench client`).
+  `serve` runs one node until a client sends `SHUTDOWN`: Raft on one port and
+  a client protocol on another.
+
+  ```text
+   bench client --nodes A,B,C           node A          node B (leader)      node C
+   write / query / add-voter ...        client port     client port          client port
+        |                                   |                |                   |
+        |-- WRITE ------------------------->| ERR notleader B                    |
+        |-- WRITE -------------------------------------------> OK 2             |
+        |                                   |<---- Raft port <-----> Raft port ->|
+  ```
+
+  The protocol is one request per line over TCP (`WRITE`, `QUERY`, `STATUS`,
+  `PEER`, the four membership changes, `SHUTDOWN`; replies `OK`, `ROWS` or
+  `ERR <code>`), documented in `cluster::client`. A node that is not the
+  leader answers `ERR notleader <id>`; `ClusterClient` tries the nodes it
+  knows until one is. It retries only what cannot have been applied: a node
+  that is down, `notleader` and `notready`. A write that fails with a timeout
+  or a lost connection may or may not have been applied, and the client does
+  not guess. The test suite starts real `bench serve` processes, writes
+  through them, kills the leader with no warning, restarts it, adds a fourth
+  node and stops them all.
 
 ## Usage
 
@@ -330,6 +354,36 @@ $B kv-bench --db /tmp/kv --ops 1000000 --sync 0                   # flashkv thro
 $B parse-bench /tmp/cap.pcapng --runs 5 --min-mpps 5              # pcapfast throughput
 $B cluster-demo --packets 1000000 --flows 5000                    # 3 replicated nodes, then a failover
 $B vopr --seeds 200                                               # Raft simulation: faults and membership
+```
+
+A cluster of three processes, here on one machine (the nodes could be on
+three). `--client` is where a node answers clients, `--raft` where the nodes
+talk to each other:
+
+```sh
+P="--peer 1=127.0.0.1:7001 --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003"
+$B serve --id 1 --dir /tmp/n1 --raft 127.0.0.1:7001 --client 127.0.0.1:8001 --voters 1,2,3 $P &
+$B serve --id 2 --dir /tmp/n2 --raft 127.0.0.1:7002 --client 127.0.0.1:8002 --voters 1,2,3 $P &
+$B serve --id 3 --dir /tmp/n3 --raft 127.0.0.1:7003 --client 127.0.0.1:8003 --voters 1,2,3 $P &
+
+NODES=127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
+c() { $B client --nodes "$NODES" "$@"; }
+c write /tmp/m.lp                                      # through the leader, wherever it is
+c query --measurement cpu --field usage --agg mean     # linearizable, on the leader
+c query --measurement cpu --field usage --local 1      # the first node's own copy
+c status                                               # role, term, leader, voters, log positions
+kill -9 %1                                             # lose node 1 (if it led, the others elect a new leader)
+c write /tmp/m.lp                                      # still works: the client goes around node 1
+c status                                               # node 1 is shown as unreachable
+
+# A new node has no --voters. The others are told where it listens, then it
+# is added as a learner (it catches up from the log or a snapshot), then as a voter.
+$B serve --id 4 --dir /tmp/n4 --raft 127.0.0.1:7004 --client 127.0.0.1:8004 $P &
+NODES=127.0.0.1:8002,127.0.0.1:8003,127.0.0.1:8004
+c peer 4 127.0.0.1:7004
+c add-learner 4
+c add-voter 4                                          # refused until it has caught up: retry
+c shutdown                                             # stop the nodes in $NODES
 ```
 
 Every storage-backed command accepts `--sync 0|1`, `--background 0|1` and
