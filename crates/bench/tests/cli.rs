@@ -167,6 +167,8 @@ fn processes_form_a_cluster_that_replicates_fails_over_and_grows() {
     let status = client_ok(&all, &["status"]);
     assert_eq!(status.lines().count(), 3, "{status}");
     assert_eq!(status.matches(" role=leader ").count(), 1, "{status}");
+    let pong = client_ok(&all, &["ping"]);
+    assert_eq!(pong.matches(": PONG\n").count(), 3, "{pong}");
 
     // Leadership is handed to another node on request, and the cluster goes
     // on with it.
@@ -188,6 +190,13 @@ fn processes_form_a_cluster_that_replicates_fails_over_and_grows() {
     let status = client_ok(&all, &["status"]);
     assert_eq!(status.matches("unreachable").count(), 1, "{status}");
     assert_eq!(status.matches(" role=leader ").count(), 1, "{status}");
+    // A health check fails while a node is down, and says which.
+    let (ok, text) = client(&all, &["ping"]);
+    assert!(!ok && text.contains("1 of 3 nodes failed:"), "{text}");
+    assert_eq!(
+        (text.matches("unreachable").count(), text.matches(": PONG").count()),
+        (1, 2)
+    );
 
     // It comes back from its files, on another port. It is not told where
     // the others are (it saved that); the others are told where it is.

@@ -398,6 +398,7 @@ c write /tmp/m.lp                                      # through the leader, whe
 c query --measurement cpu --field usage --agg mean     # linearizable, on the leader
 c query --measurement cpu --field usage --local 1      # the first node's own copy
 c status                                               # role, term, leader, voters, log positions
+c ping                                                 # every node answers PONG (fails if one does not)
 kill -9 %1                                             # lose node 1 (if it led, the others elect a new leader)
 c write /tmp/m.lp                                      # still works: the client goes around node 1
 c status                                               # node 1 is shown as unreachable

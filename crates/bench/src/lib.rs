@@ -79,6 +79,8 @@ commands:
   client --nodes ADDR,ADDR,... <command> [--timeout-ms N] [--patience-ms N]
       talk to a cluster through the client addresses of its nodes. Commands:
         status                 every node: role, term, leader, voters, log positions
+        ping                   every node: PONG, or why not; fails if any node
+                               did not answer (a health check)
         write FILE             write line protocol through the leader
         query [query flags]    like `query`, on the leader (linearizable), or
                                on the first node that answers with --local 1
@@ -756,6 +758,7 @@ fn client(a: &Args) -> Res<String> {
     // The request, and for one that goes to every node: whether it is strict.
     let (req, every) = match command {
         "status" => (Request::Status, Some(false)),
+        "ping" => (Request::Ping, Some(true)),
         "shutdown" => (Request::Shutdown, Some(true)),
         "peer" => {
             let id = node_id("peer", a.pos(2, "node id")?)?;
@@ -1122,6 +1125,7 @@ mod tests {
         assert_eq!(c(&format!("write {}", lp.display())).unwrap(), "wrote 3 points\n");
         let status = c("status").unwrap();
         assert!(status.starts_with(&format!("{node}: id=1 role=leader ")), "{status}");
+        assert_eq!(c("ping").unwrap(), format!("{node}: PONG\n"));
 
         let min = i64::MIN;
         let sums = "--measurement cpu --field usage --agg sum";
@@ -1167,7 +1171,6 @@ mod tests {
         for (args, want) in [
             ("--x 1 status", "unknown flag --x"),
             ("frobnicate", "unknown client command \"frobnicate\""),
-            ("ping", "unknown client command \"ping\""),
             ("", "missing client command"),
             ("peer", "missing node id"),
             ("peer x 127.0.0.1:1", "peer: invalid node id \"x\""),
@@ -1203,6 +1206,12 @@ mod tests {
         assert!(e.starts_with("1 of 2 nodes failed:\n"), "{e}");
         assert!(e.contains(&format!("{dead}: unreachable: ")), "{e}");
         assert!(e.contains(&format!("{node}: ok")), "{e}");
+        // `ping` is a health check: it fails too, and says which node did not
+        // answer and which did.
+        let e = err(&format!("{mixed} ping"));
+        assert!(e.starts_with("1 of 2 nodes failed:\n"), "{e}");
+        assert!(e.contains(&format!("{dead}: unreachable: ")), "{e}");
+        assert!(e.contains(&format!("{node}: PONG")), "{e}");
         let e = err(&format!("client --nodes {dead} --patience-ms 50 query"));
         assert!(e.contains("refused"), "{e}");
 
