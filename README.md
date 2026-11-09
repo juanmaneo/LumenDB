@@ -492,7 +492,11 @@ even for a one-entry log and a one-entry batch.
 
 1. `cargo xtask dev-check`: fmt, clippy `-D warnings`, tests and the 100%
    line and region coverage gate.
-2. `cargo xtask kani`: the proofs.
+2. `cargo xtask kani`: the proofs. Kani is pinned to one version
+   (`KANI_VERSION` in the workflow). [`install-kani.sh`](.github/scripts/install-kani.sh)
+   downloads its release bundle with retries and the workflow caches it, because
+   `cargo kani setup` does one download with no retry, so a single GitHub 5xx
+   would fail the job.
 3. `cargo build --release --workspace`.
 
 ## Authorship

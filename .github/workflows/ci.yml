@@ -25,14 +25,20 @@ jobs:
   kani:
     name: kani proofs
     runs-on: ubuntu-latest
+    env:
+      # Pinned: bump it on purpose, after running `cargo xtask kani` locally.
+      KANI_VERSION: 0.68.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install kani
-        run: |
-          cargo install --locked kani-verifier
-          cargo kani setup
+      - name: Cache the kani release bundle
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kani
+          key: kani-bundle-${{ runner.os }}-${{ env.KANI_VERSION }}
+      - name: Install kani (the download is retried)
+        run: sh .github/scripts/install-kani.sh
       - name: cargo xtask kani
         run: cargo xtask kani
 
