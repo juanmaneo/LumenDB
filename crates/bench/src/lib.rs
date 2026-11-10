@@ -39,7 +39,7 @@ commands:
       write InfluxDB line protocol
   query --db DIR [--measurement M] [--field F] [--where tag=value]... [--start TIME]
         [--end TIME] [--agg sum|count|min|max|mean|first|last] [--every DURATION]
-        [--align calendar|start] [--fill prev|linear|NUMBER] [--top N]
+        [--align calendar|start] [--fill prev|linear|NUMBER] [--latest 0|1] [--top N]
       query tsvdb (default: raw `flows` bytes). A TIME is an integer (ns since
       1970), `now`, `now-1h` or `now+30s`, or a UTC date: 2024-05-01,
       2024-05-01T12:30:00Z, 2024-05-01T12:30:00.5+02:00. A DURATION is an
@@ -51,7 +51,10 @@ commands:
       with the value of the window before (prev), a line between the windows
       around it (linear) or a constant. It needs --agg and --every, and
       covers --start to --end if both are given (else the data's range); a
-      window the fill has nothing for (prev or linear at an end) stays out
+      window the fill has nothing for (prev or linear at an end) stays out.
+      --latest 1 gives only the newest point of each series in the range,
+      with its own timestamp (no --agg, no --every); with --top N, the N
+      series with the largest latest values
   kv-bench --db DIR [--ops N] [--value-size N] [--batch N]
       flashkv write / point-read / scan throughput
   parse-bench <capture> [--threads N] [--runs N] [--min-mpps X]
@@ -126,7 +129,7 @@ storage options (ingest, write, query, kv-bench):
 const STORAGE_FLAGS: [&str; 4] = ["db", "sync", "background", "fail-after"];
 
 /// The flags that describe a query (`query` and `client query`).
-const QUERY_FLAGS: [&str; 10] = [
+const QUERY_FLAGS: [&str; 11] = [
     "measurement",
     "field",
     "where",
@@ -136,6 +139,7 @@ const QUERY_FLAGS: [&str; 10] = [
     "every",
     "align",
     "fill",
+    "latest",
     "top",
 ];
 
@@ -359,6 +363,7 @@ fn query_args(a: &Args) -> Res<(Query, Option<usize>)> {
         .get("fill")
         .map(|s| Fill::parse(s).ok_or(format!("unknown fill {s:?}")))
         .transpose()?;
+    q.latest = a.num::<u64>("latest", 0)? != 0;
     Ok((q, a.opt::<usize>("top")?))
 }
 
@@ -909,6 +914,7 @@ mod tests {
         assert_eq!(err("query --db x --every -1"), "--every: invalid duration \"-1\"");
         assert_eq!(err("query --db x --align never"), "unknown alignment \"never\"");
         assert_eq!(err("query --db x --fill nan"), "unknown fill \"nan\"");
+        assert_eq!(err("query --db x --latest soon"), "--latest: invalid number \"soon\"");
         assert_eq!(err("query --db x --sync maybe"), "--sync: invalid number \"maybe\"");
         assert_eq!(
             err("query --db x --background maybe"),
@@ -988,6 +994,16 @@ mod tests {
             let out = cmd(&format!("query --db {db} --measurement traffic --field packets --agg sum --start 1970-01-01 --end now+1d --every 1d --fill 0")).unwrap();
             let rows = out.lines().count();
             assert!(out.contains("2000") && rows > 20_000, "{rows} rows");
+            // The newest point of each series, with its own timestamp; the top 2 of them.
+            let out = cmd(&format!("query --db {db} --latest 1")).unwrap();
+            assert!(out.lines().count() > 2, "{out}");
+            assert!(
+                out.lines().all(|l| l.ends_with(" rows") || l.split('\t').count() == 3),
+                "{out}"
+            );
+            let out = cmd(&format!("query --db {db} --latest 1 --top 2")).unwrap();
+            assert!(out.ends_with("2 rows\n"), "{out}");
+            assert!(cmd(&format!("query --db {db} --latest 1 --agg sum")).is_err());
             let out = cmd(&format!("query --db {db} --where proto=udp --where proto=tcp")).unwrap();
             assert_eq!(out, "0 rows\n");
             assert!(cmd(&format!("query --db {db} --start 5 --end 5")).is_err());

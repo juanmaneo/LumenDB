@@ -11,7 +11,7 @@
 //! | `PING` | `OK PONG` |
 //! | `STATUS` | `OK id=1 role=leader term=3 leader=1 voters=1,2,3 learners= commit=9 applied=9 snapshot=0 raft=ADDR` |
 //! | `WRITE <bytes>`, a newline, then that many bytes of line protocol | `OK <points>` |
-//! | `QUERY <consistent\|local> <measurement> <field> [start=NS] [end=NS] [agg=A] [every=NS] [align=calendar\|start] [fill=prev\|linear\|NUMBER] [top=N] [where=<tag>=<value>]...` | `ROWS <n>`, then n lines `series TAB ts TAB value` |
+//! | `QUERY <consistent\|local> <measurement> <field> [start=NS] [end=NS] [agg=A] [every=NS] [align=calendar\|start] [fill=prev\|linear\|NUMBER] [latest=1] [top=N] [where=<tag>=<value>]...` | `ROWS <n>`, then n lines `series TAB ts TAB value` |
 //! | `PEER <id> <addr>` | `OK ok`: where to send messages to node `id` (saved: it is still known after a restart) |
 //! | `ADD-LEARNER <id>`, `REMOVE-LEARNER <id>` | `OK added`, `OK removed` |
 //! | `ADD-VOTER <id>`, `REMOVE-VOTER <id>` | `OK <index of the configuration entry>` |
@@ -352,6 +352,9 @@ fn query_line(consistent: bool, q: &Query, top: Option<u64>) -> String {
     if let Some(fill) = q.fill {
         let _ = write!(s, " fill={}", fill.name());
     }
+    if q.latest {
+        s.push_str(" latest=1");
+    }
     if let Some(n) = top {
         let _ = write!(s, " top={n}");
     }
@@ -414,6 +417,7 @@ fn parse_query(mode: &str, measurement: &str, field: &str, options: &[&str]) -> 
             "every" => query.every = Some(int(value)?),
             "align" => query.align = Align::parse(value).ok_or("unknown alignment")?,
             "fill" => query.fill = Some(Fill::parse(value).ok_or("unknown fill")?),
+            "latest" => query.latest = uint(value)? != 0,
             "top" => top = Some(uint(value)?),
             "agg" => query.agg = Some(Agg::parse(value).ok_or("unknown aggregate")?),
             "where" => {
@@ -1035,7 +1039,7 @@ mod tests {
             Request::Peer(7, "[::1]:4000".parse().unwrap()),
             Request::Query {
                 consistent: true,
-                query: Query::new("flows", "bytes"),
+                query: Query::new("flows", "bytes").latest(),
                 top: None,
             },
             Request::Query {
@@ -1117,6 +1121,7 @@ mod tests {
             ("QUERY local m f agg=median\n", "unknown aggregate"),
             ("QUERY local m f align=never\n", "unknown alignment"),
             ("QUERY local m f fill=nan\n", "unknown fill"),
+            ("QUERY local m f latest=x\n", "not a number"),
             ("QUERY local m f where=abc\n", "where= expects tag=value"),
             ("QUERY local m f where=%zz=v\n", "bad %-escape"),
             ("QUERY local m f where=k=%zz\n", "bad %-escape"),

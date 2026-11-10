@@ -133,6 +133,19 @@ pub(crate) fn data_key(col: u64, bucket: i64, seq: u64) -> Vec<u8> {
 /// Timestamped values of one column.
 type Points = Vec<(i64, FieldValue)>;
 
+fn in_range(q: &Query, p: &(i64, FieldValue)) -> bool {
+    (p.0 >= q.start) & (p.0 < q.end)
+}
+
+/// The newest point in the range of `q` among the chunks of one partition.
+fn newest_in_chunks(chunks: &[Vec<u8>], q: &Query) -> Result<Option<(i64, FieldValue)>> {
+    let mut points = Vec::new();
+    for chunk in chunks {
+        points.extend(Chunk::decode(chunk)?.points());
+    }
+    Ok(normalize(points).into_iter().rev().find(|p| in_range(q, p)))
+}
+
 /// Length of the `D`+col+bucket prefix shared by the chunks of a partition.
 pub(crate) const PARTITION_PREFIX: usize = 17;
 
@@ -417,19 +430,59 @@ impl Db {
         for (series, col, buffered) in targets {
             let lo = data_key(col, *buckets.start(), 0);
             let hi = data_key(col, buckets.end() + 1, 0);
-            let mut points = Vec::new();
-            for item in self.kv.iter_at(&snapshot, &lo, Some(&hi)) {
-                let (_, v) = item?;
-                points.extend(Chunk::decode(&v)?.points());
-            }
-            points.extend(buffered);
-            let points = normalize(points)
-                .into_iter()
-                .filter(|p| (p.0 >= q.start) & (p.0 < q.end))
-                .collect();
+            let points = if q.latest {
+                self.newest_point(&snapshot, (&lo, &hi), buffered, q)?
+            } else {
+                let mut points = Vec::new();
+                for item in self.kv.iter_at(&snapshot, &lo, Some(&hi)) {
+                    let (_, v) = item?;
+                    points.extend(Chunk::decode(&v)?.points());
+                }
+                points.extend(buffered);
+                normalize(points).into_iter().filter(|p| in_range(q, p)).collect()
+            };
             out.push((series, points));
         }
         Ok(out)
+    }
+
+    /// The newest point of one column in the range of `q`, as a list of at
+    /// most one point. It goes through the keys of the column's chunks but
+    /// decodes only those of the newest partition (and the one before it, if
+    /// the newest holds nothing in range), so a long history costs a key scan
+    /// and not a decode of every point.
+    fn newest_point(
+        &self,
+        snapshot: &flashkv::Snapshot,
+        (lo, hi): (&[u8], &[u8]),
+        buffered: Points,
+        q: &Query,
+    ) -> Result<Points> {
+        // The chunks of the last two partitions, oldest first, by partition.
+        let mut parts: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        for item in self.kv.iter_at(snapshot, lo, Some(hi)) {
+            let (k, v) = item?;
+            if parts.last().map(|p| &p.0[..]) != Some(&k[..PARTITION_PREFIX]) {
+                if parts.len() == 2 {
+                    parts.remove(0);
+                }
+                parts.push((k[..PARTITION_PREFIX].to_vec(), Vec::new()));
+            }
+            parts.last_mut().expect("a partition was just added").1.push(v);
+        }
+        let newest = parts
+            .iter()
+            .rev()
+            .find_map(|(_, chunks)| newest_in_chunks(chunks, q).transpose())
+            .transpose()?;
+        // The buffer is newer than every chunk, so it wins a tie.
+        let both = newest.into_iter().chain(buffered).collect();
+        Ok(normalize(both)
+            .into_iter()
+            .rev()
+            .find(|p| in_range(q, p))
+            .into_iter()
+            .collect())
     }
 
     /// Runs `q`: one row per point (raw) or per series and window (aggregate).
@@ -650,6 +703,110 @@ pub(crate) mod tests {
         assert!(db.query(&Query::new("cpu", "usage").fill(Fill::Prev)).is_err());
     }
 
+    /// The latest point of each series, as the last row of a plain query.
+    fn last_of_each_series(db: &Db, q: &Query) -> Vec<Row> {
+        let mut last: Vec<Row> = Vec::new();
+        for row in db.query(q).unwrap() {
+            match last.last_mut() {
+                Some(l) if l.series == row.series => *l = row,
+                _ => last.push(row),
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn latest_is_the_last_point_of_each_series() {
+        let dir = tmpdir("latest");
+        let mut o = opts();
+        o.partition = Partitioner::new(10);
+        let db = Db::open(&dir, o.clone()).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        let hosts = ["a", "b", "c"];
+        let mut ranges = vec![(i64::MIN, i64::MAX)];
+        for round in 0..60 {
+            // A few points anywhere in ten partitions: some behind the newest, some a rewrite.
+            let points: Vec<Point> = (0..next(6))
+                .map(|_| cpu(hosts[next(3) as usize], next(100) as i64, next(1000) as f64))
+                .collect();
+            db.write_points(&points).unwrap();
+            match next(4) {
+                0 => db.flush().unwrap(),
+                1 if round % 7 == 0 => {
+                    db.flush().unwrap();
+                    db.compact().unwrap();
+                }
+                _ => {}
+            }
+            let start = next(110) as i64 - 5;
+            ranges.push((start, start + 1 + next(60) as i64));
+            for &(start, end) in &ranges[ranges.len().saturating_sub(3)..] {
+                let all = Query::new("cpu", "usage").range(start, end);
+                let latest = db.query(&all.clone().latest()).unwrap();
+                assert_eq!(
+                    latest,
+                    last_of_each_series(&db, &all),
+                    "round {round}, [{start}, {end})"
+                );
+            }
+        }
+        let all = Query::new("cpu", "usage");
+        let latest = db.query(&all.clone().latest()).unwrap();
+        assert_eq!(latest.len(), 3, "{latest:?}");
+        assert_eq!(latest, last_of_each_series(&db, &all));
+        // The same from disk and the replayed log after a restart.
+        db.close().unwrap();
+        let db = Db::open(&dir, o).unwrap();
+        assert_eq!(db.query(&all.clone().latest()).unwrap(), latest);
+        for &(start, end) in &ranges {
+            let all = all.clone().range(start, end);
+            assert_eq!(db.query(&all.clone().latest()).unwrap(), last_of_each_series(&db, &all));
+        }
+        // Nothing in range, no row; and a series that has no such field has none.
+        assert!(db.query(&all.clone().range(1000, 2000).latest()).unwrap().is_empty());
+        assert!(db.query(&Query::new("cpu", "nope").latest()).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn latest_prefers_the_buffer_on_a_tie_and_looks_back_when_the_newest_partition_is_out_of_range() {
+        let dir = tmpdir("latest-tie");
+        let mut o = opts();
+        o.partition = Partitioner::new(10);
+        let db = Db::open(&dir, o).unwrap();
+        db.write_points(&[
+            cpu("a", 5, 1.0),
+            cpu("a", 15, 2.0),
+            cpu("a", 25, 3.0),
+            cpu("a", 35, 4.0),
+        ])
+        .unwrap();
+        db.flush().unwrap();
+        let q = Query::new("cpu", "usage").latest();
+        let value = |q: &Query| db.query(q).unwrap()[0].value.clone();
+        assert_eq!(value(&q), FieldValue::Float(4.0));
+        // The newest partition [30, 40) has a point, but it is past the end;
+        // the one before it has the answer.
+        assert_eq!(value(&q.clone().range(0, 30)), FieldValue::Float(3.0));
+        assert_eq!(db.query(&q.clone().range(0, 30)).unwrap()[0].ts, 25);
+        // Neither partition [30, 40) nor the one before it has a point in [36, 39).
+        assert_eq!(db.query(&q.clone().range(36, 39)).unwrap().len(), 0);
+        // A rewrite in the buffer wins the tie at ts 35; an older point does not win.
+        db.write_points(&[cpu("a", 35, 9.0), cpu("a", 1, 7.0)]).unwrap();
+        assert_eq!(value(&q), FieldValue::Float(9.0));
+        // A newer point in the buffer wins.
+        db.write_points(&[cpu("a", 36, 5.5)]).unwrap();
+        let row = &db.query(&q).unwrap()[0];
+        assert_eq!((row.ts, row.value.clone()), (36, FieldValue::Float(5.5)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn write_query_flush_reopen() {
         let dir = tmpdir("basic");
@@ -834,6 +991,7 @@ pub(crate) mod tests {
         raw_put(&dir, &data_key(0, 0, 999), b"\x09");
         let db = Db::open(&dir, opts()).unwrap();
         assert!(db.query(&Query::new("cpu", "usage")).is_err());
+        assert!(db.query(&Query::new("cpu", "usage").latest()).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -841,7 +999,7 @@ pub(crate) mod tests {
     /// must be readable after recovery, and nothing else.
     #[test]
     fn fault_injection_then_power_loss_keeps_acknowledged_points() {
-        let script = |env: Arc<dyn Env>, dir: &Path, acked: &mut Vec<i64>| -> Result<()> {
+        let script = |env: Arc<dyn Env>, dir: &Path, acked: &mut Vec<i64>, q: &Query| -> Result<()> {
             let mut o = opts();
             o.kv.env = env;
             o.kv.sync = true;
@@ -860,27 +1018,29 @@ pub(crate) mod tests {
             db.kv.flush()?;
             drop(db);
             let db = Db::open(dir, o)?;
-            assert_eq!(db.query(&Query::new("cpu", "usage"))?.len(), acked.len());
+            let want = if q.latest { 1 } else { acked.len() };
+            assert_eq!(db.query(q)?.len(), want);
             Ok(())
         };
-        for n in 0.. {
-            let dir = tmpdir("faults");
-            let fault = FaultEnv::new(Arc::new(OsEnv));
-            fault.fail_after(n);
-            let mut acked = Vec::new();
-            let done = script(Arc::new(fault.clone()), &dir, &mut acked).is_ok();
-            fault.heal();
-            fault.crash().unwrap();
-            let db = Db::open(&dir, opts()).unwrap();
-            let got: Vec<i64> = values(&db, &Query::new("cpu", "usage"))
-                .into_iter()
-                .map(|v| v.0)
-                .collect();
-            assert_eq!(got, acked, "fault at op {n}");
-            drop(db);
-            std::fs::remove_dir_all(&dir).unwrap();
-            if done {
-                break;
+        // Reading everything, and reading only the newest point, both from disk.
+        let all = Query::new("cpu", "usage");
+        for q in [all.clone(), all.clone().latest()] {
+            for n in 0.. {
+                let dir = tmpdir("faults");
+                let fault = FaultEnv::new(Arc::new(OsEnv));
+                fault.fail_after(n);
+                let mut acked = Vec::new();
+                let done = script(Arc::new(fault.clone()), &dir, &mut acked, &q).is_ok();
+                fault.heal();
+                fault.crash().unwrap();
+                let db = Db::open(&dir, opts()).unwrap();
+                let got: Vec<i64> = values(&db, &all).into_iter().map(|v| v.0).collect();
+                assert_eq!(got, acked, "fault at op {n}");
+                drop(db);
+                std::fs::remove_dir_all(&dir).unwrap();
+                if done {
+                    break;
+                }
             }
         }
     }

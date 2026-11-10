@@ -354,6 +354,13 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
     no rows. A fill that would make more than `max_fill_rows` rows (a million
     by default, in total) is an error, so a one-nanosecond window over a
     year cannot exhaust the memory.
+  - `latest` (`--latest 1`, QuestDB's `LATEST ON`) gives the newest point
+    of each series in the range, with its own timestamp: the current value
+    of every host, say, or the top N of them. It reads the keys of a
+    column's chunks but decodes only the newest partition (or the one
+    before, if the newest has nothing in range), so a long history costs a
+    key scan, not a decode of every point. It takes no aggregate and no
+    window.
   - Times and durations are written the way a person does:
     `--start 2024-05-01 --end now --every 15m --fill prev`.
 

@@ -137,6 +137,9 @@ pub struct Query {
     pub align: Align,
     /// What to do with windows without points; needs `agg` and `every`.
     pub fill: Option<Fill>,
+    /// Only the newest point of each series in the range, with its own
+    /// timestamp (QuestDB's `LATEST ON`). No aggregate, no window.
+    pub latest: bool,
 }
 
 impl Query {
@@ -152,6 +155,7 @@ impl Query {
             every: None,
             align: Align::Calendar,
             fill: None,
+            latest: false,
         }
     }
 
@@ -180,6 +184,11 @@ impl Query {
         self
     }
 
+    pub fn latest(mut self) -> Self {
+        self.latest = true;
+        self
+    }
+
     pub fn fill(mut self, fill: Fill) -> Self {
         self.fill = Some(fill);
         self
@@ -190,6 +199,9 @@ impl Query {
             return Err(Error::Query(format!(
                 "need start < end and a positive window: {self:?}"
             )));
+        }
+        if self.latest & (self.agg.is_some() | self.every.is_some()) {
+            return Err(Error::Query("the latest point takes no aggregate and no window".into()));
         }
         if self.fill.is_some() & (self.agg.is_none() | self.every.is_none()) {
             return Err(Error::Query("a fill needs an aggregate and a window".into()));
@@ -439,6 +451,11 @@ mod tests {
         assert!(filled.clone().agg(Agg::Sum).validate().is_err());
         assert!(filled.clone().every(5).validate().is_err());
         assert!(filled.agg(Agg::Sum).every(5).validate().is_ok());
+        // The latest point is a point, not an aggregate.
+        let latest = Query::new("m", "f").latest();
+        assert!(latest.validate().is_ok());
+        assert!(latest.clone().agg(Agg::Sum).validate().is_err());
+        assert!(latest.every(5).validate().is_err());
     }
 
     #[test]
