@@ -69,4 +69,4 @@ jobs:
       # (every failing test is listed, not only those of the first binary)
       - run: cargo test --workspace --no-fail-fast
       - name: CRC32C speed on this runner
-        run: cargo run --release -p bench -- crc-bench --size 512 --size 4096 --size 65536 --size 1048576 --mb 1024
+        run: cargo run --release -p lumen-bench -- crc-bench --size 512 --size 4096 --size 65536 --size 1048576 --mb 1024

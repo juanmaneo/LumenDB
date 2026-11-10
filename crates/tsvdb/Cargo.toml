@@ -1,11 +1,18 @@
 [package]
 name = "tsvdb"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tsdb", "time-series", "database", "columnar", "influxdb"]
+categories = ["database-implementations"]
 description = "Columnar time-series database on top of flashkv, inspired by InfluxDB v3: line protocol, columnar chunks, time partitioning, aggregation/downsampling"
 
 [dependencies]
-flashkv = { path = "../flashkv" }
-pcapfast = { path = "../pcapfast" }
-parking_lot = "0.12"
+flashkv.workspace = true
+pcapfast.workspace = true
+parking_lot.workspace = true

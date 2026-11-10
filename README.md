@@ -7,15 +7,18 @@ Parse packet captures at "the speed of light" into a crash-safe, columnar
 time-series database. LumenDB is written entirely in Rust and depends only on
 `memmap2` and `parking_lot`.
 
+The crates are published as the packages in parentheses; in the code they
+keep the short names (`use flashkv::Db`, through `package = "lumen-flashkv"`).
+
 | crate | what it is | inspired by |
 |---|---|---|
-| [`cpu`](crates/cpu) | portability layer for special instructions (x86_64, aarch64, portable fallback) | corsix/fast-crc32 |
-| [`flashkv`](crates/flashkv) | crash-safe ordered key-value store (LSM) | LevelDB, LMDB, FoundationDB, eguan/ibs |
-| [`raft`](crates/raft) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron, TigerBeetle |
+| [`cpu`](crates/cpu) (`lumen-cpu`) | portability layer for special instructions (x86_64, aarch64, portable fallback) | corsix/fast-crc32 |
+| [`flashkv`](crates/flashkv) (`lumen-flashkv`) | crash-safe ordered key-value store (LSM) | LevelDB, LMDB, FoundationDB, eguan/ibs |
+| [`raft`](crates/raft) (`lumen-raft`) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron, TigerBeetle |
 | [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
 | [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli, QuestDB |
-| [`cluster`](crates/cluster) | tsvdb replicated by raft | TigerBeetle, CockroachDB |
-| [`bench`](crates/bench) | command line: generate, ingest, query, benchmark, run and drive a cluster | — |
+| [`cluster`](crates/cluster) (`lumen-cluster`) | tsvdb replicated by raft | TigerBeetle, CockroachDB |
+| [`bench`](crates/bench) (`lumen-bench`) | command line, binary `bench`: generate, ingest, query, benchmark, run and drive a cluster | — |
 | [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `vopr` / `bench` | cargo-xtask |
 | [`proofs`](proofs) | kani model-checking harnesses | — |
 

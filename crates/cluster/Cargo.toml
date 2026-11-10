@@ -1,12 +1,19 @@
 [package]
-name = "cluster"
-version = "0.1.0"
+name = "lumen-cluster"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["raft", "replication", "tsdb", "time-series", "distributed"]
+categories = ["database-implementations", "network-programming"]
 description = "A tsvdb replicated by Raft: writes go through the leader's log, every node applies them to its own database"
 
 [dependencies]
-raft = { path = "../raft" }
-tsvdb = { path = "../tsvdb" }
-flashkv = { path = "../flashkv" }
-parking_lot = "0.12"
+raft.workspace = true
+tsvdb.workspace = true
+flashkv.workspace = true
+parking_lot.workspace = true

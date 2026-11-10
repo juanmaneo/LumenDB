@@ -1,8 +1,15 @@
 [package]
-name = "cpu"
-version = "0.1.0"
+name = "lumen-cpu"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["crc32c", "simd", "sse42", "neon", "pclmulqdq"]
+categories = ["algorithms", "hardware-support"]
 description = "The portability layer: a trait for each kind of processor instruction LumenDB is fast with, implemented by each architecture (x86_64, aarch64), algorithms written once against the traits, and a portable fallback"
 
 [lints.rust]

@@ -3,18 +3,6 @@
 version = 4
 
 [[package]]
-name = "bench"
-version = "0.1.0"
-dependencies = [
- "cluster",
- "cpu",
- "flashkv",
- "pcapfast",
- "raft",
- "tsvdb",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -25,28 +13,6 @@ name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
-
-[[package]]
-name = "cluster"
-version = "0.1.0"
-dependencies = [
- "flashkv",
- "parking_lot",
- "raft",
- "tsvdb",
-]
-
-[[package]]
-name = "cpu"
-version = "0.1.0"
-
-[[package]]
-name = "flashkv"
-version = "0.1.0"
-dependencies = [
- "cpu",
- "parking_lot",
-]
 
 [[package]]
 name = "libc"
@@ -61,6 +27,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
+]
+
+[[package]]
+name = "lumen-bench"
+version = "0.1.0"
+dependencies = [
+ "lumen-cluster",
+ "lumen-cpu",
+ "lumen-flashkv",
+ "lumen-raft",
+ "pcapfast",
+ "tsvdb",
+]
+
+[[package]]
+name = "lumen-cluster"
+version = "0.1.0"
+dependencies = [
+ "lumen-flashkv",
+ "lumen-raft",
+ "parking_lot",
+ "tsvdb",
+]
+
+[[package]]
+name = "lumen-cpu"
+version = "0.1.0"
+
+[[package]]
+name = "lumen-flashkv"
+version = "0.1.0"
+dependencies = [
+ "lumen-cpu",
+ "parking_lot",
+]
+
+[[package]]
+name = "lumen-raft"
+version = "0.1.0"
+dependencies = [
+ "lumen-flashkv",
+ "parking_lot",
 ]
 
 [[package]]
@@ -107,16 +115,8 @@ dependencies = [
 name = "proofs"
 version = "0.1.0"
 dependencies = [
- "flashkv",
- "raft",
-]
-
-[[package]]
-name = "raft"
-version = "0.1.0"
-dependencies = [
- "flashkv",
- "parking_lot",
+ "lumen-flashkv",
+ "lumen-raft",
 ]
 
 [[package]]
@@ -144,7 +144,7 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 name = "tsvdb"
 version = "0.1.0"
 dependencies = [
- "flashkv",
+ "lumen-flashkv",
  "parking_lot",
  "pcapfast",
 ]

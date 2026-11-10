@@ -1,10 +1,17 @@
 [package]
-name = "raft"
-version = "0.1.0"
+name = "lumen-raft"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["raft", "consensus", "swim", "gossip", "distributed"]
+categories = ["algorithms", "network-programming", "concurrency"]
 description = "Deterministic Raft consensus core (majority quorum), SWIM gossip membership, Lamport logical clocks"
 
 [dependencies]
-parking_lot = "0.12"
-flashkv = { path = "../flashkv" }
+parking_lot.workspace = true
+flashkv.workspace = true

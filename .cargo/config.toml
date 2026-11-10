@@ -3,7 +3,7 @@ xtask = "run --quiet --package xtask --"
 # aarch64 tests on an x86_64 machine, under QEMU emulating an Ampere Altra core
 # (`rustup target add aarch64-unknown-linux-musl`, and qemu-user):
 # `cargo test-aarch64`. Correctness only: emulated speed means nothing.
-test-aarch64 = "test -p cpu -p flashkv --target aarch64-unknown-linux-musl"
+test-aarch64 = "test -p lumen-cpu -p lumen-flashkv --target aarch64-unknown-linux-musl"
 
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"

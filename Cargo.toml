@@ -3,8 +3,26 @@ resolver = "2"
 members = ["crates/cpu", "crates/raft", "crates/flashkv", "crates/pcapfast", "crates/tsvdb", "crates/cluster", "crates/bench", "xtask", "proofs"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
+# The oldest toolchain the workspace is checked with (`cargo +1.95 check`).
+rust-version = "1.95"
 license = "MIT"
+authors = ["Juan Manuel CABA <contact@juan.email>"]
+repository = "https://github.com/juanmaneo/LumenDB"
+homepage = "https://github.com/juanmaneo/LumenDB"
+
+# The crates of the workspace keep their short names in the code: the
+# packages are published as lumen-*, where the short name was taken.
+[workspace.dependencies]
+cpu = { package = "lumen-cpu", path = "crates/cpu", version = "0.1.0" }
+flashkv = { package = "lumen-flashkv", path = "crates/flashkv", version = "0.1.0" }
+raft = { package = "lumen-raft", path = "crates/raft", version = "0.1.0" }
+pcapfast = { path = "crates/pcapfast", version = "0.1.0" }
+tsvdb = { path = "crates/tsvdb", version = "0.1.0" }
+cluster = { package = "lumen-cluster", path = "crates/cluster", version = "0.1.0" }
+memmap2 = "0.9"
+parking_lot = "0.12"
 
 [profile.release]
 opt-level = 3

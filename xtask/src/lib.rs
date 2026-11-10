@@ -171,7 +171,7 @@ pub fn bench(ctx: &Ctx, args: &[&str]) -> Result<String, String> {
     }
     let dir = ctx.root.join(BENCH_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let run = ["run", "--release", "-q", "-p", "bench", "--"];
+    let run = ["run", "--release", "-q", "-p", "lumen-bench", "--"];
     let gen = ["gen-pcap", BENCH_CAPTURE, "--packets", &packets, "--flows", "5000"];
     ctx.step(&[&run[..], &gen].concat())?;
     let mut parse = vec!["parse-bench", BENCH_CAPTURE, "--runs", "5"];
@@ -195,7 +195,7 @@ pub fn vopr(ctx: &Ctx, args: &[&str]) -> Result<String, String> {
             None => return Err(format!("unknown vopr flag {flag}\n\n{USAGE}")),
         }
     }
-    let mut cmd = vec!["run", "--release", "-q", "-p", "bench", "--", "vopr"];
+    let mut cmd = vec!["run", "--release", "-q", "-p", "lumen-bench", "--", "vopr"];
     cmd.extend(flags.iter().flat_map(|&(f, v)| [f, v]));
     ctx.step(&cmd)?;
     Ok("vopr: all safety properties held\n".into())
@@ -361,7 +361,7 @@ pub(crate) mod tests {
     fn bench_generates_then_parses() {
         let _serial = serial();
         let d = tmp("bench");
-        let r = "run --release -q -p bench --";
+        let r = "run --release -q -p lumen-bench --";
         assert_eq!(run(&args("bench"), &ctx(&d, "never")).unwrap(), "bench: done\n");
         assert!(d.join(BENCH_DIR).is_dir());
         assert_eq!(
@@ -416,7 +416,7 @@ pub(crate) mod tests {
     fn vopr_runs_the_simulator_in_release_mode() {
         let _serial = serial();
         let d = tmp("vopr");
-        let r = "run --release -q -p bench -- vopr";
+        let r = "run --release -q -p lumen-bench -- vopr";
         assert_eq!(
             run(&args("vopr"), &ctx(&d, "never")).unwrap(),
             "vopr: all safety properties held\n"

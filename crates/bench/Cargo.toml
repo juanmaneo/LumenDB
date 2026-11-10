@@ -1,14 +1,26 @@
 [package]
-name = "bench"
-version = "0.1.0"
+name = "lumen-bench"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["pcap", "tsdb", "benchmark", "raft", "database"]
+categories = ["command-line-utilities", "database-implementations"]
 description = "CLI: generate pcaps, ingest pcap into tsvdb, run queries and KV benchmarks"
 
+# (the command keeps its short name)
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
 [dependencies]
-cluster = { path = "../cluster" }
-cpu = { path = "../cpu" }
-flashkv = { path = "../flashkv" }
-pcapfast = { path = "../pcapfast" }
-raft = { path = "../raft" }
-tsvdb = { path = "../tsvdb" }
+cluster.workspace = true
+cpu.workspace = true
+flashkv.workspace = true
+pcapfast.workspace = true
+raft.workspace = true
+tsvdb.workspace = true
