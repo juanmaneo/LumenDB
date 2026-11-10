@@ -3,8 +3,8 @@
 //!
 //! Write path (InfluxDB v3 style WAL + write buffer):
 //! 1. points are validated against the schema (a field keeps its first type)
-//!    and turned into typed columns ([`crate::batch`]; plain lines of known
-//!    series go straight there, see [`crate::fast`]);
+//!    and turned into typed columns (`batch`; plain lines of known
+//!    series go straight there, see `fast`);
 //! 2. new series / schema / column entries are stored in flashkv, then the
 //!    columns are appended to the log as one CRC-framed record (fsynced with
 //!    `sync`) — when the write returns `Ok` the points survive a power loss;

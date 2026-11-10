@@ -198,7 +198,7 @@ impl Num {
 /// What a column of numbers says about a chunk of it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Numbers {
-    /// The sum of the values as floats (compensated, see [`crate::agg::add`]).
+    /// The sum of the values as floats (compensated, see `agg::add`).
     pub sum: f64,
     pub min: f64,
     pub max: f64,

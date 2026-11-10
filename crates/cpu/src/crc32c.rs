@@ -6,7 +6,7 @@
 //!
 //! One CRC instruction after the other runs at the instruction's latency, 8
 //! bytes every 2 or 3 cycles, while the processor could start one every
-//! cycle. [`fused`] keeps it busy (after Peter Cawley's "fusion" CRC32C,
+//! cycle. `fused` keeps it busy (after Peter Cawley's "fusion" CRC32C,
 //! <https://github.com/corsix/fast-crc32>). It cuts a block of the data into
 //! `S` scalar streams, each run through the CRC instruction by its own chain,
 //! followed by a vector region that `V` accumulators fold with carry-less
@@ -20,7 +20,7 @@
 //! stream's register is moved to the end of the block by one carry-less
 //! multiplication, `c·x^(8n) mod P`. The CRC is linear, so the XOR of all
 //! of them is the CRC of the block. The constants are powers of x modulo P,
-//! computed at compile time ([`x_pow`]) for each block size, so blocks have a
+//! computed at compile time (`x_pow`) for each block size, so blocks have a
 //! few fixed sizes: as many of 64 steps as fit, then of 8 steps, then at most
 //! one each of 4, 2 and 1 steps, then the rest one instruction at a time.
 //!

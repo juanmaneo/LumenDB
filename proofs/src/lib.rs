@@ -3,7 +3,7 @@
 //! Each property is a plain boolean function, so it is unit-tested on
 //! samples in every build and *proved* for all inputs (within the stated
 //! bounds) by the [kani](https://github.com/model-checking/kani) harnesses in
-//! [`harnesses`], run with `cargo xtask kani` (`cargo kani -p proofs`):
+//! `harnesses`, run with `cargo xtask kani` (`cargo kani -p proofs`):
 //!
 //! 1. flashkv varint encoding round-trips every `u64`;
 //! 2. flashkv CRC32C matches the published check values, and CRC masking is
