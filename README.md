@@ -311,7 +311,7 @@ db.ingest_capture(&stats)?;
 | `cargo xtask vopr [--seeds N]` | the Raft simulation in release mode |
 | `cargo xtask bench` | writes a 3.6 GB synthetic capture and runs `parse-bench` on it |
 | `cargo xtask release VERSION` | bumps every crate, releases the `Unreleased` section of [`CHANGELOG.md`](CHANGELOG.md) (the commit subjects since the last tag if it is empty), runs `dev-check` and a publish dry run, then commits and tags `vVERSION` |
-| `cargo xtask publish` | `cargo publish` of every crate of the tagged HEAD in dependency order; run again after crates.io's rate limit on new crates (published versions are skipped) |
+| `cargo xtask publish` | `cargo publish` of every crate of the tagged HEAD in dependency order, one a minute, waiting out crates.io's rate limit (published versions are skipped, so it can be rerun) |
 
 Nothing is pushed: a release is `cargo xtask release 0.2.0`,
 `cargo xtask publish`, then `git push origin HEAD v0.2.0`.

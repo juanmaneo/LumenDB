@@ -23,8 +23,11 @@
 //!   notes are better than none), runs dev-check and a publish dry run, then
 //!   commits and tags `vVERSION`.
 //! - `publish`: `cargo publish` of every crate of the tagged HEAD, in
-//!   dependency order ([`PUBLISH_ORDER`]). A version already on crates.io is
-//!   skipped, so after crates.io's limit on new crates it is simply run again.
+//!   dependency order ([`PUBLISH_ORDER`]), one crate per [`PUBLISH_PAUSE`] to
+//!   stay under crates.io's rate limit. A crate that is refused anyway (429)
+//!   is retried after the pause, up to [`PUBLISH_RETRIES`] times. A version
+//!   already on crates.io is skipped, so a stopped `publish` is simply run
+//!   again.
 //!
 //! xtask never installs or touches git hooks, and never pushes: `release`
 //! and `publish` say what to push.
@@ -35,7 +38,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const USAGE: &str = "\
 usage: cargo xtask <task>
@@ -55,8 +58,8 @@ tasks:
                              is empty), run dev-check and a publish dry run, then commit
                              and tag vVERSION
   publish                    cargo publish every crate of the tagged HEAD, in dependency
-                             order; versions already on crates.io are skipped, so it is run
-                             again after crates.io's rate limit
+                             order, one a minute; waits out crates.io's rate limit, and
+                             skips versions already on crates.io (so it can be run again)
 
 Nothing is ever pushed: release and publish print the git push to run.
 ";
@@ -71,6 +74,15 @@ pub const PUBLISH_ORDER: [&str; 7] = [
     "lumen-cluster",
     "lumen-bench",
 ];
+
+/// Pause after each crate `cargo xtask publish` publishes: crates.io lets one
+/// new version of an existing crate through per minute (after a burst).
+pub const PUBLISH_PAUSE: Duration = Duration::from_secs(60);
+
+/// How many times `cargo xtask publish` retries a crate crates.io refused
+/// (429), after a pause each time. crates.io asks ten minutes between new
+/// crates after the first five, which this covers with room to spare.
+pub const PUBLISH_RETRIES: u32 = 15;
 
 /// Default number of seeds of `cargo xtask vopr`.
 pub const VOPR_SEEDS: u64 = 200;
@@ -96,6 +108,8 @@ pub struct Ctx {
     pub cargo: String,
     pub git: String,
     pub root: PathBuf,
+    /// How long `publish` waits between crates, and before a retry.
+    pub pause: Duration,
 }
 
 impl Ctx {
@@ -115,6 +129,7 @@ impl Ctx {
                 .unwrap_or(String::from("cargo")),
             git: var("XTASK_GIT").unwrap_or(String::from("git")),
             root: manifest_dir.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            pause: PUBLISH_PAUSE,
         }
     }
 
@@ -413,21 +428,35 @@ pub fn publish(ctx: &Ctx) -> Result<String, String> {
         ));
     }
     clean(ctx)?;
+    let wait = ctx.pause.as_secs();
     let mut done = String::new();
-    for name in PUBLISH_ORDER {
-        println!("xtask: cargo publish -p {name}");
-        let (ok, errors) = ctx.cargo_stderr(&["publish", "-p", name])?;
-        if ok {
-            done.push_str(&format!("{name} {version}: published\n"));
-        } else if errors.contains("already exists") {
-            done.push_str(&format!("{name} {version}: already on crates.io\n"));
-        } else if errors.contains("status 429") {
-            return Err(format!(
-                "{done}{name}: crates.io limits how many new crates are published in a row; run \
-                 `cargo xtask publish` again in about 10 minutes (what is published is skipped)"
-            ));
-        } else {
-            return Err(format!("{done}`cargo publish -p {name}` failed"));
+    for (i, name) in PUBLISH_ORDER.iter().enumerate() {
+        let mut refused = 0;
+        loop {
+            println!("xtask: cargo publish -p {name}");
+            let (ok, errors) = ctx.cargo_stderr(&["publish", "-p", name])?;
+            if ok {
+                done.push_str(&format!("{name} {version}: published\n"));
+                if i + 1 < PUBLISH_ORDER.len() {
+                    println!("xtask: {wait} s before the next crate");
+                    std::thread::sleep(ctx.pause);
+                }
+                break;
+            } else if errors.contains("already exists") {
+                done.push_str(&format!("{name} {version}: already on crates.io\n"));
+                break;
+            } else if errors.contains("status 429") && refused < PUBLISH_RETRIES {
+                refused += 1;
+                println!("xtask: crates.io refused {name} (rate limit): retry {refused}/{PUBLISH_RETRIES} in {wait} s");
+                std::thread::sleep(ctx.pause);
+            } else if errors.contains("status 429") {
+                return Err(format!(
+                    "{done}{name}: crates.io still refuses it (rate limit) after {PUBLISH_RETRIES} retries; \
+                     run `cargo xtask publish` again later (what is published is skipped)"
+                ));
+            } else {
+                return Err(format!("{done}`cargo publish -p {name}` failed"));
+            }
         }
     }
     Ok(format!(
@@ -456,6 +485,7 @@ pub(crate) mod tests {
     use super::*;
     use std::fs::{self, Permissions};
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
     /// Tests write executable scripts and spawn processes: a fork in one
     /// thread while another holds a script open for writing makes exec fail
@@ -494,6 +524,7 @@ pub(crate) mod tests {
             cargo,
             git: "git".into(),
             root: dir.to_path_buf(),
+            pause: Duration::ZERO,
         }
     }
 
@@ -588,6 +619,7 @@ pub(crate) mod tests {
             cargo,
             git: "git".into(),
             root: d.clone(),
+            pause: Duration::ZERO,
         };
         run(&args("kani"), &c).unwrap();
         let limits = fs::read_to_string(limits).unwrap();
@@ -1121,11 +1153,25 @@ Requests): too many new crates' >&2; exit 101;;"
         )
     }
 
+    /// Like [`limited`] for the first two attempts only.
+    fn limited_twice(name: &str, dir: &Path) -> String {
+        let count = dir.join("count").display().to_string();
+        format!(
+            "publish\\ -p\\ {name}) n=$(cat {count} 2>/dev/null || echo 0); echo $((n + 1)) > {count}; \
+             if [ \"$n\" -lt 2 ]; then echo 'error: status 429 Too Many Requests' >&2; exit 101; fi;;"
+        )
+    }
+
     #[test]
     fn publish_goes_in_dependency_order() {
         let _serial = serial();
         let (d, c) = repo("pub", WRITTEN, "never");
+        // One crate per pause, and none after the last.
+        let pause = Duration::from_millis(30);
+        let c = Ctx { pause, ..c };
+        let started = Instant::now();
         let out = run(&args("publish"), &c).unwrap();
+        assert!(started.elapsed() >= pause * (PUBLISH_ORDER.len() as u32 - 1));
         let published: String = PUBLISH_ORDER
             .iter()
             .map(|n| format!("{n} 0.1.0: published\n"))
@@ -1145,27 +1191,66 @@ Requests): too many new crates' >&2; exit 101;;"
     }
 
     #[test]
-    fn publish_skips_what_is_there_and_stops_at_the_rate_limit() {
+    fn publish_waits_out_the_rate_limit() {
         let _serial = serial();
+        let pause = Duration::from_millis(40);
+        let (d, c) = repo("pub-wait", WRITTEN, "never");
+        let c = Ctx {
+            pause,
+            ..rules_cargo(c, &limited_twice("lumen-raft", &d))
+        };
+        let started = Instant::now();
+        let out = run(&args("publish"), &c).unwrap();
+        // 6 pauses between the 7 crates, and one before each of the 2 retries.
+        assert!(started.elapsed() >= pause * 8);
+        assert_eq!(out.matches(": published\n").count(), PUBLISH_ORDER.len());
+        let log = log(&d);
+        assert_eq!(log.lines().count(), PUBLISH_ORDER.len() + 2);
+        assert_eq!(log.matches("publish -p lumen-raft\n").count(), 3);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn publish_gives_up_on_a_rate_limit_that_does_not_end() {
+        let _serial = serial();
+        let pause = Duration::from_millis(20);
         let (d, c) = repo("pub-limit", WRITTEN, "never");
         let rules = [exists("lumen-cpu"), exists("lumen-flashkv"), limited("lumen-raft")].join("\n");
-        let e = run(&args("publish"), &rules_cargo(c, &rules)).unwrap_err();
-        assert!(
-            e.starts_with(
+        let c = Ctx {
+            pause,
+            ..rules_cargo(c, &rules)
+        };
+        let started = Instant::now();
+        let e = run(&args("publish"), &c).unwrap_err();
+        // One pause after pcapfast, and one before each retry of lumen-raft.
+        assert!(started.elapsed() >= pause * (1 + PUBLISH_RETRIES));
+        assert_eq!(
+            e,
+            format!(
                 "lumen-cpu 0.1.0: already on crates.io\nlumen-flashkv 0.1.0: already on crates.io\n\
-                 pcapfast 0.1.0: published\nlumen-raft: crates.io limits"
-            ),
-            "{e}"
+                 pcapfast 0.1.0: published\nlumen-raft: crates.io still refuses it (rate limit) after \
+                 {PUBLISH_RETRIES} retries; run `cargo xtask publish` again later (what is published is skipped)"
+            )
         );
-        assert!(e.ends_with("`cargo xtask publish` again in about 10 minutes (what is published is skipped)"));
-        // It stopped there.
-        assert_eq!(log(&d).lines().count(), 4);
+        // The crates before lumen-raft once each, lumen-raft first and then once per retry.
+        assert_eq!(log(&d).lines().count(), 3 + 1 + PUBLISH_RETRIES as usize);
         fs::remove_dir_all(&d).unwrap();
+    }
 
-        // Run again after the wait: everything is on crates.io.
+    #[test]
+    fn publish_run_again_skips_without_waiting() {
+        let _serial = serial();
         let (d, c) = repo("pub-again", WRITTEN, "never");
         let rules: Vec<String> = PUBLISH_ORDER.iter().map(|n| exists(n)).collect();
-        let out = run(&args("publish"), &rules_cargo(c, &rules.join("\n"))).unwrap();
+        // A pause that would be noticed: nothing published, so nothing to wait for.
+        let pause = Duration::from_secs(5);
+        let c = Ctx {
+            pause,
+            ..rules_cargo(c, &rules.join("\n"))
+        };
+        let started = Instant::now();
+        let out = run(&args("publish"), &c).unwrap();
+        assert!(started.elapsed() < pause);
         assert_eq!(out.matches(": already on crates.io\n").count(), PUBLISH_ORDER.len());
         assert!(out.ends_with("push with `git push origin HEAD v0.1.0`\n"));
         fs::remove_dir_all(&d).unwrap();
@@ -1242,6 +1327,7 @@ Requests): too many new crates' >&2; exit 101;;"
             git: "/nonexistent/git".into(),
             cargo: c.cargo.clone(),
             root: c.root.clone(),
+            pause: Duration::ZERO,
         };
         let nogit = Ctx {
             root: c.root.clone(),
