@@ -10,7 +10,9 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
 use tsvdb::partition::HOUR_NS;
 use tsvdb::{Agg, Db, Query};
 
@@ -238,7 +240,7 @@ pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
     a.check(
         &[
             &DATA_FLAGS[..],
-            &["batch", "runs", "flush-points", "ingest", "threads", "only"],
+            &["batch", "runs", "flush-points", "ingest", "threads", "only", "writers"],
         ]
         .concat(),
     )?;
@@ -247,20 +249,42 @@ pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
     let runs = a.num::<usize>("runs", 5)?;
     let ingest = a.num::<u64>("ingest", 1)? != 0;
     let only = a.get("only").unwrap_or("");
+    let writers = a.num::<usize>("writers", 1)?.max(1);
     let (dir, mut opts) = db_options(a)?;
     opts.threads = a.num("threads", 0)?;
     let db = open_db((dir, opts))?;
-    let (mut write, mut text, mut gen) = (Duration::ZERO, String::new(), Gen::new(&w));
+    let mut gen = Gen::new(&w);
     if !ingest {
         gen.next = w.rows();
     }
+    // The text is made first (it is not what is measured), then written by
+    // --writers threads, each taking the next batch when it is free, like
+    // that many clients of a server.
+    let mut batches = Vec::new();
     while !gen.done() {
-        text.clear();
+        let mut text = String::new();
         gen.batch(batch, &mut text);
-        let t = Instant::now();
-        db.write_lines(&text)?;
-        write += t.elapsed();
+        batches.push(text);
     }
+    let t = Instant::now();
+    let next = AtomicUsize::new(0);
+    let failed: Mutex<Option<tsvdb::Error>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..writers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(text) = batches.get(i) else { break };
+                if let Err(e) = db.write_lines(text) {
+                    *failed.lock().unwrap() = Some(e);
+                    break;
+                }
+            });
+        }
+    });
+    if let Some(e) = failed.into_inner().unwrap() {
+        return Err(e.into());
+    }
+    let write = t.elapsed();
     let t = Instant::now();
     db.flush()?;
     let flush = t.elapsed();
@@ -269,7 +293,7 @@ pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
     let stats = db.stats();
     let ingested = format!(
         "ingest: {:.1} ms: {:.0} rows/s, {:.2} M values/s\n\
-         \x20 write_lines {:.1} ms ({} of {} batches the fast way), final flush {:.1} ms; {} flushes, {} series, {} columns\n",
+         \x20 write_lines {:.1} ms on {writers} threads ({} of {} batches the fast way), final flush {:.1} ms; {} flushes, {} series, {} columns\n",
         total * 1e3,
         rows as f64 / total,
         values as f64 / total / 1e6,
@@ -377,6 +401,7 @@ mod tests {
             ("tsdb-bench --db x --runs z", "--runs: invalid number \"z\""),
             ("tsdb-bench --db x --ingest z", "--ingest: invalid number \"z\""),
             ("tsdb-bench --db x --threads z", "--threads: invalid number \"z\""),
+            ("tsdb-bench --db x --writers z", "--writers: invalid number \"z\""),
             (
                 "tsdb-bench --db x --hosts 0",
                 "--hosts, --hours and --interval must be more than 0",
@@ -440,6 +465,26 @@ mod tests {
             again.contains("   120 rows\n") && again.contains("   40 rows\n"),
             "{again}"
         );
+        std::fs::remove_dir_all(&d).unwrap();
+        // Several writers, and a failure of one of them (a database that is poisoned).
+        let out = cmd(&format!(
+            "tsdb-bench --db {} --hosts 4 --hours 2 --interval 1m --batch 50 --runs 1 --writers 3 --sync 0",
+            d.display()
+        ))
+        .unwrap();
+        assert!(out.contains(" on 3 threads ("), "{out}");
+        assert!(out.contains("   120 rows\n"), "{out}");
+        std::fs::remove_dir_all(&d).unwrap();
+        for n in 0.. {
+            let r = cmd(&format!(
+                "tsdb-bench --db {}/w{n} --hosts 2 --hours 1 --interval 10m --batch 3 --runs 0 --writers 2 \
+                 --flush-points 4 --background 0 --fail-after {n}",
+                d.display()
+            ));
+            if r.is_ok() {
+                break;
+            }
+        }
         std::fs::remove_dir_all(&d).unwrap();
         // One case.
         let one = cmd(&format!(

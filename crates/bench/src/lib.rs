@@ -75,9 +75,10 @@ commands:
       another database can be given the data that tsdb-bench ingests
   tsdb-bench --db DIR [--hosts N] [--hours N] [--interval DURATION] [--seed N]
         [--batch N] [--runs N] [--flush-points N] [--ingest 0|1] [--threads N]
-        [--only NAME]
+        [--only NAME] [--writers N]
       ingest that workload (in batches of --batch lines, default 5000, parsed
-      and written; DIR should be empty; with --ingest 0, not at all: the
+      and written by --writers threads, default 1, like that many clients;
+      DIR should be empty; with --ingest 0, not at all: the
       queries are timed on the data that DIR holds from an earlier run with
       the same flags; --threads N limits the threads that a large write, a
       flush and a query use, default 0: one per core; --only NAME times only
@@ -258,11 +259,13 @@ impl Args {
     }
 }
 
-fn kv_options(a: &Args) -> Res<flashkv::DbOptions> {
+/// The storage options of the command line, over `base` (flashkv's own for
+/// `kv-bench`, tsvdb's for the commands that go through it).
+fn kv_options(a: &Args, base: flashkv::DbOptions) -> Res<flashkv::DbOptions> {
     let mut o = flashkv::DbOptions {
         sync: a.num::<u64>("sync", 1)? != 0,
         background: a.num::<u64>("background", 1)? != 0,
-        ..Default::default()
+        ..base
     };
     if let Some(n) = a.opt::<u64>("fail-after")? {
         let fault = FaultEnv::new(Arc::new(OsEnv));
@@ -309,7 +312,7 @@ fn db_options(a: &Args) -> Res<(&str, DbOptions)> {
     let flush = a.opt::<usize>("flush-points")?;
     let defaults = DbOptions::default();
     let opts = DbOptions {
-        kv: kv_options(a)?,
+        kv: kv_options(a, defaults.kv.clone())?,
         flush_points: flush.unwrap_or(defaults.flush_points),
         chunk_points: flush.map_or(defaults.chunk_points, |_| 0),
         ..defaults
@@ -450,7 +453,7 @@ fn kv_bench(a: &Args) -> Res<String> {
     let ops: u64 = a.num("ops", 100_000)?;
     let value = vec![0xab; a.num("value-size", 100)?];
     let batch = a.num::<u64>("batch", 1_000)?.max(1);
-    let kv = flashkv::Db::open(Path::new(a.req("db")?), kv_options(a)?)?;
+    let kv = flashkv::Db::open(Path::new(a.req("db")?), kv_options(a, Default::default())?)?;
     let key = |i: u64| format!("key{:016x}", i.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let t = Instant::now();
     let mut i = 0;
