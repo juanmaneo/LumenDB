@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tsvdb::{query, Agg, Db, DbOptions, Query};
+use tsvdb::time::{now_ns, parse_duration, parse_time};
+use tsvdb::{query, Agg, Align, Db, DbOptions, Query};
 
 pub type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -36,9 +37,16 @@ commands:
       and traffic timeline (measurement `traffic`) in tsvdb
   write <file.lp> --db DIR
       write InfluxDB line protocol
-  query --db DIR [--measurement M] [--field F] [--where tag=value]... [--start NS]
-        [--end NS] [--agg sum|count|min|max|mean] [--every NS] [--top N]
-      query tsvdb (default: raw `flows` bytes)
+  query --db DIR [--measurement M] [--field F] [--where tag=value]... [--start TIME]
+        [--end TIME] [--agg sum|count|min|max|mean] [--every DURATION]
+        [--align calendar|start] [--top N]
+      query tsvdb (default: raw `flows` bytes). A TIME is an integer (ns since
+      1970), `now`, `now-1h` or `now+30s`, or a UTC date: 2024-05-01,
+      2024-05-01T12:30:00Z, 2024-05-01T12:30:00.5+02:00. A DURATION is an
+      integer (ns) or a number and a unit (ns us ms s m h d w): 90s, 1h, 1d.
+      With --every, a window starts at a multiple of the duration since 1970
+      (an hour window on the hour, a day window at midnight UTC), whatever
+      --start is; --align start makes the first one start at --start
   kv-bench --db DIR [--ops N] [--value-size N] [--batch N]
       flashkv write / point-read / scan throughput
   parse-bench <capture> [--threads N] [--runs N] [--min-mpps X]
@@ -112,6 +120,19 @@ storage options (ingest, write, query, kv-bench):
 
 const STORAGE_FLAGS: [&str; 4] = ["db", "sync", "background", "fail-after"];
 
+/// The flags that describe a query (`query` and `client query`).
+const QUERY_FLAGS: [&str; 9] = [
+    "measurement",
+    "field",
+    "where",
+    "start",
+    "end",
+    "agg",
+    "every",
+    "align",
+    "top",
+];
+
 struct Args {
     pos: Vec<String>,
     flags: Vec<(String, String)>,
@@ -177,6 +198,18 @@ impl Args {
 
     fn num<T: FromStr>(&self, name: &str, default: T) -> Res<T> {
         Ok(self.opt(name)?.unwrap_or(default))
+    }
+
+    /// `--name`, a time (see `parse_time`), if given.
+    fn time(&self, name: &str) -> Res<Option<i64>> {
+        let parse = |s| parse_time(s, now_ns()).ok_or(format!("--{name}: invalid time {s:?}"));
+        Ok(self.get(name).map(parse).transpose()?)
+    }
+
+    /// `--name`, a duration (see `parse_duration`), if given.
+    fn duration(&self, name: &str) -> Res<Option<i64>> {
+        let parse = |s| parse_duration(s).ok_or(format!("--{name}: invalid duration {s:?}"));
+        Ok(self.get(name).map(parse).transpose()?)
     }
 }
 
@@ -299,7 +332,7 @@ fn query_args(a: &Args) -> Res<(Query, Option<usize>)> {
         a.get("measurement").unwrap_or("flows"),
         a.get("field").unwrap_or("bytes"),
     )
-    .range(a.num("start", i64::MIN)?, a.num("end", i64::MAX)?);
+    .range(a.time("start")?.unwrap_or(i64::MIN), a.time("end")?.unwrap_or(i64::MAX));
     for w in a.all("where") {
         let (k, v) = w
             .split_once('=')
@@ -310,12 +343,17 @@ fn query_args(a: &Args) -> Res<(Query, Option<usize>)> {
         .get("agg")
         .map(|s| Agg::parse(s).ok_or(format!("unknown aggregate {s:?}")))
         .transpose()?;
-    q.every = a.opt("every")?;
+    q.every = a.duration("every")?;
+    q.align = a
+        .get("align")
+        .map(|s| Align::parse(s).ok_or(format!("unknown alignment {s:?}")))
+        .transpose()?
+        .unwrap_or(Align::Calendar);
     Ok((q, a.opt::<usize>("top")?))
 }
 
 fn run_query(a: &Args) -> Res<String> {
-    a.check(&["measurement", "field", "where", "start", "end", "agg", "every", "top"])?;
+    a.check(&QUERY_FLAGS)?;
     let (q, top) = query_args(a)?;
     let db = open_db(db_options(a)?)?;
     let rows = db.query(&q)?;
@@ -752,21 +790,8 @@ fn each_report(c: &ClusterClient, req: &Request, strict: bool) -> Res<String> {
 }
 
 fn client(a: &Args) -> Res<String> {
-    a.check(&[
-        "nodes",
-        "timeout-ms",
-        "patience-ms",
-        "secret-file",
-        "local",
-        "measurement",
-        "field",
-        "where",
-        "start",
-        "end",
-        "agg",
-        "every",
-        "top",
-    ])?;
+    let own = ["nodes", "timeout-ms", "patience-ms", "secret-file", "local"];
+    a.check(&[&own[..], &QUERY_FLAGS[..]].concat())?;
     let nodes = (a.req("nodes")?.split(','))
         .map(|n| socket_addr("--nodes", n))
         .collect::<Res<Vec<_>>>()?;
@@ -870,7 +895,9 @@ mod tests {
             "--where expects tag=value, got \"nope\""
         );
         assert_eq!(err("query --db x --agg median"), "unknown aggregate \"median\"");
-        assert_eq!(err("query --db x --every soon"), "--every: invalid number \"soon\"");
+        assert_eq!(err("query --db x --every soon"), "--every: invalid duration \"soon\"");
+        assert_eq!(err("query --db x --every -1"), "--every: invalid duration \"-1\"");
+        assert_eq!(err("query --db x --align never"), "unknown alignment \"never\"");
         assert_eq!(err("query --db x --sync maybe"), "--sync: invalid number \"maybe\"");
         assert_eq!(
             err("query --db x --background maybe"),
@@ -893,8 +920,8 @@ mod tests {
             ("ingest c --db x --bucket-ns z", "--bucket-ns: invalid number \"z\""),
             ("write f --x 1", "unknown flag --x"),
             ("write f", "missing --db"),
-            ("query --db x --start z", "--start: invalid number \"z\""),
-            ("query --db x --end z", "--end: invalid number \"z\""),
+            ("query --db x --start z", "--start: invalid time \"z\""),
+            ("query --db x --end 2024-13-01", "--end: invalid time \"2024-13-01\""),
             ("kv-bench --x 1", "unknown flag --x"),
             ("kv-bench --ops z", "--ops: invalid number \"z\""),
             ("kv-bench --value-size z", "--value-size: invalid number \"z\""),
@@ -941,6 +968,11 @@ mod tests {
             assert!(out.ends_with("3 rows\n"), "{out}");
             let out = cmd(&format!("query --db {db} --measurement traffic --field packets --agg sum --start 0 --end 9223372036854775807 --every 3600000000000")).unwrap();
             assert!(out.contains("2000"), "{out}");
+            // The same with human units: calendar windows, and anchored at the start.
+            for align in ["calendar", "start"] {
+                let out = cmd(&format!("query --db {db} --measurement traffic --field packets --agg sum --start 1970-01-01 --end now+1d --every 1d --align {align}")).unwrap();
+                assert!(out.contains("2000"), "{align}: {out}");
+            }
             let out = cmd(&format!("query --db {db} --where proto=udp --where proto=tcp")).unwrap();
             assert_eq!(out, "0 rows\n");
             assert!(cmd(&format!("query --db {db} --start 5 --end 5")).is_err());

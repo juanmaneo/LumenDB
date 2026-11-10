@@ -40,6 +40,36 @@ impl Agg {
     }
 }
 
+/// Where the windows of an aggregation (`every`) start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    /// At multiples of the window, counted from 1970-01-01 UTC: a one-hour
+    /// window starts on the hour and a one-day window at midnight, whatever
+    /// the range asked for, and two queries (or two rollups) over different
+    /// ranges cut time the same way. This is the default.
+    Calendar,
+    /// At the start of the range (`start`), like InfluxDB's `GROUP BY time()`
+    /// with an offset. Without a start, the first window starts at `i64::MIN`.
+    Start,
+}
+
+impl Align {
+    pub fn parse(s: &str) -> Option<Align> {
+        match s {
+            "calendar" => Some(Align::Calendar),
+            "start" => Some(Align::Start),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Align::Calendar => "calendar",
+            Align::Start => "start",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Query {
     pub measurement: String,
@@ -52,6 +82,8 @@ pub struct Query {
     pub agg: Option<Agg>,
     /// Aggregation window (ns); `None` aggregates the whole range.
     pub every: Option<i64>,
+    /// Where the windows start.
+    pub align: Align,
 }
 
 impl Query {
@@ -65,6 +97,7 @@ impl Query {
             end: i64::MAX,
             agg: None,
             every: None,
+            align: Align::Calendar,
         }
     }
 
@@ -85,6 +118,11 @@ impl Query {
 
     pub fn every(mut self, every: i64) -> Self {
         self.every = Some(every);
+        self
+    }
+
+    pub fn align(mut self, align: Align) -> Self {
+        self.align = align;
         self
     }
 
@@ -135,12 +173,17 @@ pub fn evaluate(points: &[(i64, FieldValue)], q: &Query) -> Result<Vec<(i64, Fie
     let Some(agg) = q.agg else {
         return Ok(points.to_vec());
     };
-    let width = q.every.map_or(i128::MAX, i128::from);
-    let start = i128::from(q.start);
-    let window = |ts: i64| (i128::from(ts) - start) / width;
+    // Without a window, one window that starts at the start of the range.
+    let (origin, width) = match q.every {
+        None => (i128::from(q.start), i128::MAX),
+        Some(every) if q.align == Align::Start => (i128::from(q.start), i128::from(every)),
+        Some(every) => (0, i128::from(every)),
+    };
+    let window = |ts: i64| (i128::from(ts) - origin).div_euclid(width);
+    let stamp = |w: i128| (origin + w * width).clamp(i64::MIN.into(), i64::MAX.into()) as i64;
     points
         .chunk_by(|a, b| window(a.0) == window(b.0))
-        .map(|w| Ok(((start + window(w[0].0) * width) as i64, reduce(agg, w)?)))
+        .map(|w| Ok((stamp(window(w[0].0)), reduce(agg, w)?)))
         .collect()
 }
 
@@ -203,6 +246,54 @@ mod tests {
         let all = Query::new("m", "f").agg(Agg::Count);
         assert_eq!(evaluate(&p, &all).unwrap(), vec![(i64::MIN, FieldValue::UInt(3))]);
         assert!(evaluate(&[], &all).unwrap().is_empty());
+    }
+
+    #[test]
+    fn align_names_roundtrip() {
+        for a in [Align::Calendar, Align::Start] {
+            assert_eq!(Align::parse(a.name()), Some(a));
+        }
+        assert_eq!(Align::parse("first"), None);
+        assert_eq!(Query::new("m", "f").align, Align::Calendar);
+        assert_eq!(Query::new("m", "f").align(Align::Start).align, Align::Start);
+    }
+
+    #[test]
+    fn calendar_windows_ignore_where_the_range_starts() {
+        let p = pts(&[(-1, 32.0), (3, 1.0), (4, 2.0), (5, 4.0), (9, 8.0), (10, 16.0)]);
+        let q = Query::new("m", "f").range(-3, 20).agg(Agg::Sum).every(5);
+        let sums = |q: &Query| -> Vec<(i64, f64)> {
+            let in_range: Vec<_> = p
+                .iter()
+                .filter(|(t, _)| (q.start..q.end).contains(t))
+                .cloned()
+                .collect();
+            let rows = evaluate(&in_range, q).unwrap();
+            rows.into_iter().map(|(t, v)| (t, v.as_f64().unwrap())).collect()
+        };
+        // Windows are [-5, 0), [0, 5), [5, 10), [10, 15) wherever the range starts.
+        let calendar = [(-5, 32.0), (0, 3.0), (5, 12.0), (10, 16.0)];
+        assert_eq!(sums(&q), calendar);
+        assert_eq!(sums(&q.clone().range(3, 20))[..], calendar[1..]);
+        assert_eq!(sums(&q.clone().range(i64::MIN, i64::MAX))[..], calendar);
+        // Anchored at the start instead: [-3, 2), [2, 7), [7, 12).
+        let anchored = [(-3, 32.0), (2, 7.0), (7, 24.0)];
+        assert_eq!(sums(&q.clone().align(Align::Start)), anchored);
+    }
+
+    #[test]
+    fn windows_at_the_ends_of_time() {
+        let p = pts(&[(i64::MIN, 1.0), (i64::MAX, 2.0)]);
+        let q = Query::new("m", "f").agg(Agg::Count).every(i64::MAX);
+        // The first window would start below i64::MIN: its stamp saturates.
+        let stamps: Vec<i64> = evaluate(&p, &q).unwrap().into_iter().map(|r| r.0).collect();
+        assert_eq!(stamps, vec![i64::MIN, i64::MAX]);
+        let stamps: Vec<i64> = evaluate(&p, &q.align(Align::Start))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(stamps, vec![i64::MIN, i64::MAX - 1]);
     }
 
     #[test]

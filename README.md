@@ -333,7 +333,13 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
   (downsampling).
 - **Queries.** Range scans with tag filters, `sum`/`count`/`min`/`max`/`mean`
   per series and optional time window, and top-N (for example the heaviest
-  flows of a capture).
+  flows of a capture). Windows are calendar-aligned, as in QuestDB's
+  `SAMPLE BY`: a window of a duration `D` starts at a multiple of `D` since
+  1970-01-01 UTC (an hourly window on the hour, a daily one at midnight),
+  whatever range was asked for, so two queries or two rollups over different
+  ranges cut time the same way. `--align start` anchors the first window at
+  the start of the range instead. Times and durations are written the way a
+  person does: `--start 2024-05-01 --end now --every 15m`.
 
 ### cluster: a tsvdb replicated by Raft
 
@@ -411,7 +417,7 @@ $B gen-pcap /tmp/cap.pcapng --packets 1000000 --flows 5000 --format pcapng
 $B ingest /tmp/cap.pcapng --db /tmp/lumendb
 $B query --db /tmp/lumendb --agg sum --top 10                       # heaviest flows (bytes)
 $B query --db /tmp/lumendb --measurement traffic --field packets \
-         --agg sum --every 60000000000                            # packets per minute
+         --agg sum --every 1m                                     # packets per minute
 $B query --db /tmp/lumendb --where proto=udp --where dport=53 --agg count
 echo 'cpu,host=a usage=0.5 1700000000000000000' > /tmp/m.lp
 $B write /tmp/m.lp --db /tmp/lumendb

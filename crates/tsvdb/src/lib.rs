@@ -21,8 +21,9 @@ pub mod lineproto;
 pub mod partition;
 pub mod query;
 pub mod tags;
+pub mod time;
 
 pub use db::{capture_points, Db, DbOptions, DbStats};
 pub use error::{Error, Result};
 pub use lineproto::{FieldType, FieldValue, Point};
-pub use query::{Agg, Query, Row};
+pub use query::{Agg, Align, Query, Row};

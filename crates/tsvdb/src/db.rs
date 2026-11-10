@@ -30,6 +30,7 @@ use crate::lineproto::{self, FieldType, FieldValue, Point};
 use crate::partition::{encode_bucket, Partitioner};
 use crate::query::{self, Query, Row};
 use crate::tags::{Series, SeriesIndex};
+use crate::time::now_ns;
 use flashkv::codec::Decoder;
 use flashkv::varint::put_len_prefixed;
 use flashkv::WriteBatch;
@@ -39,7 +40,6 @@ use pcapfast::{FlowKey, FlowStats, FlowTable, ParseStats};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Points per `write_points` call when ingesting captures.
 pub const INGEST_BATCH: usize = 50_000;
@@ -132,12 +132,6 @@ type Points = Vec<(i64, FieldValue)>;
 
 /// Length of the `D`+col+bucket prefix shared by the chunks of a partition.
 pub(crate) const PARTITION_PREFIX: usize = 17;
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-}
 
 impl State {
     pub(crate) fn healthy(&self) -> Result<()> {
