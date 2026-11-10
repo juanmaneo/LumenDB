@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 use tsvdb::time::{now_ns, parse_duration, parse_time};
 use tsvdb::{query, Agg, Align, Db, DbOptions, Fill, Query};
 
+mod tsbs;
+
 pub type Res<T> = Result<T, Box<dyn Error>>;
 
 pub const USAGE: &str = "\
@@ -65,6 +67,23 @@ commands:
       this: use `client retain`
   kv-bench --db DIR [--ops N] [--value-size N] [--batch N]
       flashkv write / point-read / scan throughput
+  gen-cpu <out> [--hosts N] [--hours N] [--interval DURATION] [--seed N]
+      write the line protocol of a workload like TSBS's cpu-only: every host
+      (default 100) reports ten CPU gauges every --interval (default 10s) for
+      --hours (default 24, at most 65535), from 2016-01-01T00:00:00Z, as a
+      random walk between 0 and 100. The same seed gives the same file, so
+      another database can be given the data that tsdb-bench ingests
+  tsdb-bench --db DIR [--hosts N] [--hours N] [--interval DURATION] [--seed N]
+        [--batch N] [--runs N] [--flush-points N]
+      ingest that workload (in batches of --batch lines, default 5000, parsed
+      and written; DIR should be empty), then time queries like TSBS's
+      single-groupby (the max of a gauge of one host per minute, over 1 and
+      12 hours), cpu-max-all (ten gauges, one host, per hour over 8 hours),
+      double-groupby (the mean per host and hour over 12 hours, of one gauge
+      and of all ten), lastpoint, and the sum of everything. Each is run
+      --runs times (default 5, 0: no queries): the best and the median are
+      printed. There is no field predicate yet, so TSBS's high-cpu queries
+      are missing
   parse-bench <capture> [--threads N] [--runs N] [--min-mpps X]
       parse a capture N times (default 5) after one warm-up pass that loads it
       into the page cache. `wall` is the whole parse_file call (open, mmap,
@@ -131,7 +150,7 @@ commands:
       that fails with a timeout or a lost connection may or may not have been
       applied
 
-storage options (ingest, write, query, retain, kv-bench):
+storage options (ingest, write, query, retain, kv-bench, tsdb-bench):
   --sync 0|1        fsync every write (default 1)
   --background 0|1  flush/compact on a background thread (default 1)
   --fail-after N    inject an I/O error at the N-th filesystem operation
@@ -904,6 +923,8 @@ pub fn run(args: &[String]) -> Res<String> {
         Some("query") => run_query(&a),
         Some("retain") => retain(&a),
         Some("kv-bench") => kv_bench(&a),
+        Some("gen-cpu") => tsbs::gen_cpu(&a),
+        Some("tsdb-bench") => tsbs::tsdb_bench(&a),
         Some("parse-bench") => parse_bench(&a),
         Some("vopr") => vopr(&a),
         Some("cluster-demo") => cluster_demo(&a),
