@@ -53,6 +53,8 @@ pub struct DbOptions {
     pub flush_points: usize,
     /// Chunks of one column/partition that make compaction merge them.
     pub compact_min_chunks: usize,
+    /// The most rows a query may make by filling empty windows.
+    pub max_fill_rows: usize,
 }
 
 impl Default for DbOptions {
@@ -62,6 +64,7 @@ impl Default for DbOptions {
             partition: Partitioner::hourly(),
             flush_points: 100_000,
             compact_min_chunks: 4,
+            max_fill_rows: query::MAX_FILL_ROWS,
         }
     }
 }
@@ -434,7 +437,8 @@ impl Db {
         q.validate()?;
         let mut rows = Vec::new();
         for (series, points) in self.read_series(q)? {
-            for (ts, value) in query::evaluate(&points, q)? {
+            let budget = self.opts.max_fill_rows.saturating_sub(rows.len());
+            for (ts, value) in query::evaluate_within(&points, q, budget)? {
                 rows.push(Row {
                     series: series.key(),
                     tags: series.tags.clone(),
@@ -539,7 +543,7 @@ impl Db {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::query::Agg;
+    use crate::query::{Agg, Fill};
     use flashkv::env::{Env, FaultEnv, OsEnv};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -602,6 +606,48 @@ pub(crate) mod tests {
         for d in [a, b, tmpdir("dump-c")] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn fill_applies_to_stored_and_buffered_points() {
+        let dir = tmpdir("fill");
+        let mut o = opts();
+        o.max_fill_rows = 15;
+        let db = Db::open(&dir, o).unwrap();
+        let s = 1_000_000_000;
+        db.write_points(&[cpu("a", s, 1.0), cpu("a", 4 * s, 4.0), cpu("b", 2 * s, 7.0)])
+            .unwrap();
+        db.flush().unwrap();
+        db.write_points(&[cpu("a", 6 * s, 6.0)]).unwrap();
+        let q = Query::new("cpu", "usage")
+            .filter("host", "a")
+            .range(0, 8 * s)
+            .agg(Agg::Max)
+            .every(s)
+            .fill(Fill::Prev);
+        let got: Vec<(i64, f64)> = db
+            .query(&q)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.ts / s, r.value.as_f64().unwrap()))
+            .collect();
+        // Nothing before the first point; the last one is carried to the end.
+        let want = [(1, 1.0), (2, 1.0), (3, 1.0), (4, 4.0), (5, 4.0), (6, 6.0), (7, 6.0)];
+        assert_eq!(got, want);
+        // Each series is filled on its own.
+        let both = Query::new("cpu", "usage")
+            .range(0, 8 * s)
+            .agg(Agg::Max)
+            .every(s)
+            .fill(Fill::Value(0.0));
+        let rows = db.query(&both.clone().range(0, 7 * s)).unwrap();
+        assert_eq!(rows.len(), 14);
+        assert_eq!(rows.iter().filter(|r| r.series == "cpu,host=b").count(), 7);
+        // The budget is for the whole query: 8 rows for the first series leave 7.
+        let e = db.query(&both).unwrap_err().to_string();
+        assert!(e.contains("filling would make 8 rows, more than the 7 allowed"), "{e}");
+        // And a query that fills needs an aggregate and a window.
+        assert!(db.query(&Query::new("cpu", "usage").fill(Fill::Prev)).is_err());
     }
 
     #[test]

@@ -26,4 +26,4 @@ pub mod time;
 pub use db::{capture_points, Db, DbOptions, DbStats};
 pub use error::{Error, Result};
 pub use lineproto::{FieldType, FieldValue, Point};
-pub use query::{Agg, Align, Query, Row};
+pub use query::{Agg, Align, Fill, Query, Row};

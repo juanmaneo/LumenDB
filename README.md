@@ -343,8 +343,19 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
     asked for, so two queries or two rollups over different ranges cut time
     the same way. `--align start` anchors the first window at the start of
     the range instead.
+  - A window without points is left out, unless `--fill` makes a row for it
+    (QuestDB's `FILL`): `prev` repeats the value of the window before,
+    `linear` draws a line between the windows around it, and a number is a
+    constant of the type of the result (an integer result rounds it). The
+    rows cover `--start` to `--end` when both are given, and the data's own
+    range otherwise. There is no null in tsvdb: when a fill has nothing to
+    put (`prev` or `linear` before the first window, `linear` after the last
+    one), the window stays out, and a series with no point in the range has
+    no rows. A fill that would make more than `max_fill_rows` rows (a million
+    by default, in total) is an error, so a one-nanosecond window over a
+    year cannot exhaust the memory.
   - Times and durations are written the way a person does:
-    `--start 2024-05-01 --end now --every 15m`.
+    `--start 2024-05-01 --end now --every 15m --fill prev`.
 
 ### cluster: a tsvdb replicated by Raft
 

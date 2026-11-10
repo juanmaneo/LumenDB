@@ -11,7 +11,7 @@
 //! | `PING` | `OK PONG` |
 //! | `STATUS` | `OK id=1 role=leader term=3 leader=1 voters=1,2,3 learners= commit=9 applied=9 snapshot=0 raft=ADDR` |
 //! | `WRITE <bytes>`, a newline, then that many bytes of line protocol | `OK <points>` |
-//! | `QUERY <consistent\|local> <measurement> <field> [start=NS] [end=NS] [agg=A] [every=NS] [align=calendar\|start] [top=N] [where=<tag>=<value>]...` | `ROWS <n>`, then n lines `series TAB ts TAB value` |
+//! | `QUERY <consistent\|local> <measurement> <field> [start=NS] [end=NS] [agg=A] [every=NS] [align=calendar\|start] [fill=prev\|linear\|NUMBER] [top=N] [where=<tag>=<value>]...` | `ROWS <n>`, then n lines `series TAB ts TAB value` |
 //! | `PEER <id> <addr>` | `OK ok`: where to send messages to node `id` (saved: it is still known after a restart) |
 //! | `ADD-LEARNER <id>`, `REMOVE-LEARNER <id>` | `OK added`, `OK removed` |
 //! | `ADD-VOTER <id>`, `REMOVE-VOTER <id>` | `OK <index of the configuration entry>` |
@@ -61,7 +61,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use tsvdb::{Agg, Align, Query};
+use tsvdb::{Agg, Align, Fill, Query};
 
 /// The longest request line, in bytes.
 pub const MAX_HEADER: u64 = 64 * 1024;
@@ -349,6 +349,9 @@ fn query_line(consistent: bool, q: &Query, top: Option<u64>) -> String {
     if q.align != Align::Calendar {
         let _ = write!(s, " align={}", q.align.name());
     }
+    if let Some(fill) = q.fill {
+        let _ = write!(s, " fill={}", fill.name());
+    }
     if let Some(n) = top {
         let _ = write!(s, " top={n}");
     }
@@ -410,6 +413,7 @@ fn parse_query(mode: &str, measurement: &str, field: &str, options: &[&str]) -> 
             "end" => query.end = int(value)?,
             "every" => query.every = Some(int(value)?),
             "align" => query.align = Align::parse(value).ok_or("unknown alignment")?,
+            "fill" => query.fill = Some(Fill::parse(value).ok_or("unknown fill")?),
             "top" => top = Some(uint(value)?),
             "agg" => query.agg = Some(Agg::parse(value).ok_or("unknown aggregate")?),
             "where" => {
@@ -1019,6 +1023,7 @@ mod tests {
             .filter("dc", "");
         full.every = Some(60);
         full.align = Align::Start;
+        full.fill = Some(Fill::Value(-0.25));
         let mut all = vec![
             Request::Ping,
             Request::Status,
@@ -1111,6 +1116,7 @@ mod tests {
             ("QUERY local m f top=x\n", "not a number"),
             ("QUERY local m f agg=median\n", "unknown aggregate"),
             ("QUERY local m f align=never\n", "unknown alignment"),
+            ("QUERY local m f fill=nan\n", "unknown fill"),
             ("QUERY local m f where=abc\n", "where= expects tag=value"),
             ("QUERY local m f where=%zz=v\n", "bad %-escape"),
             ("QUERY local m f where=k=%zz\n", "bad %-escape"),
