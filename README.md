@@ -19,7 +19,7 @@ keep the short names (`use flashkv::Db`, through `package = "lumen-flashkv"`).
 | [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli, QuestDB |
 | [`cluster`](crates/cluster) (`lumen-cluster`) | tsvdb replicated by raft | TigerBeetle, CockroachDB |
 | [`bench`](crates/bench) (`lumen-bench`) | command line, binary `bench`: generate, ingest, query, benchmark, run and drive a cluster | — |
-| [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `vopr` / `bench` | cargo-xtask |
+| [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `vopr` / `bench` / `release` / `publish` | cargo-xtask |
 | [`proofs`](proofs) | kani model-checking harnesses | — |
 
 ## Architecture
@@ -310,6 +310,11 @@ db.ingest_capture(&stats)?;
 | `cargo xtask kani` | the proofs, with virtual memory capped at 8 GiB |
 | `cargo xtask vopr [--seeds N]` | the Raft simulation in release mode |
 | `cargo xtask bench` | writes a 3.6 GB synthetic capture and runs `parse-bench` on it |
+| `cargo xtask release VERSION` | bumps every crate, releases the `Unreleased` section of [`CHANGELOG.md`](CHANGELOG.md) (the commit subjects since the last tag if it is empty), runs `dev-check` and a publish dry run, then commits and tags `vVERSION` |
+| `cargo xtask publish` | `cargo publish` of every crate of the tagged HEAD in dependency order; run again after crates.io's rate limit on new crates (published versions are skipped) |
+
+Nothing is pushed: a release is `cargo xtask release 0.2.0`,
+`cargo xtask publish`, then `git push origin HEAD v0.2.0`.
 
 Prerequisites: `cargo install cargo-llvm-cov` and
 `cargo install --locked kani-verifier && cargo kani setup`.

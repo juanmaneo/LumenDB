@@ -19,7 +19,10 @@ fn xtask(args: &[&str], cargo: Option<&str>) -> Output {
 fn help_and_failures() {
     let out = xtask(&["help"], None);
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("dev-check"));
+    let help = String::from_utf8_lossy(&out.stdout);
+    for task in ["dev-check", "release VERSION", "publish"] {
+        assert!(help.contains(task), "{task}");
+    }
 
     let out = xtask(&["deploy"], None);
     assert_eq!(out.status.code(), Some(1));
