@@ -35,15 +35,17 @@ time-series database. LumenDB is written entirely in Rust and depends only on
         v                                       v
  +-----------------------------------------------------+
  | tsvdb                                               |
+ | typed columns in memory, CRC-framed log of its own  |---> files: NNNN.tswal
  +-----------------------------------------------------+
         |
-        | WAL record + series/schema
-        | flush: Gorilla chunks per column and hour
+        | series/schema; flush: Gorilla chunks per column
+        | and hour, and the statistics of each chunk
         v
  +-----------------------------------------------------+
  | flashkv                                             |<-- compactor thread
  |                                                     |    (snapshot read, atomic batch)
- |                                                     |<-- queries (snapshot)
+ |                                                     |<-- queries (snapshot, statistics,
+ |                                                     |    columns read on several threads)
  +-----------------------------------------------------+
         |
         | pread, CRC-checked
@@ -321,12 +323,26 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
   unsigned, boolean and string fields. Each measurement plus tag set is a
   series, held in an inverted tag index. Each (series, field) pair is a typed
   column, and a field keeps its first type.
-- **Write path.** One flashkv batch holds the new series, schema and column
-  entries plus a line-protocol WAL record, so an acknowledged write survives
-  a power loss. The points then go to an in-memory buffer. A flush turns the
-  buffer into immutable **chunks**, one per column and hour partition. Chunks
-  use delta-of-delta timestamps, Gorilla XOR floats, zigzag-delta integers
-  and bit-packed booleans.
+- **Write path.** A write is turned into typed columns: for each column, a
+  vector of timestamps and one of values. New series, fields and columns go
+  to flashkv first; then the columns are appended, as one CRC-framed binary
+  record, to a write-ahead log that is a file of its own (with `sync` on, it
+  is fsynced before the write returns), so an acknowledged write survives a
+  power loss. The columns then join the in-memory buffer. A flush turns the
+  buffer into immutable **chunks**, one per column and hour partition, built
+  on several threads, and starts a new log. Chunks use delta-of-delta
+  timestamps, Gorilla XOR floats, zigzag-delta integers and bit-packed
+  booleans. Next to each chunk is a small entry of **statistics**: its
+  number of points, first and last timestamp, and for numbers the sum, the
+  minimum, the maximum and the first and last value.
+- **Fast ingestion.** Plain lines (no escapes, no quotes) of a series that
+  was seen before are parsed straight into the columns, with no point made:
+  the text of the series is looked up as it is, and says which columns the
+  fields go to. The float and integer readers give exactly what `str::parse`
+  gives (a test checks it on random text). Anything else (a new series,
+  fields in another order, a string) goes through the full line protocol
+  parser, which is also what reports errors. A large write is parsed in
+  pieces on several threads.
 - **Compaction and downsampling.** Compaction merges a partition's chunks
   from a snapshot and publishes the result with one atomic batch, so reads
   are never blocked. `rollup` writes windowed aggregates as a new measurement
@@ -347,6 +363,18 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
 - **Queries.** Range scans with tag filters, `sum`/`count`/`min`/`max`/`mean`
   and `first`/`last` per series and optional time window, and top-N (for
   example the heaviest flows of a capture).
+  - A query first looks at the statistics of the chunks of its columns
+    (read once and kept in memory, and kept up to date by flushes,
+    compaction and retention). A chunk outside the range is not read. A
+    chunk that lies inside the range and inside one window is answered from
+    its statistics alone, without decoding it. The other chunks are decoded
+    and folded into their windows a run of values at a time, with no point
+    made. When two chunks overlap in time (a point written again, or out of
+    order), the query falls back to sorting and deduplicating the points,
+    and a test checks the two paths against each other.
+  - The columns of the series are read on several threads when the work is
+    worth it: the first columns are timed, and threads are only started if
+    the rest is estimated to take long enough.
   - `first` and `last` work on any field type, and with `min` and `max`
     give open/high/low/close bars. `sum` and `mean` use Neumaier's
     compensated summation, so small values are not lost next to big ones.
@@ -369,11 +397,10 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
     year cannot exhaust the memory.
   - `latest` (`--latest 1`, QuestDB's `LATEST ON`) gives the newest point
     of each series in the range, with its own timestamp: the current value
-    of every host, say, or the top N of them. It reads the keys of a
-    column's chunks but decodes only the newest partition (or the one
-    before, if the newest has nothing in range), so a long history costs a
-    key scan, not a decode of every point. It takes no aggregate and no
-    window.
+    of every host, say, or the top N of them. It looks only at the newest
+    partition that has a point in range, and a chunk that lies inside the
+    range has its newest point in its statistics, so a long history costs
+    nothing more. It takes no aggregate and no window.
   - Times and durations are written the way a person does:
     `--start 2024-05-01 --end now --every 15m --fill prev`. Units are
     `ns us ms s m h d w`; a month or a year is not one, because it is not
@@ -401,6 +428,63 @@ a plain column), `FILL(NULL)` (there is no null), `DEDUP` (the last write to
 a series, field and timestamp already wins), Parquet, and the network
 interfaces (ILP over TCP, REST, the PostgreSQL wire protocol): each needs a
 library or a wire format this project would have to write and keep.
+
+#### Measured against QuestDB
+
+`bench gen-cpu` writes a workload like the "cpu-only" use case of
+[TSBS](https://github.com/timescale/tsbs): 100 hosts, each reporting ten
+CPU gauges every 10 s for 24 hours, so 864,000 rows and 8.64 million values.
+`bench tsdb-bench` ingests the same data and times queries modelled on
+TSBS's. The comparison below is QuestDB 10.2.0 (with its bundled JRE and
+default configuration) given the same file over ILP/TCP, with the same
+queries in SQL over its REST interface.
+
+Setup: AMD Ryzen 7 5800U (8 cores, 16 threads), 62 GB of RAM, ext4 on an
+NVMe SSD, both databases on the same disk, run one after the other.
+
+Ingestion, in rows per second (each row has ten values):
+
+| | LumenDB | QuestDB |
+|---|---|---|
+| 1 writer, no fsync | 598,000 | 262,000 (1 ILP connection) |
+| 4 writers, no fsync | 765,000 | 326,000 (8 ILP connections) |
+| 1 writer, fsync per batch of 5000 rows | 471,000 | (not its default) |
+| 4 writers, fsync per batch | 604,000 | |
+
+Queries, best of 10 runs, in milliseconds:
+
+| query | LumenDB | QuestDB (server `execute` time) |
+|---|---|---|
+| single-groupby-1-1-1: max of a gauge of one host, per minute, 1 h | 0.018 | 2.0 |
+| single-groupby-1-1-12: the same over 12 h | 0.24 | 5.5 |
+| cpu-max-all-1: max of ten gauges of one host, per hour, 8 h | 0.030 | 2.6 |
+| double-groupby-1: mean of a gauge per host and hour, 12 h | 0.22 | 9.9 |
+| double-groupby-all: the same for ten gauges | 2.4 | 13.1 |
+| lastpoint: the newest values of every host | 0.53 | 1.2 |
+| sum-everything-1: sum of a gauge per host, all data | 0.24 | 4.0 |
+| sum-everything-all: the same for ten gauges | 2.9 | 20.7 |
+
+On disk: 75 MB for LumenDB, about 560 MB for QuestDB's table directories.
+
+What these numbers do and do not say:
+
+- LumenDB is measured in process. QuestDB is a server: its ingestion goes
+  through a TCP socket from a Python sender (which may limit it, especially
+  over one connection), and its query times above are its own `execute`
+  timings, without HTTP and JSON. A LumenDB server would pay for its own
+  network protocol.
+- QuestDB does not fsync by default. LumenDB with `--sync 1` fsyncs the log
+  once per write call, here a batch of 5000 rows.
+- Several of these queries use windows of an hour, which is LumenDB's
+  partition size, so chunks are answered from their statistics. Queries
+  whose windows cut through chunks (per minute, above) decode them, and are
+  still well ahead here; a query that has to look at most points (a filter
+  on a value, which LumenDB does not have yet, or raw scans) would show a
+  smaller gap or none.
+- This is one workload on one machine, with QuestDB's default settings. It
+  is not TSBS itself, and QuestDB has features LumenDB lacks (SQL, joins,
+  value filters, the PostgreSQL wire protocol). To reproduce:
+  `bench gen-cpu cpu.lp` and `bench tsdb-bench --db DIR --sync 0 --runs 10`.
 
 ### cluster: a tsvdb replicated by Raft
 
@@ -497,6 +581,8 @@ $B retain --db /tmp/lumendb --keep 7d                             # drop what is
 echo 'cpu,host=a usage=0.5 1700000000000000000' > /tmp/m.lp
 $B write /tmp/m.lp --db /tmp/lumendb
 $B kv-bench --db /tmp/kv --ops 1000000 --sync 0                   # flashkv throughput
+$B gen-cpu /tmp/cpu.lp                                            # TSBS-like cpu data, as line protocol
+$B tsdb-bench --db /tmp/tsdb --sync 0 --runs 10 --writers 4       # ingest it, then time queries
 $B parse-bench /tmp/cap.pcapng --runs 5 --min-mpps 5              # pcapfast throughput
 $B cluster-demo --packets 1000000 --flows 5000                    # 3 replicated nodes, then a failover
 $B vopr --seeds 200                                               # Raft simulation: faults and membership

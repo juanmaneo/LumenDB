@@ -1,8 +1,9 @@
 //! tsvdb: columnar time-series database on top of flashkv, inspired by
 //! InfluxDB v3 (IOx).
 //!
-//! - Writes arrive as line protocol ([`lineproto`]), are made durable in a
-//!   flashkv-backed write-ahead batch, and land in an in-memory write buffer.
+//! - Writes arrive as line protocol ([`lineproto`]), are turned into typed
+//!   columns, made durable in a write-ahead log of their own, and land in an
+//!   in-memory write buffer.
 //! - Each measurement + tag set is a series ([`tags`]); each (series, field)
 //!   is a typed column.
 //! - The buffer is flushed into immutable columnar chunks ([`chunk`]:
@@ -11,7 +12,7 @@
 //! - [`compact`] merges partitions in the background from a snapshot with one
 //!   atomic batch, so reads are never blocked, and rolls data up (downsampling).
 //! - [`query`] evaluates range scans and sum/count/min/max/mean/first/last
-//!   aggregates, optionally per calendar-aligned time window with a fill for
+//!   aggregates (from the statistics of whole chunks where it can), optionally per calendar-aligned time window with a fill for
 //!   empty ones, the latest point of each series, and top-N (e.g. the
 //!   heaviest pcap flows). [`time`] reads durations and dates.
 //! - [`retain`] drops the partitions older than a time to live.

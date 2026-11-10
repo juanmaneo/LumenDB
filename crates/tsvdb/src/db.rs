@@ -1,20 +1,25 @@
-//! The database: every byte lives in flashkv (crash-safe, no mmap).
+//! The database: chunks, their statistics and the catalog live in flashkv
+//! (crash-safe, no mmap); the write-ahead log is a file of its own.
 //!
 //! Write path (InfluxDB v3 style WAL + write buffer):
-//! 1. points are validated against the schema (a field keeps its first type);
-//! 2. one flashkv batch atomically stores the new series / schema / column
-//!    entries plus the points as a line-protocol WAL record — when
-//!    `write_points` returns `Ok` the points survive a power loss;
-//! 3. points join the in-memory write buffer.
+//! 1. points are validated against the schema (a field keeps its first type)
+//!    and turned into typed columns ([`crate::batch`]; plain lines of known
+//!    series go straight there, see [`crate::fast`]);
+//! 2. new series / schema / column entries are stored in flashkv, then the
+//!    columns are appended to the log as one CRC-framed record (fsynced with
+//!    `sync`) — when the write returns `Ok` the points survive a power loss;
+//! 3. the columns join the in-memory write buffer.
 //!
 //! When the buffer is large enough it is flushed: one batch writes a
-//! compressed [`Chunk`] per column and partition and deletes the WAL records
-//! it covers. At open the index is rebuilt and pending WAL records replayed.
+//! compressed [`Chunk`] and its [`ChunkStats`] per column and partition, and
+//! names the new log that writes go to from then on; the old logs are
+//! removed. At open the index is rebuilt and the live logs replayed (a torn
+//! tail is dropped, damage is an error).
 //!
-//! Reads take a flashkv snapshot plus a copy of the matching buffered points
-//! under a short lock, then decode chunks without any lock; compaction
-//! ([`crate::compact`]) rewrites chunks with atomic batches, so it never blocks
-//! nor disturbs readers.
+//! Reads take a flashkv snapshot, the statistics of the chunks and a copy of
+//! the matching buffered points under a short lock, then work without any
+//! lock; compaction ([`crate::compact`]) rewrites chunks with atomic batches,
+//! so it never blocks nor disturbs readers.
 //!
 //! Any storage failure poisons the database (like LevelDB's background
 //! error): later calls fail until it is reopened, which recovers exactly the
@@ -23,7 +28,7 @@
 //! Key space: `C`+sid+field → column, `D`+col+bucket+seq → chunk,
 //! `E`+col+bucket+seq → statistics of that chunk (see [`ChunkStats`]),
 //! `F`+measurement+field → type, `Mseq` → sequence, `S`+series key → series,
-//! `V` → format of the database, `W`+seq → WAL record.
+//! `V` → format of the database, `Z` → the first live log.
 
 use crate::agg::{self, Aggregator, Slice};
 use crate::batch::{self, Batch, ColumnPoints};
