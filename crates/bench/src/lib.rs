@@ -38,7 +38,7 @@ commands:
   write <file.lp> --db DIR
       write InfluxDB line protocol
   query --db DIR [--measurement M] [--field F] [--where tag=value]... [--start TIME]
-        [--end TIME] [--agg sum|count|min|max|mean] [--every DURATION]
+        [--end TIME] [--agg sum|count|min|max|mean|first|last] [--every DURATION]
         [--align calendar|start] [--top N]
       query tsvdb (default: raw `flows` bytes). A TIME is an integer (ns since
       1970), `now`, `now-1h` or `now+30s`, or a UTC date: 2024-05-01,

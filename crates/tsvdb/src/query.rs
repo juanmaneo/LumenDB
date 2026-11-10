@@ -1,6 +1,6 @@
 //! Queries: a time range over one field of a measurement, filtered by tag
-//! equality, optionally aggregated (sum/count/min/max/mean) per series and
-//! per time window (`GROUP BY time(every)`), plus top-N ranking — e.g. the
+//! equality, optionally aggregated (sum/count/min/max/mean/first/last) per
+//! series and per time window (`GROUP BY time(every)`), plus top-N ranking — e.g. the
 //! heaviest flows of an ingested capture ([`top_flows`]).
 
 use crate::db::Db;
@@ -15,6 +15,10 @@ pub enum Agg {
     Min,
     Max,
     Mean,
+    /// The value of the earliest point of the window, of any field type.
+    First,
+    /// The value of the latest point of the window, of any field type.
+    Last,
 }
 
 impl Agg {
@@ -25,6 +29,8 @@ impl Agg {
             "min" => Some(Agg::Min),
             "max" => Some(Agg::Max),
             "mean" => Some(Agg::Mean),
+            "first" => Some(Agg::First),
+            "last" => Some(Agg::Last),
             _ => None,
         }
     }
@@ -36,6 +42,8 @@ impl Agg {
             Agg::Min => "min",
             Agg::Max => "max",
             Agg::Mean => "mean",
+            Agg::First => "first",
+            Agg::Last => "last",
         }
     }
 }
@@ -145,6 +153,29 @@ pub struct Row {
     pub value: FieldValue,
 }
 
+/// Neumaier's compensated sum: the rounding error of each addition is
+/// accumulated on the side and added back, so a long series of floats of
+/// very different sizes does not lose the small ones (`1e100 + 1 - 1e100` is
+/// 1, not 0). A sum that is infinite or NaN is the plain one.
+fn sum(values: &[f64]) -> f64 {
+    let (mut total, mut error) = (0.0, 0.0);
+    for &x in values {
+        let t = total + x;
+        error += if total.abs() >= x.abs() {
+            (total - t) + x
+        } else {
+            (x - t) + total
+        };
+        total = t;
+    }
+    let compensated = total + error;
+    if compensated.is_nan() {
+        total
+    } else {
+        compensated
+    }
+}
+
 fn reduce(agg: Agg, window: &[(i64, FieldValue)]) -> Result<FieldValue> {
     let numeric = || -> Result<Vec<f64>> {
         window
@@ -157,12 +188,14 @@ fn reduce(agg: Agg, window: &[(i64, FieldValue)]) -> Result<FieldValue> {
     };
     Ok(match agg {
         Agg::Count => FieldValue::UInt(window.len() as u64),
-        Agg::Sum => FieldValue::Float(numeric()?.iter().sum()),
+        Agg::First => window[0].1.clone(),
+        Agg::Last => window[window.len() - 1].1.clone(),
+        Agg::Sum => FieldValue::Float(sum(&numeric()?)),
         Agg::Min => FieldValue::Float(numeric()?.into_iter().fold(f64::INFINITY, f64::min)),
         Agg::Max => FieldValue::Float(numeric()?.into_iter().fold(f64::NEG_INFINITY, f64::max)),
         Agg::Mean => {
             let v = numeric()?;
-            FieldValue::Float(v.iter().sum::<f64>() / v.len() as f64)
+            FieldValue::Float(sum(&v) / v.len() as f64)
         }
     })
 }
@@ -212,7 +245,15 @@ mod tests {
 
     #[test]
     fn agg_names_roundtrip() {
-        for a in [Agg::Sum, Agg::Count, Agg::Min, Agg::Max, Agg::Mean] {
+        for a in [
+            Agg::Sum,
+            Agg::Count,
+            Agg::Min,
+            Agg::Max,
+            Agg::Mean,
+            Agg::First,
+            Agg::Last,
+        ] {
             assert_eq!(Agg::parse(a.name()), Some(a));
         }
         assert_eq!(Agg::parse("median"), None);
@@ -238,6 +279,8 @@ mod tests {
             (Agg::Min, FieldValue::Float(2.0)),
             (Agg::Max, FieldValue::Float(9.0)),
             (Agg::Mean, FieldValue::Float(5.0)),
+            (Agg::First, FieldValue::Float(2.0)),
+            (Agg::Last, FieldValue::Float(9.0)),
         ];
         for (agg, want) in expect {
             assert_eq!(evaluate(&p, &q.clone().agg(agg)).unwrap(), vec![(0, want)]);
@@ -312,13 +355,60 @@ mod tests {
     }
 
     #[test]
-    fn non_numeric_aggregates_fail_except_count() {
+    fn non_numeric_aggregates_fail_except_count_first_and_last() {
         let p = vec![(1, FieldValue::Str("x".into())), (2, FieldValue::Bool(true))];
         let q = Query::new("m", "f");
         for agg in [Agg::Sum, Agg::Min, Agg::Max, Agg::Mean] {
             assert!(evaluate(&p, &q.clone().agg(agg)).is_err());
         }
-        assert_eq!(evaluate(&p, &q.agg(Agg::Count)).unwrap()[0].1, FieldValue::UInt(2));
+        assert_eq!(
+            evaluate(&p, &q.clone().agg(Agg::Count)).unwrap()[0].1,
+            FieldValue::UInt(2)
+        );
+        assert_eq!(
+            evaluate(&p, &q.clone().agg(Agg::First)).unwrap()[0].1,
+            FieldValue::Str("x".into())
+        );
+        assert_eq!(evaluate(&p, &q.agg(Agg::Last)).unwrap()[0].1, FieldValue::Bool(true));
+    }
+
+    #[test]
+    fn open_high_low_close_per_window() {
+        let p = pts(&[(0, 5.0), (1, 9.0), (2, 1.0), (3, 6.0), (10, 7.0), (11, 7.5)]);
+        let bars = |agg| -> Vec<f64> {
+            let q = Query::new("m", "f").agg(agg).every(10);
+            evaluate(&p, &q)
+                .unwrap()
+                .iter()
+                .map(|r| r.1.as_f64().unwrap())
+                .collect()
+        };
+        assert_eq!(bars(Agg::First), [5.0, 7.0]);
+        assert_eq!(bars(Agg::Max), [9.0, 7.5]);
+        assert_eq!(bars(Agg::Min), [1.0, 7.0]);
+        assert_eq!(bars(Agg::Last), [6.0, 7.5]);
+    }
+
+    #[test]
+    fn sums_are_compensated() {
+        // The naive sum of these is 0 (or 1, by order); the exact one is 2.
+        let hard = [1e100, 1.0, -1e100, 1.0];
+        assert_eq!(hard.iter().sum::<f64>(), 1.0);
+        assert_eq!(sum(&hard), 2.0);
+        assert_eq!(sum(&[1.0, 1e100, 1.0, -1e100]), 2.0);
+        assert_eq!(sum(&[]), 0.0);
+        assert_eq!(sum(&[0.1; 10]), 1.0);
+        assert_eq!([0.1; 10].iter().sum::<f64>(), 0.9999999999999999);
+        // Infinities and NaN are not turned into something else.
+        assert_eq!(sum(&[1.0, f64::INFINITY]), f64::INFINITY);
+        assert_eq!(sum(&[f64::INFINITY, 1.0]), f64::INFINITY);
+        assert_eq!(sum(&[f64::NEG_INFINITY, 1.0]), f64::NEG_INFINITY);
+        assert_eq!(sum(&[f64::MAX, f64::MAX]), f64::INFINITY);
+        assert!(sum(&[f64::INFINITY, f64::NEG_INFINITY]).is_nan());
+        assert!(sum(&[1.0, f64::NAN]).is_nan());
+        let mean = pts(&[(1, 1e100), (2, 1.0), (3, -1e100), (4, 1.0)]);
+        let q = Query::new("m", "f").agg(Agg::Mean);
+        assert_eq!(evaluate(&mean, &q).unwrap()[0].1, FieldValue::Float(0.5));
     }
 
     #[test]

@@ -332,14 +332,19 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
   are never blocked. `rollup` writes windowed aggregates as a new measurement
   (downsampling).
 - **Queries.** Range scans with tag filters, `sum`/`count`/`min`/`max`/`mean`
-  per series and optional time window, and top-N (for example the heaviest
-  flows of a capture). Windows are calendar-aligned, as in QuestDB's
-  `SAMPLE BY`: a window of a duration `D` starts at a multiple of `D` since
-  1970-01-01 UTC (an hourly window on the hour, a daily one at midnight),
-  whatever range was asked for, so two queries or two rollups over different
-  ranges cut time the same way. `--align start` anchors the first window at
-  the start of the range instead. Times and durations are written the way a
-  person does: `--start 2024-05-01 --end now --every 15m`.
+  and `first`/`last` per series and optional time window, and top-N (for
+  example the heaviest flows of a capture).
+  - `first` and `last` work on any field type, and with `min` and `max`
+    give open/high/low/close bars. `sum` and `mean` use Neumaier's
+    compensated summation, so small values are not lost next to big ones.
+  - Windows are calendar-aligned, as in QuestDB's `SAMPLE BY`: a window of
+    a duration `D` starts at a multiple of `D` since 1970-01-01 UTC (an
+    hourly window on the hour, a daily one at midnight), whatever range was
+    asked for, so two queries or two rollups over different ranges cut time
+    the same way. `--align start` anchors the first window at the start of
+    the range instead.
+  - Times and durations are written the way a person does:
+    `--start 2024-05-01 --end now --every 15m`.
 
 ### cluster: a tsvdb replicated by Raft
 
