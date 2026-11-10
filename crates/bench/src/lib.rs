@@ -399,20 +399,19 @@ fn run_query(a: &Args) -> Res<String> {
 /// for how long.
 fn retain_args(a: &Args) -> Res<(Option<String>, i64)> {
     let keep = a.duration("keep")?.ok_or("missing --keep")?;
+    if keep == 0 {
+        return Err("--keep must be more than 0".into());
+    }
     Ok((a.get("measurement").map(str::to_string), keep))
 }
 
 fn retain(a: &Args) -> Res<String> {
     a.check(&["keep", "measurement"])?;
     let (measurement, keep) = retain_args(a)?;
-    let measurement = measurement.as_deref();
     let db = open_db(db_options(a)?)?;
-    let out = match db.retention_cutoff(measurement, keep, now_ns())? {
+    let out = match db.retain(measurement.as_deref(), keep, now_ns())? {
         None => "no data: nothing to drop\n".to_string(),
-        Some(cutoff) => {
-            let chunks = db.drop_before(measurement, cutoff)?;
-            format!("dropped {chunks} chunks that end before {cutoff} ns since 1970\n")
-        }
+        Some((cutoff, chunks)) => format!("dropped {chunks} chunks that end before {cutoff} ns since 1970\n"),
     };
     db.close()?;
     Ok(out)
@@ -1280,10 +1279,6 @@ mod tests {
             c("retain --keep 1h --measurement nothing").unwrap(),
             "no data: nothing to drop\n"
         );
-        assert!(c("retain --keep 0")
-            .unwrap_err()
-            .to_string()
-            .starts_with("bad database: invalid query"));
 
         // Membership: the leader does it or says why not.
         assert_eq!(c("add-learner 2").unwrap(), "added\n");
@@ -1319,6 +1314,7 @@ mod tests {
             ("write", "missing line protocol file"),
             ("retain", "missing --keep"),
             ("retain --keep soon", "--keep: invalid duration \"soon\""),
+            ("retain --keep 0", "--keep must be more than 0"),
             ("add-voter", "missing node id"),
             ("transfer", "missing node id"),
             ("transfer x", "transfer: invalid node id \"x\""),
@@ -1562,10 +1558,8 @@ mod tests {
             ("retain --db x", "missing --keep"),
             ("retain --keep 1h", "missing --db"),
             ("retain --db x --keep soon", "--keep: invalid duration \"soon\""),
-            (
-                "retain --db x --keep 0",
-                "invalid query: the time to keep data must be positive",
-            ),
+            ("retain --db x --keep 0", "--keep must be more than 0"),
+            ("retain --db x --keep 0s", "--keep must be more than 0"),
             ("retain --db x --keep 1h --every 1m", "unknown flag --every"),
         ] {
             assert_eq!(err(args), want, "{args}");
@@ -1590,6 +1584,16 @@ mod tests {
         // Old and new points, so that there is something to drop.
         let old_and_new = d.join("old.lp");
         std::fs::write(&old_and_new, "m v=1 1000000000000\nm v=2 90000000000000\n").unwrap();
+        // And chunks on disk, which the cutoff has to read.
+        sweep("sweep-retain-chunks", |db| {
+            cmd(&format!(
+                "ingest {} --db {} --flush-points 100",
+                cap.display(),
+                db.display()
+            ))
+            .unwrap();
+            format!("retain --db {} --keep 1h", db.display())
+        });
         sweep("sweep-retain", |db| {
             cmd(&format!("write {} --db {}", old_and_new.display(), db.display())).unwrap();
             format!("retain --db {} --keep 1h", db.display())

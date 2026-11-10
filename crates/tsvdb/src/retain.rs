@@ -48,6 +48,17 @@ impl Db {
         Ok(newest.map(|n| n.min(now).saturating_sub(ttl)))
     }
 
+    /// Keeps the last `ttl` ns of the data of `measurement` (of everything
+    /// if `None`): [`Db::retention_cutoff`], then [`Db::drop_before`].
+    /// Returns the cutoff and the number of chunks dropped, or `None` when
+    /// there is no data.
+    pub fn retain(&self, measurement: Option<&str>, ttl: i64, now: i64) -> Result<Option<(i64, usize)>> {
+        let Some(cutoff) = self.retention_cutoff(measurement, ttl, now)? else {
+            return Ok(None);
+        };
+        Ok(Some((cutoff, self.drop_before(measurement, cutoff)?)))
+    }
+
     /// Drops the partitions of `measurement` (of every measurement if
     /// `None`) that end at or before `cutoff`: every point older than the
     /// start of the partition that holds `cutoff`. Returns the number of
@@ -137,6 +148,19 @@ mod tests {
     }
 
     #[test]
+    fn retain_is_the_cutoff_and_the_drop() {
+        let (db, dir) = open("retain-both", 10);
+        assert_eq!(db.retain(None, 5, 1000).unwrap(), None);
+        db.write_points(&[cpu("a", 5, 1.0), cpu("a", 15, 2.0), cpu("a", 25, 3.0)])
+            .unwrap();
+        // The newest point is at 25, so 20 is the cutoff: [0, 10) and [10, 20) end before it.
+        assert_eq!(db.retain(None, 5, 1000).unwrap(), Some((20, 2)));
+        assert_eq!(times(&db, "cpu", "usage"), [25]);
+        assert!(db.retain(None, 0, 1000).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn whole_partitions_before_the_cutoff_are_dropped_and_stay_dropped() {
         let (db, dir) = open("retain-drop", 10);
         let mut o = opts();
@@ -216,7 +240,8 @@ mod tests {
             db.kv.flush()?;
             db.write_points(&[cpu("a", 5, 9.0)])?;
             acked.push(5);
-            db.drop_before(None, 20)?;
+            // The newest point is at 25: the cutoff is 20.
+            assert_eq!(db.retain(None, 5, i64::MAX)?.map(|r| r.0), Some(20));
             Ok(())
         };
         for n in 0.. {
@@ -262,6 +287,7 @@ mod tests {
         fault.heal();
         assert!(db.drop_before(None, 10).is_err());
         assert!(db.retention_cutoff(None, 5, 10).is_err());
+        assert!(db.retain(None, 5, 10).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
