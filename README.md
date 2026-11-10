@@ -9,14 +9,14 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 
 | crate | what it is | inspired by |
 |---|---|---|
-| [`cpu`](crates/cpu) | the portability layer: one trait per kind of special instruction, implemented for x86_64 and aarch64, with a portable fallback | corsix/fast-crc32 |
+| [`cpu`](crates/cpu) | portability layer for special instructions (x86_64, aarch64, portable fallback) | corsix/fast-crc32 |
 | [`flashkv`](crates/flashkv) | crash-safe ordered key-value store (LSM) | LevelDB, LMDB, FoundationDB, eguan/ibs |
-| [`raft`](crates/raft) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron |
+| [`raft`](crates/raft) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron, TigerBeetle |
 | [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
 | [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli, QuestDB |
-| [`cluster`](crates/cluster) | tsvdb replicated by raft: writes through the leader, every node holds a copy | TigerBeetle, CockroachDB |
-| [`bench`](crates/bench) | command line: generate, ingest, query, benchmark, run a cluster node (`serve`) and talk to a cluster (`client`) | — |
-| [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `bench` | cargo-xtask |
+| [`cluster`](crates/cluster) | tsvdb replicated by raft | TigerBeetle, CockroachDB |
+| [`bench`](crates/bench) | command line: generate, ingest, query, benchmark, run and drive a cluster | — |
+| [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `vopr` / `bench` | cargo-xtask |
 | [`proofs`](proofs) | kani model-checking harnesses | — |
 
 ## Architecture
@@ -64,489 +64,160 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 
 ### cpu: the portability layer
 
-Everything that needs a particular processor instruction to be fast lives in
-the `cpu` crate, and no other crate touches `std::arch`:
+No other crate touches `std::arch`. Each kind of instruction is a trait
+(`Crc32cInstr`, `Clmul`). `x86_64` (SSE4.2, PCLMULQDQ) and `aarch64` (CRC32,
+NEON PMULL) implement the traits, and the algorithms are written once over
+them. A plain Rust version covers other processors and kani. The best
+implementation is picked at the first call.
 
-1. A **trait** says what an instruction computes, independent of the
-   architecture: `Crc32cInstr` is one step of the CRC32C register, `Clmul` is
-   carry-less multiplication on 128-bit vectors.
-2. Each **architecture implements** the traits on token types that only its
-   feature detection creates: `x86_64` with SSE4.2 `crc32` and `pclmulqdq`
-   (every Intel processor since Westmere, every AMD one since Bulldozer),
-   `aarch64` with `crc32cx` and NEON `pmull` (Ampere Altra and AmpereOne,
-   Graviton, Apple M).
-3. The **algorithms** are written once, generic over the traits, and each
-   architecture runs them inside a `#[target_feature]` function, where every
-   trait method inlines to the bare instruction (checked in the generated
-   assembly: no calls in the hot loops).
-4. A **portable** version in plain Rust (slicing-by-8 tables) runs on any
-   other processor and under kani.
+CRC32C uses the [corsix/fast-crc32](https://github.com/corsix/fast-crc32)
+fusion algorithm. `bench crc-bench` on a Ryzen 7 5800U (Zen 3, laptop), with
+the block shape chosen by a hyperfine sweep:
 
-The fastest implementation the processor reports is picked at the first
-call. CRC32C uses Peter Cawley's "fusion" algorithm
-([corsix/fast-crc32](https://github.com/corsix/fast-crc32)). It cuts each
-block into several scalar streams, each run through the CRC instruction by
-its own dependency chain, plus a region that vector accumulators fold with
-carry-less multiplication at the same time. The partial CRCs are then moved
-to the end of the block with one carry-less multiply each and combined. The
-folding constants are powers of x modulo the polynomial, computed by
-`const fn`.
+| buffer | fused | SSE4.2, one stream | tables |
+|---|---|---|---|
+| 512 B | 11.2 GB/s | 4.9 GB/s | 0.98 GB/s |
+| 4 KiB | 16.0 GB/s | 4.9 GB/s | 0.97 GB/s |
+| 1 MiB | 13.7 GB/s | 4.6 GB/s | 0.96 GB/s |
 
-The block shape (accumulators, streams, words per stream) is a const generic
-parameter of each architecture:
-
-- **x86_64:** 2 accumulators and 3 streams of 4 words. It was the fastest of
-  9 shapes on a Ryzen 7 5800U (Zen 3), measured with hyperfine over buffers
-  of 256 bytes to 1 MiB. `bench crc-bench` on that machine, a laptop
-  running well below its boost clock:
-
-  | buffer | fused | one stream (the previous code) | tables |
-  |---|---|---|---|
-  | 64 B | 4.4 GB/s | 4.5 GB/s | 0.96 GB/s |
-  | 512 B | 11.2 GB/s | 4.9 GB/s | 0.98 GB/s |
-  | 4 KiB | 16.0 GB/s | 4.9 GB/s | 0.97 GB/s |
-  | 64 KiB | 16.5 GB/s | 4.9 GB/s | 0.98 GB/s |
-  | 1 MiB | 13.7 GB/s | 4.6 GB/s | 0.96 GB/s |
-
-  A 64-byte buffer is smaller than one block (128 bytes), so it takes the
-  single-stream path.
-- **aarch64:** 3 accumulators and 4 streams of 2 words. Cawley measured
-  this shape fastest on Ampere Altra (Neoverse N1), at about 36 GB/s a core
-  against about 23 GB/s for scalar streams alone. **LumenDB's aarch64 speed
-  has not been measured on Ampere hardware.** Correctness is tested under
-  QEMU emulating a Neoverse N1 and N2 (`cargo test-aarch64`, see
-  `.cargo/config.toml`), and the CI's ARM job prints the speed it gets on
-  GitHub's ARM runner.
-
-Every hardware version, and every shape in the tests (including one
-accumulator and one stream), is checked against a bit-by-bit CRC32C at
-every length up to 2100 bytes and several larger ones, at three alignments
-and from two starting values.
+The aarch64 shape is the one corsix measured fastest on Ampere Altra. It has
+not been measured on Ampere hardware here: it is tested under QEMU
+(Neoverse N1 and N2, `cargo test-aarch64`), and the CI's ARM job prints its
+speed on GitHub's runner.
 
 ### flashkv: the storage engine
 
-- **LevelDB's design.** Writes go to a CRC32C-framed write-ahead log, then a
-  memtable. They are flushed to immutable SSTables (prefix-compressed blocks,
-  optional LZ compression, bloom filters, CRC per block) with leveled
-  compaction. A `MANIFEST` log plus `CURRENT` is updated by atomic rename.
-- **Hardware-crash safety.** With `sync` on (the default), a write returns
-  `Ok` only once it is on stable storage. Recovery tells a torn tail from
-  corruption, as TigerBeetle does. A torn tail is an incomplete last record
-  or zero fill: a write that never completed, so it was never acknowledged.
-  It is cut at the last valid record. A complete record with a bad checksum,
-  or intact records after a bad one, means acknowledged data was damaged, so
-  the open fails instead of silently dropping it. Errors are sticky, like
-  LevelDB's `bg_error`: after a failed write, later writes are refused until
-  the store is reopened.
-- **No mmap of database files.** This avoids LMDB's map-size failure
-  (`MDB_MAP_FULL`) and SIGBUS on a truncated file. Tables are read with
-  `pread`, and every block is length- and CRC-checked, so corruption becomes
-  an `Err`, never a crash.
-- **Modular, like FoundationDB.** All I/O goes through the `Env` trait.
-  `FaultEnv` injects a failure at the N-th operation and simulates power loss:
-  unsynced bytes, files and renames disappear. Tests sweep every fault point
-  and check that every acknowledged write survives. The same harness covers
-  raft's storage, tsvdb and the CLI. `MemEnv` is an in-memory `Env` for
-  simulation: a power loss keeps each file's synced bytes plus a torn prefix
-  of the rest, and a bit can be flipped in place.
-- **Compaction never slows reads** (eguan/ibs, eblob). Flush and compaction
-  write new files on a background thread and publish them with one pointer
-  swap. Readers hold immutable snapshots, and live snapshots pin the versions
-  they can see. MVCC snapshots support optimistic, serializable transactions.
+- **LevelDB's design**: a CRC32C-framed WAL, a memtable, and immutable
+  SSTables (prefix-compressed blocks, optional LZ, bloom filters, a CRC per
+  block) with leveled compaction. `MANIFEST` plus `CURRENT` are updated by
+  atomic rename.
+- **Hardware-crash safety**: with `sync` on (the default), a write returns
+  `Ok` only once it is on stable storage. Recovery cuts a torn tail (a write
+  that was never acknowledged), but fails on damaged acknowledged data
+  instead of dropping it, as TigerBeetle does. Errors are sticky, like
+  LevelDB's `bg_error`.
+- **No mmap of database files**: no `MDB_MAP_FULL`, no SIGBUS. Tables are read
+  with `pread`, and corruption is an `Err`, never a crash.
+- **Fault injection** (FoundationDB): all I/O goes through the `Env` trait.
+  `FaultEnv` fails the N-th operation and simulates power loss. Tests sweep
+  every fault point and check that every acknowledged write survives, in
+  flashkv, raft's storage, tsvdb and the CLI. `MemEnv` adds torn writes and
+  bit flips for simulation.
+- **Compaction never blocks reads** (eguan/ibs): new files are published with
+  one pointer swap, and readers hold immutable snapshots. MVCC snapshots
+  support optimistic, serializable transactions.
 
 ### raft: distribution primitives
 
-- **Raft** (election, log replication, majority-quorum commit), deterministic
-  and transport-agnostic: drive it with `tick()` and `step(msg)`. Term, vote
-  and entries are durable before any dependent message leaves, so a node
-  never votes twice in a term. `FileStorage` uses flashkv's `Env` and record
-  framing: an atomic state file plus a generation-numbered log.
-- **Pre-vote** (Raft thesis, section 9.6). A node whose election timer fires
-  first asks its peers whether they would vote for it, without changing its
-  term or vote. Only with a majority of promises does it campaign. A peer
-  refuses while it hears from a leader, and a recovering node never promises.
-  So a node cut off from the cluster keeps its term and does not depose a
-  healthy leader when it comes back. It is on by default (`Config::pre_vote`),
-  and clusters may mix nodes with and without it.
-- **ReadIndex** (Raft thesis, section 6.4). `Node::read_index` gives a
-  linearizable read without writing to the log. The leader notes its commit
-  index and confirms it still leads when a majority acknowledges an
-  AppendEntries of a later round, piggybacked on the normal replication
-  traffic. `tick()` then releases the read, and the state machine can answer
-  it locally. A leader cut off from the majority never confirms, so it never
-  serves a stale read, and when it is deposed its pending reads fail. A new
-  leader first needs an entry of its own term committed, so a read asked
-  before that returns `NotReady`: retry in a few ticks.
-- **An empty entry per leader.** A new leader appends an empty entry of its
-  term as soon as it is elected (Raft thesis, section 6.4). Entries of
-  earlier terms commit only together with an entry of the leader's term, so
-  without it they could stay uncommitted until a client happened to write.
-  The simulator found this: after a leader change the cluster did not always
-  converge. Applications must ignore entries with empty data, and entries of
-  kind `Config`.
-- **Membership changes** (Raft thesis, section 4.1, one server at a time).
-  The voter set is held in configuration entries of the log, in effect as
-  soon as the entry is appended and taken back if it is truncated. The
-  leader changes it by one server per entry (`add_voter`, `remove_voter`), so
-  the old and the new majorities always overlap. It refuses a change while
-  another is not committed, and before it has committed an entry of its own
-  term (otherwise two leaders could choose different configurations on the
-  same prefix). A new server joins first as a learner (`add_learner`): it
-  gets the log but neither votes nor counts toward a quorum, and `add_voter`
-  waits until it has caught up, so a slow newcomer cannot stall commits.
-  A node that is not a voter never campaigns, and while it hears from a
-  leader a node ignores vote traffic from servers outside its voter set, so a
-  removed server cannot disturb the cluster. A leader that removes itself
-  steps down once the change commits. A server whose removal is not
-  committed keeps its place in elections: the leader may be gone with the
-  entry only on the server it removes, and the rest could not win without it.
-  Snapshots carry the configuration, as the entries that set it are gone.
-  The application sees committed configuration entries too, and ignores them.
-- **Leadership transfer** (Raft thesis, section 3.10). `Node::transfer_leadership`
-  hands leadership to a voter, to take the leader out of service without the
-  cluster waiting out an election timeout. The leader takes no writes or
-  membership changes meanwhile (`NotReady`, which clients retry), so the log
-  stops growing. It keeps replicating to the target, and once the target
-  holds the whole log it sends `TimeoutNow`: the target campaigns at once,
-  with no pre-vote, and as its log is as good as the leader's it wins, and
-  the old leader steps down on seeing the higher term. A transfer that has
-  not made the target leader within an election timeout is abandoned. Only
-  liveness depends on it: `TimeoutNow` is just a reason to campaign, which is
-  always safe, and a copy that arrives late is of an older term and ignored.
-  `Server::transfer_leadership` waits until the old leader has heard from the
-  new one.
-- **Snapshots and log compaction.** The application owns the state machine,
-  so it decides when to snapshot: `Node::compact(index, data)` stores the
-  serialized state machine as of an applied index, durably, and drops the log
-  up to there. A leader whose follower needs entries it has dropped sends
-  the snapshot instead (`InstallSnapshot`), in chunks of at most
-  `snapshot_chunk` bytes (1 MiB by default, 0 for one message), one in flight
-  per follower. The follower answers each chunk with how many bytes it holds
-  and the leader goes on from there, so a chunk that is lost, repeated or out
-  of order, a follower that restarted, and a leader that took a newer
-  snapshot all cost a resend and nothing else; a chunk nobody answered is
-  sent again after a heartbeat. The follower collects the chunks in memory
-  and stores the snapshot once it has all of them, and `tick()` hands it over
-  as `TickOutcome::snapshot` to restore the state
-  machine from, before any entries after it. After a restart the first tick
-  does the same with the stored snapshot. On disk the snapshot is its own
-  file, named by index and written and synced before the state file points
-  at it, so a log rewrite never copies it and a crash leaves either the old
-  or the new pair. A snapshot that fails its checksum loses the applied
-  prefix: the node starts from an empty log, marked recovering, and is
-  caught up by the leader.
-- **Wire format and TCP transport** (`raft::wire`, `raft::net`, `std::net`
-  only). A message is one record in flashkv's CRC framing, so a flipped bit,
-  a truncated stream and garbage are all detected, and a lying length costs
-  nothing: the receiver never allocates more than has arrived. The transport
-  is deliberately lossy, as Raft copes with lost, duplicated and reordered
-  messages (the simulator proves it): `send` never blocks, one writer thread
-  per peer reconnects after failures and drops what it cannot deliver, and a
-  reader drops a connection that sends a bad frame. Every drop is counted.
-  Without a secret (see the next item), anyone who can reach the port is
-  believed, and nothing is encrypted: use a trusted network or a tunnel.
-- **Authentication with a shared secret** (`raft::auth`, `std` only: SHA-256
-  and HMAC are written in the crate and checked against the FIPS 180-4 and
-  RFC 4231 test vectors). With `NetOptions::secret`, a connection starts
-  with a challenge and response: the side that accepted sends a nonce, the
-  side that connected answers with its own nonce and a proof, and the
-  accepting side answers with a proof. A proof is an HMAC-SHA256 of both
-  nonces under the secret, so each side shows that it knows the secret
-  without sending it, and a recorded handshake is of no use later. What
-  follows travels in records `len | payload | tag`, where the tag is an HMAC
-  under a key of its own for each direction, over the record's number, length
-  and payload. A record that was altered, replayed, reordered, reflected or
-  removed from the middle ends the connection. A purpose (`raft`, `client`)
-  is mixed into every proof and key, so a handshake for one port is of no use
-  on the other. The handshake and the records are not part of the Raft wire
-  format: its frames travel inside them unchanged (`VERSION` stays 2). Every
-  node of a cluster has the same secret, or none.
-
-  What it does **not** give:
-  - **Confidentiality.** Everything is readable by whoever can see the
-    network. TLS would need a dependency, and this project has none for it:
-    use WireGuard, stunnel or another tunnel where that matters.
-  - **Roles.** Everyone who holds the secret is trusted with everything: a
-    node can pose as any other, and a client can write, stop nodes and change
-    the membership.
-  - **Protection against a weak secret.** Someone who recorded a handshake
-    can test guesses against it offline. Use a long random one, readable by
-    its owner only: `head -c 32 /dev/urandom | base64 > secret; chmod 600 secret`.
-    It is at least 16 bytes, and a trailing newline in the file is dropped.
-  - **Rotation or revocation.** Nodes that have different secrets do not
-    hear each other, so a new secret means restarting every node and client.
-  - **Protection against denial of service.** A connection that has not
-    proved anything costs a thread until the handshake times out
-    (`handshake_timeout`; `--timeout-ms` on the client port).
-  - **An audit.** The primitives are standard and checked against test
-    vectors, but they were written here, not reviewed by a cryptographer. On
-    a hostile network, put a tunnel in front of it as well.
-- **Server** (`raft::server`). `Server` runs a node on a clock: it steps the
-  node with what the transport receives, ticks it, sends its messages, hands
-  committed entries, snapshots and confirmed reads to the application's
-  `StateMachine`, and compacts the log every `snapshot_every` entries. The
-  application proposes (`propose`, `wait_applied`) and gets linearizable
-  reads from `read_barrier`. A storage error stops the server for good, as
-  the state on disk can no longer be trusted to match memory.
-- **Protocol-aware recovery** (TigerBeetle; Alagappan et al., FAST '18). A
-  bit flip in the Raft log may have destroyed entries the node acknowledged,
-  and so helped commit. The node keeps the intact prefix and is marked
-  *recovering*, durably. A recovering node never votes and never campaigns,
-  so every election quorum still overlaps every commit quorum in an intact
-  node. It rejoins once it holds the current leader's whole log. A damaged
-  single-node cluster stays stuck: there is no one to copy from, and
-  stopping is safer than guessing. The state file (term, vote) holds two
-  checksummed copies; either one is enough, and two intact copies must agree.
-- **Deterministic simulation** (TigerBeetle's VOPR). One seed fixes a whole
-  run of a 3 to 7 replica cluster, each replica on its own `MemEnv` with the
-  real `FileStorage`: message loss, duplication and reordering, partitions,
-  crashes, power loss with torn writes, bit flips in the Raft log, and I/O
-  errors, while an operator keeps adding and removing servers, and handing
-  leadership to voters, through whichever replica leads. After every event the simulator checks election safety (one leader
-  per term), leader completeness, state machine safety (no two replicas
-  commit or apply different entries at an index), log matching, and
-  linearizable reads (a read, even one sent to a stale leader, must include
-  everything committed when it was asked), and snapshots (each replica has a
-  state machine, a hash of what it applied, that it snapshots, restores after
-  a restart and when a leader sends a snapshot; no two replicas may ever
-  differ in state at the same index), and membership (committed
-  configurations differ by one server, and the voters a node or a snapshot
-  has are the ones committed at its index). Then
-  faults stop and the cluster must converge: one leader that is one of its
-  own voters, and among the voters nobody recovering, identical logs and
-  state machines. Corruption hits a minority of the voters at a time, which is
-  what the protocol can survive. A failing seed replays exactly. The check
-  is real: with the recovery rule removed, 9 of 300 seeds fail with `leader
-  lacks committed entry`, and a leader that confirms reads one acknowledgement
-  early fails within the first few seeds with `stale read`; a snapshot that
-  never reaches the state machine, or a restart that skips the stored one,
-  fails on seed 0 with `applied entry ... not as committed`. A chunk that is
-  accepted twice corrupts the snapshot (seed 0: `got a snapshot with 9 bytes
-  of state`), chunks matched to the wrong transfer fail within five seeds
-  with a state mismatch, and a leader that never repeats a lost chunk leaves
-  no convergence. For membership,
-  allowing several changes at once fails with `leader ... lacks committed
-  entry`, a change of two servers fails on seed 0, a log that keeps
-  configuration entries it truncated fails within a few dozen seeds, and a leader that never steps down after
-  removing itself leaves no convergence. Two guards only unit tests catch:
-  the committed-entry-in-term rule for changes (the simulator did not find its
-  scenario in 600 seeds), and replicating to a removed server until the
-  change commits. `cargo test` runs a fixed set of seeds, and
-  `cargo xtask vopr` runs many; `--voters N` fixes how many replicas start
-  as voters.
-- **Not adopted: a checksum chain over the log** (TigerBeetle chains each
-  prepare's checksum to its parent's). A chain would catch two replicas
-  holding different data under the same index and term, which only a bug or
-  memory corruption in a node can cause. Everything else it detects is
-  covered already: media and transit damage by the CRC of every log batch,
-  snapshot and wire frame, a lost or misplaced write by contiguous indices and
-  non-decreasing terms checked at every append and at every open (a gap makes
-  the log damaged, so the node recovers), and the property itself by the
-  simulator's log-matching and state-machine checks on every event. A chain
-  would change the log, state and wire formats and cost a hash per entry.
-- **Not implemented**: handing leadership over automatically (a leader that
-  removes itself is replaced after an election timeout; a transfer has to be
-  asked for), a leader that steps down on losing its
-  quorum (it keeps leading until it hears a higher term, but cannot commit or
-  confirm reads), pipelined replication (one append, and one snapshot chunk,
-  is in flight per follower), and encryption on the wire.
-- **SWIM** membership: round-robin probes, indirect `PingReq` probes,
-  suspicion, death, incarnation-based refutation, and piggybacked gossip.
-- **Lamport clocks** stamp every message. Ordering never depends on wall
-  clocks. Lamport clocks are enough here, so there is no HLC: Raft terms and
-  log indices already order replicated state, and nothing needs to match
-  physical time.
+- **Raft**, deterministic and transport-agnostic (`tick()`, `step(msg)`),
+  with durable state written before any dependent message is sent.
+  `FileStorage` is built on flashkv's `Env`.
+- From the Raft thesis: **pre-vote**, **ReadIndex** linearizable reads, an
+  empty entry per new leader, **one-server-at-a-time membership changes**
+  with learners, **leadership transfer**, and **snapshots** sent in
+  resumable chunks.
+- **Protocol-aware recovery** (TigerBeetle; Alagappan et al., FAST '18): a
+  node whose log was damaged keeps the intact prefix and neither votes nor
+  campaigns until it holds the leader's whole log. The state file holds two
+  checksummed copies.
+- **Deterministic simulation** (TigerBeetle's VOPR): one seed fixes a whole
+  run of 3 to 7 replicas with message loss, partitions, crashes, power loss,
+  torn writes, bit flips, I/O errors and membership changes. Election safety,
+  log matching, state machine safety, linearizable reads, snapshots and
+  membership are checked after every event, then the cluster must converge.
+  Removing a safety rule makes seeds fail. A failing seed replays exactly.
+- **TCP transport and wire format** (`std::net` only): each message is a
+  CRC-framed record, and the transport is lossy by design.
+- **Shared-secret authentication**: an HMAC-SHA256 challenge-response, then
+  an HMAC tag on every record (SHA-256 and HMAC are written in the crate and
+  checked against the FIPS 180-4 and RFC 4231 vectors). There is no
+  encryption, no roles and no rotation, and the code has had no audit. On a
+  hostile network, put a tunnel (WireGuard, stunnel) in front of it.
+- **SWIM** membership and **Lamport clocks**. There is no HLC: terms and log
+  indices already order replicated state.
+- **Not implemented**: automatic leader handoff, step-down on loss of quorum,
+  pipelined replication, a checksum chain over the log (the per-record CRCs
+  and the simulator's checks cover what it would catch).
 
 ### pcapfast: the parser
 
-The capture is mmapped read-only. It is *input*, so mmap cannot corrupt the
-database. pcapfast detects pcap vs pcapng (both byte orders, µs/ns
-resolution), cuts the file into record- or block-aligned chunks and parses
-them on scoped threads. Headers are read in place, so packets are never
-copied. Each thread fills its own flow table and timeline, and the results
-are merged. Torn tails are reported, not fatal.
+pcapfast mmaps the capture read-only (it is input, so mmap cannot corrupt
+the database) and detects pcap or pcapng (both byte orders, µs or ns). It
+parses record-aligned chunks on scoped threads, without copying packets,
+and merges per-thread flow tables. A torn tail is reported, not fatal.
 
-`cargo xtask bench` measures it on a synthetic capture of 4.8 million
-packets (3.6 GB) that is already in the page cache. On a 16-thread machine,
-the best of 5 runs was:
+`cargo xtask bench`, 4.8 million packets (3.6 GB) in the page cache, 16
+threads, best of 5:
 
 | what is timed | time | rate |
 |---|---|---|
 | parsing the mapped file | 134 ms | 36 Mpkt/s, 27 GB/s |
-| the whole `parse_file` call | 348 ms | 14 Mpkt/s, 10 GB/s |
-
-The gap is the kernel mapping and unmapping 3.6 GB (about 880,000 pages);
-the parse itself scales with threads. Medians are noisier, about 200 ms and
-470 ms.
+| the whole `parse_file` call (with mmap/munmap) | 348 ms | 14 Mpkt/s, 10 GB/s |
 
 ### tsvdb: the time-series database
 
-- **Data model.** InfluxDB line protocol, with escaping and float, integer,
-  unsigned, boolean and string fields. Each measurement plus tag set is a
-  series, held in an inverted tag index. Each (series, field) pair is a typed
-  column, and a field keeps its first type.
-- **Write path.** A write is turned into typed columns: for each column, a
-  vector of timestamps and one of values. New series, fields and columns go
-  to flashkv first; then the columns are appended, as one CRC-framed binary
-  record, to a write-ahead log that is a file of its own (with `sync` on, it
-  is fsynced before the write returns), so an acknowledged write survives a
-  power loss. The columns then join the in-memory buffer. A flush turns the
-  buffer into immutable **chunks**, one per column and hour partition, built
-  on several threads, and starts a new log. Chunks use delta-of-delta
-  timestamps, Gorilla XOR floats, zigzag-delta integers and bit-packed
-  booleans. Next to each chunk is a small entry of **statistics**: its
-  number of points, first and last timestamp, and for numbers the sum, the
-  minimum, the maximum and the first and last value.
-- **Fast ingestion.** Plain lines (no escapes, no quotes) of a series that
-  was seen before are parsed straight into the columns, with no point made:
-  the text of the series is looked up as it is, and says which columns the
-  fields go to. The float and integer readers give exactly what `str::parse`
-  gives (a test checks it on random text). Anything else (a new series,
-  fields in another order, a string) goes through the full line protocol
-  parser, which is also what reports errors. A large write is parsed in
-  pieces on several threads.
-- **Compaction and downsampling.** Compaction merges a partition's chunks
-  from a snapshot and publishes the result with one atomic batch, so reads
-  are never blocked. `rollup` writes windowed aggregates as a new measurement
-  (downsampling).
-- **Retention (TTL).** `retain --keep 7d` keeps the last seven days of data
-  and drops the rest, a whole partition at a time (QuestDB's TTL). A
-  partition is a range of keys, so dropping it is a run of deletes that reads
-  no point. The cutoff is `keep` before the *earlier* of the wall clock and
-  the newest point, as in QuestDB: a point dated in the future does not move
-  it, and a database that nobody writes to any more keeps its last week of
-  data instead of being emptied by the passing of time. Only partitions that
-  end before the cutoff go, so the partition that holds it stays whole. The
-  write buffer is flushed first, so that nothing that was dropped comes back
-  from the write-ahead log after a restart. A series whose data is all gone
-  stays listed. In a cluster, the leader works out the cutoff and puts it in
-  the Raft log as an order, so every node drops the same partitions whatever
-  its own clock says (see below).
-- **Queries.** Range scans with tag filters, `sum`/`count`/`min`/`max`/`mean`
-  and `first`/`last` per series and optional time window, and top-N (for
-  example the heaviest flows of a capture).
-  - A query first looks at the statistics of the chunks of its columns
-    (read once and kept in memory, and kept up to date by flushes,
-    compaction and retention). A chunk outside the range is not read. A
-    chunk that lies inside the range and inside one window is answered from
-    its statistics alone, without decoding it. The other chunks are decoded
-    and folded into their windows a run of values at a time, with no point
-    made. When two chunks overlap in time (a point written again, or out of
-    order), the query falls back to sorting and deduplicating the points,
-    and a test checks the two paths against each other.
-  - The columns of the series are read on several threads when the work is
-    worth it: the first columns are timed, and threads are only started if
-    the rest is estimated to take long enough.
-  - `first` and `last` work on any field type, and with `min` and `max`
-    give open/high/low/close bars. `sum` and `mean` use Neumaier's
-    compensated summation, so small values are not lost next to big ones.
-  - Windows are calendar-aligned, as in QuestDB's `SAMPLE BY`: a window of
-    a duration `D` starts at a multiple of `D` since 1970-01-01 UTC (an
-    hourly window on the hour, a daily one at midnight), whatever range was
-    asked for, so two queries or two rollups over different ranges cut time
-    the same way. `--align start` anchors the first window at the start of
-    the range instead.
-  - A window without points is left out, unless `--fill` makes a row for it
-    (QuestDB's `FILL`): `prev` repeats the value of the window before,
-    `linear` draws a line between the windows around it, and a number is a
-    constant of the type of the result (an integer result rounds it). The
-    rows cover `--start` to `--end` when both are given, and the data's own
-    range otherwise. There is no null in tsvdb: when a fill has nothing to
-    put (`prev` or `linear` before the first window, `linear` after the last
-    one), the window stays out, and a series with no point in the range has
-    no rows. A fill that would make more than `max_fill_rows` rows (a million
-    by default, in total) is an error, so a one-nanosecond window over a
-    year cannot exhaust the memory.
-  - `latest` (`--latest 1`, QuestDB's `LATEST ON`) gives the newest point
-    of each series in the range, with its own timestamp: the current value
-    of every host, say, or the top N of them. It looks only at the newest
-    partition that has a point in range, and a chunk that lies inside the
-    range has its newest point in its statistics, so a long history costs
-    nothing more. It takes no aggregate and no window.
-  - Times and durations are written the way a person does:
-    `--start 2024-05-01 --end now --every 15m --fill prev`. Units are
-    `ns us ms s m h d w`; a month or a year is not one, because it is not
-    a fixed number of nanoseconds.
+- **Data model**: InfluxDB line protocol. A series is a measurement plus a
+  tag set, held in an inverted tag index. Each (series, field) pair is a
+  typed column.
+- **Write path**: new series and schema go to flashkv, then the columns go
+  to a CRC-framed WAL of tsvdb's own (fsynced with `sync` on), then to an
+  in-memory buffer. A flush writes one immutable chunk per column and hour
+  (delta-of-delta timestamps, Gorilla XOR floats, zigzag integers,
+  bit-packed booleans), with per-chunk statistics.
+- **Fast ingestion**: plain lines of a known series are parsed straight into
+  columns, and large writes are parsed on several threads.
+- **Compaction, downsampling** (`rollup`) and **retention**
+  (`retain --keep 7d`, which drops whole partitions, as QuestDB's TTL does).
+- **Queries**: tag filters, `sum`/`count`/`min`/`max`/`mean`/`first`/`last`,
+  time windows, top-N, `--fill prev|linear|N`, `--latest`. A chunk that lies
+  inside the range and inside one window is answered from its statistics
+  without being decoded. Large queries read their columns on several
+  threads.
 
 #### Ideas taken from QuestDB
 
-[QuestDB](https://github.com/questdb/questdb) is a Java time-series database
-with a native column store. These are the ideas of it that fit LumenDB, and
-what was left out.
-
 | QuestDB | LumenDB |
 |---|---|
-| `SAMPLE BY` with calendar-aligned buckets, `ALIGN TO FIRST OBSERVATION` | `--every` windows start at multiples of the duration since 1970; `--align start` anchors them at `--start` instead |
+| `SAMPLE BY`, calendar-aligned, `ALIGN TO FIRST OBSERVATION` | `--every`, `--align start` |
 | `FILL(PREV \| LINEAR \| const)` | `--fill prev\|linear\|NUMBER` |
-| `first`, `last`, `nsum` | `first`, `last`; `sum` and `mean` are compensated |
-| `LATEST ON ts PARTITION BY` | `--latest 1` |
-| TTL, with the earlier of the clock and the newest row as reference | `retain --keep`, replicated by the cluster |
-| `1h`, `7d`, ISO dates, `now()` | durations, RFC 3339 dates and `now-1h` on the command line |
+| `first`, `last`, `nsum` | `first`, `last`; compensated `sum` and `mean` |
+| `LATEST ON` | `--latest 1` |
+| TTL | `retain --keep`, replicated by the cluster |
+| `1h`, `7d`, ISO dates, `now()` | the same on the command line |
 
-Not taken: `ASOF JOIN` (a query reads one field of one measurement),
-materialized views (`rollup` downsamples, but by hand), a dictionary-encoded
-`SYMBOL` column (tags are an inverted index of strings, and a string field is
-a plain column), `FILL(NULL)` (there is no null), `DEDUP` (the last write to
-a series, field and timestamp already wins), Parquet, and the network
-interfaces (ILP over TCP, REST, the PostgreSQL wire protocol): each needs a
-library or a wire format this project would have to write and keep.
+Not taken: `ASOF JOIN`, materialized views, `SYMBOL`, `FILL(NULL)`, Parquet,
+and the network protocols (ILP, REST, PostgreSQL wire).
 
 #### Measured against QuestDB
 
-`bench gen-cpu` writes a workload like the "cpu-only" use case of
-[TSBS](https://github.com/timescale/tsbs): 100 hosts, each reporting ten
-CPU gauges every 10 s for 24 hours, so 864,000 rows and 8.64 million values.
-`bench tsdb-bench` ingests the same data and times queries modelled on
-TSBS's. The comparison below is QuestDB 10.2.0 (with its bundled JRE and
-default configuration) given the same file over ILP/TCP, with the same
-queries in SQL over its REST interface.
+A TSBS-like "cpu-only" workload (`bench gen-cpu`: 100 hosts, ten gauges, 10 s
+interval, 24 h, 864,000 rows). QuestDB 10.2.0 runs with its default
+configuration and gets the same file over ILP/TCP. The machine is a Ryzen 7
+5800U with an NVMe SSD (ext4).
 
-Setup: AMD Ryzen 7 5800U (8 cores, 16 threads), 62 GB of RAM, ext4 on an
-NVMe SSD, both databases on the same disk, run one after the other.
-
-Ingestion, in rows per second (each row has ten values):
-
-| | LumenDB | QuestDB |
+| ingestion, rows/s | LumenDB | QuestDB |
 |---|---|---|
-| 1 writer, no fsync | 598,000 | 262,000 (1 ILP connection) |
-| 4 writers, no fsync | 765,000 | 326,000 (8 ILP connections) |
-| 1 writer, fsync per batch of 5000 rows | 471,000 | (not its default) |
-| 4 writers, fsync per batch | 604,000 | |
+| 1 writer, no fsync | 598,000 | 262,000 |
+| 4 writers, no fsync | 765,000 | 326,000 (8 connections) |
+| 4 writers, fsync per 5000 rows | 604,000 | — |
 
-Queries, best of 10 runs, in milliseconds:
-
-| query | LumenDB | QuestDB (server `execute` time) |
+| query, best of 10, ms | LumenDB | QuestDB (`execute`) |
 |---|---|---|
-| single-groupby-1-1-1: max of a gauge of one host, per minute, 1 h | 0.018 | 2.0 |
-| single-groupby-1-1-12: the same over 12 h | 0.24 | 5.5 |
-| cpu-max-all-1: max of ten gauges of one host, per hour, 8 h | 0.030 | 2.6 |
-| double-groupby-1: mean of a gauge per host and hour, 12 h | 0.22 | 9.9 |
-| double-groupby-all: the same for ten gauges | 2.4 | 13.1 |
-| lastpoint: the newest values of every host | 0.53 | 1.2 |
-| sum-everything-1: sum of a gauge per host, all data | 0.24 | 4.0 |
-| sum-everything-all: the same for ten gauges | 2.9 | 20.7 |
+| single-groupby-1-1-1 | 0.018 | 2.0 |
+| single-groupby-1-1-12 | 0.24 | 5.5 |
+| cpu-max-all-1 | 0.030 | 2.6 |
+| double-groupby-1 | 0.22 | 9.9 |
+| double-groupby-all | 2.4 | 13.1 |
+| lastpoint | 0.53 | 1.2 |
+| sum-everything-all | 2.9 | 20.7 |
 
-On disk: 75 MB for LumenDB, about 560 MB for QuestDB's table directories.
+On disk: 75 MB against about 560 MB.
 
-What these numbers do and do not say:
-
-- LumenDB is measured in process. QuestDB is a server: its ingestion goes
-  through a TCP socket from a Python sender (which may limit it, especially
-  over one connection), and its query times above are its own `execute`
-  timings, without HTTP and JSON. A LumenDB server would pay for its own
-  network protocol.
-- QuestDB does not fsync by default. LumenDB with `--sync 1` fsyncs the log
-  once per write call, here a batch of 5000 rows.
-- Several of these queries use windows of an hour, which is LumenDB's
-  partition size, so chunks are answered from their statistics. Queries
-  whose windows cut through chunks (per minute, above) decode them, and are
-  still well ahead here; a query that has to look at most points (a filter
-  on a value, which LumenDB does not have yet, or raw scans) would show a
-  smaller gap or none.
-- This is one workload on one machine, with QuestDB's default settings. It
-  is not TSBS itself, and QuestDB has features LumenDB lacks (SQL, joins,
-  value filters, the PostgreSQL wire protocol). To reproduce:
-  `bench gen-cpu cpu.lp` and `bench tsdb-bench --db DIR --sync 0 --runs 10`.
+Caveats: LumenDB runs in process, while QuestDB is a server fed by a Python
+sender. Hour windows match LumenDB's partitions, so those queries are
+answered from statistics. QuestDB does more (SQL, joins, value filters).
+This is one workload on one machine. To reproduce:
+`bench gen-cpu cpu.lp && bench tsdb-bench --db DIR --sync 0 --runs 10`.
 
 ### cluster: a tsvdb replicated by Raft
 
@@ -560,69 +231,16 @@ What these numbers do and do not say:
                                                   +--------------------------+
 ```
 
-Every node keeps a full copy. The leader parses a write, gives each point
-without a timestamp its own clock, and proposes it as line protocol; when it
-commits, every node applies it to its own `tsvdb`, in log order. `write_lines`
-returns once the leader has applied it, and `query_consistent` is a
-linearizable read on the leader (`query` reads the local copy, which may lag).
-
-- **Replaying is harmless.** Two writes of one point leave the last, and a
-  replayed log writes the same points in the same order, so applying an entry
-  twice changes no query result. A node notes how far it has applied (after
-  the database made the write durable, so the note never runs ahead of the
-  data), which saves the replay, but losing the note only costs disk.
-- **Refused writes are refused everywhere.** A field that already has another
-  type is accepted by the leader's parser and refused by the database when the
-  entry is applied, on every node alike; the writer gets `Error::Rejected`.
-  Anything else, such as a failing disk, stops the node: it can no longer
-  follow the log.
-- **Retention is an order in the log.** `ReplicatedDb::retain` reads the
-  leader's clock and data (after a read barrier), works out the cutoff, and
-  proposes `#retain <cutoff> <measurement>`; every node then drops the
-  partitions that end before that very time, whatever its own clock says. A
-  replayed order drops the same partitions again, and a snapshot is a dump of
-  what was left. The leader writes no comments in line protocol, so no write
-  from a client can look like an order. A node of an older version would
-  read the order as a comment and keep its data: use `retain` once every node
-  runs this version.
-- **Snapshots are dumps.** `Node::compact` stores a compressed dump of the
-  database (`tsvdb::Db::dump`), and a node that is new or far behind is
-  restored from it. A snapshot lives in memory, on the node that sends it and
-  on the one that receives it, and travels in chunks (`--snapshot-chunk`), so
-  raise `snapshot_every` for a large database (0 never compacts).
-- **Adding a server**: start it with no voters, `add_learner` it on the leader,
-  and `add_voter` it once it has caught up (from the snapshot). Addresses are
-  static: every node is told where every other node lives, the ones that are
-  not in the cluster yet included. A node saves the addresses it is told (the
-  `peers` file of its directory), so a restarted node finds the others again;
-  only the others have to be told if it moved.
-- **Processes and clients** (`cluster::client`, `bench serve`, `bench client`).
-  `serve` runs one node until a client sends `SHUTDOWN`: Raft on one port and
-  a client protocol on another.
-
-  ```text
-   bench client --nodes A,B,C           node A          node B (leader)      node C
-   write / query / add-voter ...        client port     client port          client port
-        |                                   |                |                   |
-        |-- WRITE ------------------------->| ERR notleader B                    |
-        |-- WRITE -------------------------------------------> OK 2             |
-        |                                   |<---- Raft port <-----> Raft port ->|
-  ```
-
-  The protocol is one request per line over TCP (`WRITE`, `QUERY`, `RETAIN`,
-  `STATUS`, `PEER`, the four membership changes, `TRANSFER`, `SHUTDOWN`;
-  replies `OK`, `ROWS` or
-  `ERR <code>`), documented in `cluster::client`. A node that is not the
-  leader answers `ERR notleader <id>`; `ClusterClient` tries the nodes it
-  knows until one is. It retries only what cannot have been applied: a node
-  that is down, `notleader` and `notready`. A write that fails with a timeout
-  or a lost connection may or may not have been applied, and the client does
-  not guess. The test suite starts real `bench serve` processes, writes
-  through them, hands leadership to another node, kills the leader with no
-  warning, restarts it, adds a fourth node and stops them all, and with a
-  secret, that clients without it, or with another, get nothing.
-  `serve --secret-file FILE` and `client --secret-file FILE` turn on the
-  authentication above, for the Raft port and the client port alike.
+- Every node keeps a full copy. Writes go through the leader.
+  `query_consistent` is linearizable, while `query` reads the local copy.
+- Applying an entry twice is harmless, so replay after a crash is safe.
+- Retention is an order in the log, so every node drops the same partitions.
+- Snapshots are compressed database dumps.
+- Membership: add a node as a learner, then promote it to voter once it has
+  caught up.
+- `bench serve` runs a node, and `bench client` talks to a cluster through a
+  line-based TCP protocol documented in `cluster::client`. The client follows
+  the leader and retries only what cannot have been applied.
 
 ## Usage
 
@@ -634,76 +252,39 @@ $B gen-pcap /tmp/cap.pcapng --packets 1000000 --flows 5000 --format pcapng
 $B ingest /tmp/cap.pcapng --db /tmp/lumendb
 $B query --db /tmp/lumendb --agg sum --top 10                       # heaviest flows (bytes)
 $B query --db /tmp/lumendb --measurement traffic --field packets \
-         --agg sum --every 1m                                     # packets per minute
-$B query --db /tmp/lumendb --measurement traffic --field packets \
-         --agg sum --every 1m --fill 0 --start 2024-05-01 --end now   # a row for every minute
+         --agg sum --every 1m --fill 0 --start 2024-05-01 --end now   # packets per minute
 $B query --db /tmp/lumendb --where proto=udp --where dport=53 --agg count
-$B query --db /tmp/lumendb --measurement cpu --field usage --latest 1 # newest point of each series
-$B retain --db /tmp/lumendb --keep 7d                             # drop what is older than a week
+$B retain --db /tmp/lumendb --keep 7d
 echo 'cpu,host=a usage=0.5 1700000000000000000' > /tmp/m.lp
 $B write /tmp/m.lp --db /tmp/lumendb
 $B kv-bench --db /tmp/kv --ops 1000000 --sync 0                   # flashkv throughput
-$B crc-bench --size 4096 --size 1048576                           # every CRC32C implementation, GB/s
-$B gen-cpu /tmp/cpu.lp                                            # TSBS-like cpu data, as line protocol
-$B tsdb-bench --db /tmp/tsdb --sync 0 --runs 10 --writers 4       # ingest it, then time queries
-$B parse-bench /tmp/cap.pcapng --runs 5 --min-mpps 5              # pcapfast throughput
-$B cluster-demo --packets 1000000 --flows 5000                    # 3 replicated nodes, then a failover
-$B vopr --seeds 200                                               # Raft simulation: faults and membership
+$B crc-bench                                                      # every CRC32C implementation
+$B gen-cpu /tmp/cpu.lp && $B tsdb-bench --db /tmp/tsdb --sync 0   # TSBS-like benchmark
+$B parse-bench /tmp/cap.pcapng                                    # pcapfast throughput
+$B cluster-demo                                                   # 3 replicated nodes, then a failover
+$B vopr --seeds 200                                               # Raft simulation
 ```
 
-A cluster of three processes, here on one machine (the nodes could be on
-three). `--client` is where a node answers clients, `--raft` where the nodes
-talk to each other:
+Storage commands accept `--sync 0|1`, `--background 0|1` and
+`--fail-after N` (inject an I/O error at the N-th filesystem operation).
+`bench help` lists every flag.
+
+A three-node cluster:
 
 ```sh
 P="--peer 1=127.0.0.1:7001 --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003"
-$B serve --id 1 --dir /tmp/n1 --raft 127.0.0.1:7001 --client 127.0.0.1:8001 --voters 1,2,3 $P &
-$B serve --id 2 --dir /tmp/n2 --raft 127.0.0.1:7002 --client 127.0.0.1:8002 --voters 1,2,3 $P &
-$B serve --id 3 --dir /tmp/n3 --raft 127.0.0.1:7003 --client 127.0.0.1:8003 --voters 1,2,3 $P &
-
-NODES=127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
-c() { $B client --nodes "$NODES" "$@"; }
-c write /tmp/m.lp                                      # through the leader, wherever it is
-c query --measurement cpu --field usage --agg mean     # linearizable, on the leader
-c query --measurement cpu --field usage --local 1      # the first node's own copy
-c retain --keep 7d                                     # every node drops what is older than a week
-c status                                               # role, term, leader, voters, log positions
-c ping                                                 # every node answers PONG (fails if one does not)
-kill -9 %1                                             # lose node 1 (if it led, the others elect a new leader)
-c write /tmp/m.lp                                      # still works: the client goes around node 1
-c status                                               # node 1 is shown as unreachable
-
-# A new node has no --voters. The others are told where it listens, then it
-# is added as a learner (it catches up from the log or a snapshot), then as a voter.
-$B serve --id 4 --dir /tmp/n4 --raft 127.0.0.1:7004 --client 127.0.0.1:8004 $P &
-NODES=127.0.0.1:8002,127.0.0.1:8003,127.0.0.1:8004
-c peer 4 127.0.0.1:7004
-c add-learner 4
-c add-voter 4                                          # refused until it has caught up: retry
-c transfer 4                                           # hand leadership to node 4; it returns once 4 leads
-c shutdown                                             # stop the nodes in $NODES
+for i in 1 2 3; do
+  $B serve --id $i --dir /tmp/n$i --raft 127.0.0.1:700$i --client 127.0.0.1:800$i --voters 1,2,3 $P &
+done
+c() { $B client --nodes 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003 "$@"; }
+c write /tmp/m.lp
+c query --measurement cpu --field usage --agg mean
+c status
+c shutdown
 ```
 
-To authenticate the nodes and the clients, give every `serve` and every
-`client` the same secret file (see *Authentication* above for what that does
-and does not protect against):
-
-```sh
-head -c 32 /dev/urandom | base64 > /tmp/secret && chmod 600 /tmp/secret
-$B serve --id 1 --dir /tmp/n1 --raft 127.0.0.1:7001 --client 127.0.0.1:8001 --voters 1,2,3 $P \
-         --secret-file /tmp/secret &
-# ... likewise for the other nodes
-$B client --nodes "$NODES" --secret-file /tmp/secret ping
-```
-
-A client with another secret is told so ("do both sides use the same
-secret?"). One with none is not: it sends a request and gets no answer, so it
-fails with a timeout or an unreadable reply. Either way the nodes do nothing
-it asks.
-
-Every storage-backed command accepts `--sync 0|1`, `--background 0|1` and
-`--fail-after N`. The last one injects an I/O error at the N-th filesystem
-operation, so you can watch crash handling from a shell.
+Add `--secret-file FILE` to every `serve` and `client` to authenticate
+nodes and clients.
 
 As a library:
 
@@ -715,63 +296,31 @@ db.write_lines("cpu,host=a usage=0.5 1700000000000000000")?;
 let rows = db.query(&Query::new("cpu", "usage").filter("host", "a").agg(Agg::Mean))?;
 let stats = pcapfast::parse_file("cap.pcap".as_ref(), &Default::default())?;
 db.ingest_capture(&stats)?;
-let top = tsvdb::query::top_flows(&db, i64::MIN, i64::MAX, 10)?;
-```
-
-A replicated database (three of these, each with its own `dir`, `id` and
-`listen`, and the others in `peers`):
-
-```rust
-use cluster::{ClusterOptions, ReplicatedDb};
-use std::time::Duration;
-
-let node = ReplicatedDb::open("node1".as_ref(), 1, listen, &[1, 2, 3], &peers, ClusterOptions::default())?;
-// On the leader (a follower says who is, with Error::Raft(NotLeader(hint))):
-node.write_lines("cpu,host=a usage=0.5", Duration::from_secs(5))?;
-let rows = node.query_consistent(&Query::new("cpu", "usage"), Duration::from_secs(5))?;
 ```
 
 ## xtask
 
-Project automation uses the [cargo-xtask](https://github.com/matklad/cargo-xtask)
-pattern. The alias lives in `.cargo/config.toml`.
-
 | command | does |
 |---|---|
-| `cargo xtask dev-check` | fails on the first failing step: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, then `cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100`, which runs every test (a failing test fails the gate, so there is no separate `cargo test`) |
-| `cargo xtask dev-check --no-coverage` | the same with a plain `cargo test --workspace` in place of the coverage gate (for machines without cargo-llvm-cov) |
-| `cargo xtask kani` | `cargo kani -p proofs`, with virtual memory capped at 8 GiB (`ulimit -v`) so a runaway proof fails instead of triggering the OOM killer |
-| `cargo xtask vopr [--seeds N] [--start N] [--replicas N]` | in release mode, runs the Raft cluster simulation for `N` seeds (default 200, about 0.1 s each) and checks the safety properties after every event. A failing seed is printed with the command that replays it, for example `bench vopr --start 42 --seeds 1` |
-| `cargo xtask bench [--packets N] [--min-mpps X]` | in release mode, writes a synthetic capture (default 4.8 million packets, about 3.6 GB) to `target/bench/capture.pcap`, then runs `bench parse-bench` on it: one warm-up pass and 5 timed runs. With `--min-mpps`, it fails if the best wall-clock rate is below `X` Mpkt/s |
+| `cargo xtask dev-check` | `cargo fmt --check`, `clippy -D warnings`, then every test under `cargo llvm-cov` with a 100% line and region gate |
+| `cargo xtask dev-check --no-coverage` | the same with plain `cargo test` |
+| `cargo xtask kani` | the proofs, with virtual memory capped at 8 GiB |
+| `cargo xtask vopr [--seeds N]` | the Raft simulation in release mode |
+| `cargo xtask bench` | writes a 3.6 GB synthetic capture and runs `parse-bench` on it |
 
+Prerequisites: `cargo install cargo-llvm-cov` and
+`cargo install --locked kani-verifier && cargo kani setup`.
 
-A missing `cargo-llvm-cov` or `cargo-kani` fails with installation
-instructions:
+**Coverage**: every line and region of every file is covered, binaries
+included.
 
-```sh
-rustup component add llvm-tools-preview && cargo install cargo-llvm-cov
-cargo install --locked kani-verifier && cargo kani setup
-```
-
-**Coverage policy.** Every line and every region of every file is covered,
-including the binaries: integration tests spawn them through
-`env!("CARGO_BIN_EXE_<name>")`, and every file has `#[cfg(test)]` tests.
-
-**Proofs.** The kani harnesses in [`proofs`](proofs/src/lib.rs) prove the
-following, within the bounds stated in each harness:
+**Proofs**: the kani harnesses in [`proofs`](proofs/src/lib.rs) prove, within
+the bounds stated in each:
 
 - the flashkv varint round-trips every `u64`;
-- CRC32C matches its published check values, and CRC masking is a
-  bijection;
-
-  The check values are proved for the pure Rust table version of CRC32C
-  in the [`cpu`](crates/cpu) crate. Kani can model neither the CPUID
-  feature detection (inline assembly) nor the CRC and carry-less multiply
-  instructions, so under `cfg(kani)` the `cpu` crate uses the tables only.
-  The unit tests `every_engine_is_crc32c` and `every_shape_is_crc32c`
-  check every hardware version against a bit-by-bit CRC32C over every
-  length up to 2000 bytes and a few larger ones, three alignments and two
-  starting values.
+- CRC32C matches its published check values (the portable version: kani
+  cannot model the CPU instructions; unit tests check every hardware version
+  against it), and CRC masking is a bijection;
 
   A masked CRC is the raw CRC passed through a fixed post-processing step.
   flashkv uses the LevelDB form,
@@ -800,35 +349,17 @@ following, within the bounds stated in each harness:
 - any two majority quorums intersect;
 - the Lamport clock is monotonic.
 
-The same properties run as unit tests in every build.
-
-raft `Log::append` keeping its invariants and being atomic on error is
-checked by exhaustive enumeration in a unit test instead: every log of up to
-2 entries and every batch of up to 3 entries, over indices 0..=4 and terms
-0..=3. That is a proof for this finite domain. Kani cannot check it: with a
-symbolic entry index, CBMC runs out of memory on the log's `Vec` operations,
-even for a one-entry log and a one-entry batch.
+raft's `Log::append` invariants are checked by exhaustive enumeration over a
+small finite domain instead, because CBMC runs out of memory on them.
 
 ## CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on
-`ubuntu-latest`:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 
-1. `cargo xtask dev-check`: fmt, clippy `-D warnings`, and the tests under
-   the 100% line and region coverage gate. The job builds without debuginfo
-   (`CARGO_PROFILE_DEV_DEBUG=0`). On 4 cores from a cold cache, that and
-   running the tests once instead of twice took the steps from about 76 s to
-   about 37 s.
-2. `cargo xtask kani`: the proofs. Kani is pinned to one version
-   (`KANI_VERSION` in the workflow). [`install-kani.sh`](.github/scripts/install-kani.sh)
-   downloads its release bundle with retries and the workflow caches it, because
-   `cargo kani setup` does one download with no retry, so a single GitHub 5xx
-   would fail the job.
-3. `cargo build --release --workspace`.
-4. On `ubuntu-24.04-arm` (aarch64): clippy `-D warnings`, `cargo test
-   --workspace` (which runs the CRC32C `crc32cx` and `pmull` code on real
-   hardware), and `bench crc-bench`, which prints the speed of each CRC32C
-   implementation on that runner.
+1. `cargo xtask dev-check` (fmt, clippy, tests, 100% coverage);
+2. `cargo xtask kani`, with a pinned kani and a cached, retried download;
+3. `cargo build --release --workspace`;
+4. on `ubuntu-24.04-arm`: clippy, tests and `bench crc-bench`.
 
 ## Authorship
 
