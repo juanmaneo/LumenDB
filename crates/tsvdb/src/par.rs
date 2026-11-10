@@ -25,8 +25,8 @@ pub(crate) fn threads_for(limit: usize) -> usize {
 
 /// `f` of every item, in the order of the items. The first ones are done on
 /// this thread, and measured; if the rest is going to take long enough, it is
-/// shared between up to `threads` threads (this one is not one of them: it
-/// waits), each taking the next item when it is free.
+/// shared between up to `threads` threads (this one is one of them), each
+/// taking the next item when it is free.
 pub(crate) fn map<T: Send, R: Send>(threads: usize, items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
     let mut items = items.into_iter().enumerate();
     let mut done = Vec::with_capacity(items.len());
@@ -45,19 +45,21 @@ pub(crate) fn map<T: Send, R: Send>(threads: usize, items: Vec<T>, f: impl Fn(T)
     } else {
         let queue = Mutex::new(items);
         let shared = Mutex::new(done);
-        thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        // (The lock is held to take an item, not to work on it.)
-                        let next = queue.lock().expect("a worker panicked").next();
-                        let Some((i, item)) = next else { break };
-                        mine.push((i, f(item)));
-                    }
-                    shared.lock().expect("a worker panicked").extend(mine);
-                });
+        let work = || {
+            let mut mine = Vec::new();
+            loop {
+                // (The lock is held to take an item, not to work on it.)
+                let next = queue.lock().expect("a worker panicked").next();
+                let Some((i, item)) = next else { break };
+                mine.push((i, f(item)));
             }
+            shared.lock().expect("a worker panicked").extend(mine);
+        };
+        thread::scope(|scope| {
+            (1..workers).for_each(|_| {
+                scope.spawn(work);
+            });
+            work();
         });
         done = shared.into_inner().expect("a worker panicked");
     }
@@ -109,7 +111,7 @@ mod tests {
         let (_, threads) = run(4, 40, Duration::from_millis(1));
         assert!(threads.len() > 1, "{threads:?}");
         // Not more threads than are allowed, and not the first one alone.
-        assert!(threads.len() <= 5, "{threads:?}");
+        assert!(threads.len() <= 4, "{threads:?}");
         // One thread is no sharing at all.
         let (_, threads) = run(1, 40, Duration::from_millis(1));
         assert_eq!(threads.len(), 1);

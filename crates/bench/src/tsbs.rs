@@ -12,7 +12,7 @@ use std::io::{BufWriter, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tsvdb::partition::HOUR_NS;
-use tsvdb::{lineproto, Agg, Db, Query};
+use tsvdb::{Agg, Db, Query};
 
 /// 2016-01-01T00:00:00Z, where TSBS starts too.
 const START_NS: i64 = 1_451_606_400_000_000_000;
@@ -238,7 +238,7 @@ pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
     a.check(
         &[
             &DATA_FLAGS[..],
-            &["batch", "runs", "flush-points", "ingest", "query-threads", "only"],
+            &["batch", "runs", "flush-points", "ingest", "threads", "only"],
         ]
         .concat(),
     )?;
@@ -248,9 +248,9 @@ pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
     let ingest = a.num::<u64>("ingest", 1)? != 0;
     let only = a.get("only").unwrap_or("");
     let (dir, mut opts) = db_options(a)?;
-    opts.query_threads = a.num("query-threads", 0)?;
+    opts.threads = a.num("threads", 0)?;
     let db = open_db((dir, opts))?;
-    let (mut parse, mut write, mut text, mut gen) = (Duration::ZERO, Duration::ZERO, String::new(), Gen::new(&w));
+    let (mut write, mut text, mut gen) = (Duration::ZERO, String::new(), Gen::new(&w));
     if !ingest {
         gen.next = w.rows();
     }
@@ -258,26 +258,24 @@ pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
         text.clear();
         gen.batch(batch, &mut text);
         let t = Instant::now();
-        let points = lineproto::parse(&text).expect("generated line protocol is valid");
-        parse += t.elapsed();
-        let t = Instant::now();
-        db.write_points(&points)?;
+        db.write_lines(&text)?;
         write += t.elapsed();
     }
     let t = Instant::now();
     db.flush()?;
     let flush = t.elapsed();
     let (rows, values) = (w.rows(), w.rows() * FIELDS.len() as u64);
-    let total = secs(parse + write + flush);
+    let total = secs(write + flush);
     let stats = db.stats();
     let ingested = format!(
         "ingest: {:.1} ms: {:.0} rows/s, {:.2} M values/s\n\
-         \x20 parse {:.1} ms, write {:.1} ms, final flush {:.1} ms; {} flushes, {} series, {} columns\n",
+         \x20 write_lines {:.1} ms ({} of {} batches the fast way), final flush {:.1} ms; {} flushes, {} series, {} columns\n",
         total * 1e3,
         rows as f64 / total,
         values as f64 / total / 1e6,
-        secs(parse) * 1e3,
         secs(write) * 1e3,
+        stats.fast_writes,
+        rows.div_ceil(batch as u64),
         secs(flush) * 1e3,
         stats.flushes,
         stats.series,
@@ -378,10 +376,7 @@ mod tests {
             ("tsdb-bench --db x --batch z", "--batch: invalid number \"z\""),
             ("tsdb-bench --db x --runs z", "--runs: invalid number \"z\""),
             ("tsdb-bench --db x --ingest z", "--ingest: invalid number \"z\""),
-            (
-                "tsdb-bench --db x --query-threads z",
-                "--query-threads: invalid number \"z\"",
-            ),
+            ("tsdb-bench --db x --threads z", "--threads: invalid number \"z\""),
             (
                 "tsdb-bench --db x --hosts 0",
                 "--hosts, --hours and --interval must be more than 0",

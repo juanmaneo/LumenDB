@@ -74,14 +74,14 @@ commands:
       random walk between 0 and 100. The same seed gives the same file, so
       another database can be given the data that tsdb-bench ingests
   tsdb-bench --db DIR [--hosts N] [--hours N] [--interval DURATION] [--seed N]
-        [--batch N] [--runs N] [--flush-points N] [--ingest 0|1] [--query-threads N]
+        [--batch N] [--runs N] [--flush-points N] [--ingest 0|1] [--threads N]
         [--only NAME]
       ingest that workload (in batches of --batch lines, default 5000, parsed
       and written; DIR should be empty; with --ingest 0, not at all: the
       queries are timed on the data that DIR holds from an earlier run with
-      the same flags; --query-threads N limits the threads a query reads its
-      series on, default 0: one per core; --only NAME times only the queries
-      whose name has NAME in it), then time queries like TSBS's
+      the same flags; --threads N limits the threads that a large write, a
+      flush and a query use, default 0: one per core; --only NAME times only
+      the queries whose name has NAME in it), then time queries like TSBS's
       single-groupby (the max of a gauge of one host per minute, over 1 and
       12 hours), cpu-max-all (ten gauges, one host, per hour over 8 hours),
       double-groupby (the mean per host and hour over 12 hours, of one gauge

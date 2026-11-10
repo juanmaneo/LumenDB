@@ -43,6 +43,12 @@ impl From<flashkv::Error> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Kv(e.into())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -71,5 +77,7 @@ mod tests {
         let kv: Error = flashkv::Error::Corruption("bad".into()).into();
         assert_eq!(kv.to_string(), "storage: corruption: bad");
         assert!(kv.source().is_some());
+        let io: Error = std::io::Error::other("disk").into();
+        assert_eq!(io.to_string(), "storage: io error: disk");
     }
 }

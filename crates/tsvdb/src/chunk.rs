@@ -81,6 +81,58 @@ impl Column {
         Ok(())
     }
 
+    /// Makes room for `n` more values.
+    pub fn reserve(&mut self, n: usize) {
+        match self {
+            Column::Float(v) => v.reserve(n),
+            Column::Int(v) => v.reserve(n),
+            Column::UInt(v) => v.reserve(n),
+            Column::Bool(v) => v.reserve(n),
+            Column::Str(v) => v.reserve(n),
+        }
+    }
+
+    /// Appends the values of `later`, which must have the column's type.
+    pub fn append(&mut self, later: Column) -> Result<()> {
+        match (self, later) {
+            (Column::Float(c), Column::Float(x)) => c.extend(x),
+            (Column::Int(c), Column::Int(x)) => c.extend(x),
+            (Column::UInt(c), Column::UInt(x)) => c.extend(x),
+            (Column::Bool(c), Column::Bool(x)) => c.extend(x),
+            (Column::Str(c), Column::Str(x)) => c.extend(x),
+            (c, x) => {
+                return Err(Error::Schema(format!(
+                    "{:?} values in a {:?} column",
+                    x.field_type(),
+                    c.field_type()
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    /// The values `from..to`.
+    pub fn range(&self, from: usize, to: usize) -> Column {
+        match self {
+            Column::Float(v) => Column::Float(v[from..to].to_vec()),
+            Column::Int(v) => Column::Int(v[from..to].to_vec()),
+            Column::UInt(v) => Column::UInt(v[from..to].to_vec()),
+            Column::Bool(v) => Column::Bool(v[from..to].to_vec()),
+            Column::Str(v) => Column::Str(v[from..to].to_vec()),
+        }
+    }
+
+    /// The values at `indexes`, in that order.
+    pub fn gather(&self, indexes: &[usize]) -> Column {
+        match self {
+            Column::Float(v) => Column::Float(indexes.iter().map(|&i| v[i]).collect()),
+            Column::Int(v) => Column::Int(indexes.iter().map(|&i| v[i]).collect()),
+            Column::UInt(v) => Column::UInt(indexes.iter().map(|&i| v[i]).collect()),
+            Column::Bool(v) => Column::Bool(indexes.iter().map(|&i| v[i]).collect()),
+            Column::Str(v) => Column::Str(indexes.iter().map(|&i| v[i].clone()).collect()),
+        }
+    }
+
     /// Value at `i` (panics if out of bounds, like slice indexing).
     pub fn get(&self, i: usize) -> FieldValue {
         match self {
@@ -239,11 +291,11 @@ pub struct Chunk {
     col: Column,
 }
 
-fn zigzag(v: i64) -> u64 {
+pub(crate) fn zigzag(v: i64) -> u64 {
     ((v << 1) ^ (v >> 63)) as u64
 }
 
-fn unzigzag(v: u64) -> i64 {
+pub(crate) fn unzigzag(v: u64) -> i64 {
     ((v >> 1) as i64) ^ -((v & 1) as i64)
 }
 
@@ -399,14 +451,42 @@ fn get_deltas(d: &mut Decoder, n: usize) -> Vec<i64> {
 impl Chunk {
     /// Builds a chunk of type `ty` from points in any order (see [`normalize`]).
     pub fn from_points(ty: FieldType, points: Vec<(i64, FieldValue)>) -> Result<Chunk> {
-        let points = normalize(points);
         let mut col = Column::new(ty);
         let mut ts = Vec::with_capacity(points.len());
         for (t, v) in points {
             col.push(v)?;
             ts.push(t);
         }
-        Ok(Chunk { ts, col })
+        Ok(Chunk::from_columns(ts, col))
+    }
+
+    /// A chunk of the points `(ts[i], col[i])`, which are in the order they
+    /// were written: sorted by time, and with the last value written for a
+    /// timestamp if there are several.
+    pub fn from_columns(ts: Vec<i64>, col: Column) -> Chunk {
+        if ts.windows(2).all(|w| w[0] < w[1]) {
+            return Chunk { ts, col };
+        }
+        // A stable sort: points of the same time stay in the order written.
+        let mut order: Vec<usize> = (0..ts.len()).collect();
+        order.sort_by_key(|&i| ts[i]);
+        let last_of_its_time = |k: usize| order.get(k + 1).is_none_or(|&next| ts[next] != ts[order[k]]);
+        let keep: Vec<usize> = (0..order.len())
+            .filter(|&k| last_of_its_time(k))
+            .map(|k| order[k])
+            .collect();
+        Chunk {
+            ts: keep.iter().map(|&i| ts[i]).collect(),
+            col: col.gather(&keep),
+        }
+    }
+
+    /// The points `from..to`, as a chunk.
+    pub fn slice(&self, from: usize, to: usize) -> Chunk {
+        Chunk {
+            ts: self.ts[from..to].to_vec(),
+            col: self.col.range(from, to),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -625,6 +705,31 @@ mod tests {
         let mut bools = vec![FieldType::Bool as u8, 9, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2];
         put_len_prefixed(&mut bools, &[0xff]);
         assert!(Chunk::decode(&bools).is_err());
+    }
+
+    #[test]
+    fn columns_are_sliced_and_gathered_by_type() {
+        for values in samples() {
+            let ty = values[0].field_type();
+            let pts: Vec<(i64, FieldValue)> = (0..).zip(values.clone()).collect();
+            let chunk = Chunk::from_points(ty, pts).unwrap();
+            let part = chunk.slice(1, 3);
+            assert_eq!(part.points(), chunk.points()[1..3].to_vec(), "{ty:?}");
+            assert_eq!(chunk.column().gather(&[2, 0]), {
+                let mut c = Column::new(ty);
+                c.push(values[2].clone()).unwrap();
+                c.push(values[0].clone()).unwrap();
+                c
+            });
+            // Points out of order and written twice, of every type.
+            let ts = [5, 1, 5, 3];
+            let shuffled: Vec<(i64, FieldValue)> = ts.iter().copied().zip(values.clone()).collect();
+            let want = normalize(shuffled.clone());
+            let (t, v): (Vec<i64>, Vec<FieldValue>) = shuffled.into_iter().unzip();
+            let mut col = Column::new(ty);
+            v.into_iter().for_each(|x| col.push(x).unwrap());
+            assert_eq!(Chunk::from_columns(t, col).points(), want, "{ty:?}");
+        }
     }
 
     #[test]

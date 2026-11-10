@@ -26,25 +26,32 @@
 //! `V` → format of the database, `W`+seq → WAL record.
 
 use crate::agg::{self, Aggregator, Slice};
+use crate::batch::{self, Batch, ColumnPoints};
 use crate::chunk::{normalize, Chunk, ChunkStats};
 use crate::error::{Error, Result};
+use crate::fast;
 use crate::lineproto::{self, FieldType, FieldValue, Point};
 use crate::par;
 use crate::partition::{decode_bucket, encode_bucket, Partitioner};
 use crate::query::{self, Query, Row};
-use crate::tags::{Series, SeriesIndex};
+use crate::tags::{series_key, Series, SeriesIndex};
 use crate::time::now_ns;
 use flashkv::codec::Decoder;
+use flashkv::log::{self, LogWriter};
 use flashkv::varint::put_len_prefixed;
 use flashkv::WriteBatch;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use pcapfast::flow::proto_name;
 use pcapfast::{FlowKey, FlowStats, FlowTable, ParseStats};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// The size of the pieces that a large write is parsed in, on several
+/// threads: parsing a piece is much more than starting a thread.
+const SEGMENT_BYTES: usize = 256 << 10;
 
 /// The most points that wait in memory for [`DbOptions::chunk_points`].
 pub const MAX_BUFFERED_POINTS: usize = 8 << 20;
@@ -52,9 +59,13 @@ pub const MAX_BUFFERED_POINTS: usize = 8 << 20;
 /// Points per `write_points` call when ingesting captures.
 pub const INGEST_BATCH: usize = 50_000;
 const META_SEQ: &[u8] = b"Mseq";
-/// Where the format of the database is: 2 has the statistics of the chunks.
+/// Where the format of the database is: 2 had the statistics of the chunks;
+/// 3 has records of the log that are binary, and holds a column at a time.
 const FORMAT_KEY: &[u8] = b"V";
-const FORMAT: u8 = 2;
+/// Where the first log that is to be read is: older ones are of points that
+/// are in chunks (it is one of the things a flush stores).
+const WAL_KEY: &[u8] = b"Z";
+const FORMAT: u8 = 3;
 
 #[derive(Clone)]
 pub struct DbOptions {
@@ -72,21 +83,34 @@ pub struct DbOptions {
     pub compact_min_chunks: usize,
     /// The most rows a query may make by filling empty windows.
     pub max_fill_rows: usize,
-    /// The most threads a query uses to read the columns of its series; 0
-    /// for as many as there are cores.
-    pub query_threads: usize,
+    /// The most threads to use for a query (to read the columns of its
+    /// series), for parsing a large write, and for building the chunks of a
+    /// flush; 0 for as many as there are cores.
+    pub threads: usize,
 }
 
 impl Default for DbOptions {
     fn default() -> Self {
+        // What the store holds is chunks, which are compressed already, and a
+        // block that is compressed again is only slower to write: and a flush
+        // of the buffer is several megabytes, so a memtable that is larger
+        // than the default means the writer waits for the tables less often.
+        let kv = flashkv::DbOptions {
+            write_buffer_size: 32 << 20,
+            table: flashkv::sstable::TableOptions {
+                compress: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         DbOptions {
-            kv: flashkv::DbOptions::default(),
+            kv,
             partition: Partitioner::hourly(),
             flush_points: 100_000,
             chunk_points: 512,
             compact_min_chunks: 4,
             max_fill_rows: query::MAX_FILL_ROWS,
-            query_threads: 0,
+            threads: 0,
         }
     }
 }
@@ -99,6 +123,8 @@ pub struct DbStats {
     pub wal_records: usize,
     pub flushes: u64,
     pub compactions: u64,
+    /// Writes of lines that were turned into columns straight away.
+    pub fast_writes: u64,
 }
 
 #[derive(Default)]
@@ -110,10 +136,18 @@ pub(crate) struct State {
     cols: HashMap<u64, HashMap<String, u64>>,
     col_types: HashMap<u64, FieldType>,
     next_col: u64,
-    buffer: HashMap<u64, Vec<(i64, FieldValue)>>,
+    buffer: Batch,
     buffered: usize,
-    /// WAL keys not yet covered by a flush.
-    wal: Vec<Vec<u8>>,
+    /// The log that writes go to until the next flush, which is a file of the
+    /// directory of the database (not a key of the store: the store would
+    /// write them again, in a table, and again when merging tables, to
+    /// delete them at the flush).
+    wal: Option<LogWriter>,
+    /// Which one it is, and the older ones (their points are in the buffer
+    /// still) that are left.
+    wal_gen: u64,
+    wal_older: Vec<u64>,
+    wal_records: usize,
     seq: u64,
     poisoned: Option<String>,
     flushes: u64,
@@ -177,6 +211,14 @@ pub(crate) fn stats_key(data_key: &[u8]) -> Vec<u8> {
     key
 }
 
+fn wal_name(gen: u64) -> String {
+    format!("{gen:016x}.tswal")
+}
+
+fn wal_generation(name: &str) -> Option<u64> {
+    u64::from_str_radix(name.strip_suffix(".tswal")?, 16).ok()
+}
+
 /// Timestamped values of one column.
 type Points = Vec<(i64, FieldValue)>;
 
@@ -208,8 +250,7 @@ enum Source {
 struct Target {
     series: Arc<Series>,
     col: u64,
-    ty: FieldType,
-    buffered: Points,
+    buffered: Option<ColumnPoints>,
     /// The statistics of the stored chunks of the column, at the time of the
     /// query; those of the partitions in the range are the ones to look at.
     stored: Arc<Catalog>,
@@ -288,9 +329,9 @@ impl State {
     }
 
     /// Resolves series / columns for `points` (registering new ones in
-    /// memory and in `batch`) and returns `(column, ts, value)` triples.
-    fn stage(&mut self, points: &[Point], now: i64, batch: &mut WriteBatch) -> Vec<(u64, i64, FieldValue)> {
-        let mut staged = Vec::new();
+    /// memory and in `batch`) and returns the points by column.
+    fn stage(&mut self, points: &[Point], now: i64, batch: &mut WriteBatch) -> Batch {
+        let mut staged = Batch::default();
         for p in points {
             let ts = p.timestamp.unwrap_or(now);
             let (sid, new) = self.index.insert(&p.measurement, &p.tags);
@@ -313,23 +354,47 @@ impl State {
                     batch.put(&column_key(sid, f), &[&c.to_le_bytes()[..], &[ty as u8]].concat());
                     c
                 });
-                staged.push((col, ts, v.clone()));
+                let points = staged.entry(col).or_insert_with(|| ColumnPoints::new(ty));
+                points
+                    .push(ts, v.clone())
+                    .expect("the points of a column are of its type");
             }
         }
         staged
     }
 
-    fn apply(&mut self, staged: Vec<(u64, i64, FieldValue)>) {
-        self.buffered += staged.len();
-        for (col, ts, v) in staged {
-            self.buffer.entry(col).or_default().push((ts, v));
+    /// Adds the points of a write to the buffer; their columns are known and
+    /// they have the types of the columns. `room` is the number of points
+    /// that a column of the buffer is to have room for, when it is made.
+    fn apply(&mut self, staged: Batch, room: usize) {
+        self.buffered += batch::points_in(&staged);
+        for (col, points) in staged {
+            match self.buffer.entry(col) {
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    held.get_mut()
+                        .append(points)
+                        .expect("the points of a column are of its type");
+                }
+                std::collections::hash_map::Entry::Vacant(free) => {
+                    let room = room.max(points.len());
+                    let mut buffered = ColumnPoints::with_capacity(points.values.field_type(), room);
+                    buffered.append(points).expect("the points of a column are of its type");
+                    free.insert(buffered);
+                }
+            }
         }
     }
 
+    /// Puts a record of the log back in the buffer.
     fn replay(&mut self, record: &[u8]) -> Result<()> {
-        let points = lineproto::parse(&String::from_utf8_lossy(record))?;
-        let staged = self.stage(&points, 0, &mut WriteBatch::new());
-        self.apply(staged);
+        let staged = batch::decode(record)?;
+        let known = |(col, points): (&u64, &ColumnPoints)| self.col_types.get(col) == Some(&points.values.field_type());
+        if !staged.iter().all(known) {
+            return Err(Error::Corrupt(
+                "record of the log: a column that is not there or not of that type".into(),
+            ));
+        }
+        self.apply(staged, 0);
         Ok(())
     }
 }
@@ -395,24 +460,28 @@ pub fn capture_points(stats: &ParseStats) -> Vec<Point> {
 }
 
 pub struct Db {
+    dir: PathBuf,
     pub(crate) kv: flashkv::Db,
     pub(crate) opts: DbOptions,
     pub(crate) state: Mutex<State>,
     pub(crate) compact_lock: Mutex<()>,
     pub(crate) compactions: AtomicU64,
+    /// The series that lines can be turned into columns for without making
+    /// points of them (see [`crate::fast`]). Series and columns are never
+    /// removed or changed, so what is in here stays true.
+    fast: RwLock<fast::Cache>,
+    fast_writes: AtomicU64,
 }
 
 impl Db {
     pub fn open(dir: &Path, opts: DbOptions) -> Result<Db> {
         let kv = flashkv::Db::open(dir, opts.kv.clone())?;
+        let older = || Error::Corrupt("the database was made by an older version, whose format is not read".into());
         match kv.get(FORMAT_KEY)?.as_deref() {
             Some([FORMAT]) => {}
+            Some([older_format]) if *older_format < FORMAT => return Err(older()),
             Some(_) => return Err(corrupt("format")),
-            None if kv.iter(b"D", Some(b"E")).next().is_some() => {
-                return Err(Error::Corrupt(
-                    "the chunks have no statistics: the database was made by an older version".into(),
-                ))
-            }
+            None if kv.iter(b"D", Some(b"E")).next().is_some() => return Err(older()),
             None => kv.put(FORMAT_KEY, &[FORMAT])?,
         }
         let mut entries = kv.scan(b"C", Some(b"D"))?;
@@ -429,20 +498,61 @@ impl Db {
                     d.finish("sequence")?;
                 }
                 b'S' => st.index.restore(Series::decode(&v)?),
-                b'W' => {
-                    st.replay(&v)?;
-                    st.wal.push(k);
-                }
                 _ => {}
             }
         }
-        Ok(Db {
+        let env = opts.kv.env.clone();
+        let live_from = match kv.get(WAL_KEY)? {
+            Some(v) => {
+                let mut d = Decoder::new(&v);
+                let first = d.u64();
+                d.finish("first log")?;
+                first
+            }
+            None => 0,
+        };
+        let mut gens: Vec<u64> = env.list(dir)?.iter().filter_map(|n| wal_generation(n)).collect();
+        gens.sort_unstable();
+        // The logs of points that are in chunks, which a crash left, go.
+        for gen in gens.iter().filter(|&&g| g < live_from) {
+            let _ = env.remove(&dir.join(wal_name(*gen)));
+        }
+        gens.retain(|&g| g >= live_from);
+        for gen in &gens {
+            let name = wal_name(*gen);
+            let data = env.read_all(&dir.join(&name))?;
+            for record in log::parse_checked(&data, &name)? {
+                st.replay(record)?;
+                st.wal_records += 1;
+            }
+        }
+        // Writes go to a log of their own: no record is added after a torn one.
+        st.wal_gen = gens.last().map_or(live_from, |last| last + 1);
+        st.wal_older = gens;
+        let db = Db {
+            dir: dir.to_path_buf(),
             kv,
             opts,
-            state: Mutex::new(st),
+            state: Mutex::default(),
             compact_lock: Mutex::new(()),
             compactions: AtomicU64::new(0),
-        })
+            fast: RwLock::default(),
+            fast_writes: AtomicU64::new(0),
+        };
+        let wal = db.start_wal(st.wal_gen)?;
+        st.wal = Some(wal);
+        *db.state.lock() = st;
+        Ok(db)
+    }
+
+    /// A new log, which is there after a crash.
+    fn start_wal(&self, gen: u64) -> flashkv::Result<LogWriter> {
+        let env = &self.opts.kv.env;
+        let file = env.create(&self.dir.join(wal_name(gen)))?;
+        if self.opts.kv.sync {
+            env.sync_dir(&self.dir)?;
+        }
+        Ok(LogWriter::new(file))
     }
 
     /// Writes `points` durably (see module docs). Points without a timestamp
@@ -452,21 +562,28 @@ impl Db {
         let st = &mut *guard;
         st.healthy()?;
         check_points(&st.schema, points)?;
-        let now = now_ns();
         let mut batch = WriteBatch::new();
-        let staged = st.stage(points, now, &mut batch);
-        let mut text = String::new();
-        for p in points {
-            lineproto::write_line(&mut text, p, Some(p.timestamp.unwrap_or(now)));
-            text.push('\n');
+        let staged = st.stage(points, now_ns(), &mut batch);
+        let record = batch::encode(&staged);
+        self.write_staged(st, vec![staged], &record, batch)
+    }
+
+    /// Makes `staged`, whose series and columns are known and whose points
+    /// are of the types of the columns, durable and puts it in the buffer, a
+    /// batch after the other.
+    /// `batch` has what is to be stored before the record of the log: the new
+    /// series, fields and columns.
+    fn write_staged(&self, st: &mut State, staged: Vec<Batch>, record: &[u8], batch: WriteBatch) -> Result<()> {
+        // What the points are of (series, fields, columns) first, so that no
+        // record of the log is of something that is not there after a crash.
+        if !batch.is_empty() {
+            self.commit(st, &batch)?;
         }
-        st.seq += 1;
-        let wal_key = [&b"W"[..], &st.seq.to_be_bytes()].concat();
-        batch.put(&wal_key, text.as_bytes());
-        batch.put(META_SEQ, &st.seq.to_le_bytes());
-        self.commit(st, &batch)?;
-        st.wal.push(wal_key);
-        st.apply(staged);
+        let logged = st.wal.as_mut().expect("the log is open").add(record, self.opts.kv.sync);
+        logged.map_err(|e| self.poison(st, e))?;
+        st.wal_records += 1;
+        let room = self.opts.chunk_points;
+        staged.into_iter().for_each(|batch| st.apply(batch, room));
         let wanted = self.opts.chunk_points.saturating_mul(st.buffer.len());
         if st.buffered >= self.opts.flush_points.max(wanted.min(MAX_BUFFERED_POINTS)) {
             // The points are already durable: a failed flush only poisons
@@ -476,18 +593,81 @@ impl Db {
         Ok(())
     }
 
-    /// Parses line protocol and writes it; returns the number of points.
+    /// Parses line protocol and writes it; returns the number of points. A
+    /// large text is parsed in pieces, on several threads.
     pub fn write_lines(&self, text: &str) -> Result<usize> {
+        let now = now_ns();
+        let parsed = {
+            let cache = self.fast.read();
+            let pieces = fast::segments(text, SEGMENT_BYTES);
+            let parse = |piece: &str| {
+                let (staged, lines) = fast::parse(piece, &cache, now)?;
+                Some((batch::encode_body(&staged), staged, lines))
+            };
+            let threads = par::threads_for(self.opts.threads);
+            par::map(threads, pieces, parse).into_iter().collect::<Option<Vec<_>>>()
+        };
+        let lines = parsed.iter().flatten().map(|p| p.2).sum::<usize>();
+        if let Some(parsed) = parsed.filter(|_| lines > 0) {
+            let (bodies, staged): (Vec<_>, Vec<_>) = parsed.into_iter().map(|(body, staged, _)| (body, staged)).unzip();
+            let record = batch::record(&bodies);
+            let mut guard = self.state.lock();
+            guard.healthy()?;
+            self.write_staged(&mut guard, staged, &record, WriteBatch::new())?;
+            self.fast_writes.fetch_add(1, Ordering::Relaxed);
+            return Ok(lines);
+        }
         let points = lineproto::parse(text)?;
         self.write_points(&points)?;
+        self.learn(text);
         Ok(points.len())
     }
 
+    /// Remembers the series of the plain lines of `text`, which has just been
+    /// written, so that the next lines of them can go the fast way.
+    fn learn(&self, text: &str) {
+        let st = self.state.lock();
+        let mut cache = self.fast.write();
+        for line in text.lines() {
+            let Some((series, names)) = fast::plain_fields(line) else {
+                continue;
+            };
+            if (cache.len() >= fast::MAX_SERIES) | cache.contains_key(series) {
+                continue;
+            }
+            let Ok(point) = lineproto::parse_line(line) else {
+                continue;
+            };
+            let Some(cols) = st
+                .index
+                .get(&series_key(&point.measurement, &point.tags))
+                .and_then(|sid| st.cols.get(&sid))
+            else {
+                continue;
+            };
+            let slots: Vec<(Box<str>, u64, FieldType)> = names
+                .iter()
+                .filter_map(|name| {
+                    let name: Box<str> = (*name).into();
+                    cols.get(&*name).map(|&col| (name, col, st.col_types[&col]))
+                })
+                .collect();
+            // Strings are not for the fast way; nor is a name that is twice.
+            let distinct = names.iter().collect::<std::collections::HashSet<_>>().len() == names.len();
+            let fine = (slots.len() == names.len()) & distinct & slots.iter().all(|f| f.2 != FieldType::Str);
+            cache.extend(fine.then(|| (series.into(), fast::Fields(slots))));
+        }
+    }
+
     fn commit(&self, st: &mut State, batch: &WriteBatch) -> Result<()> {
-        self.kv.write(batch).map_err(|e| {
-            st.poisoned = Some(e.to_string());
-            Error::Kv(e)
-        })
+        self.kv.write(batch).map_err(|e| self.poison(st, e))
+    }
+
+    /// Every later call fails until the database is opened again, which
+    /// recovers what was acknowledged.
+    fn poison(&self, st: &mut State, e: flashkv::Error) -> Error {
+        st.poisoned = Some(e.to_string());
+        Error::Kv(e)
     }
 
     /// Moves the write buffer into chunks.
@@ -500,23 +680,50 @@ impl Db {
     fn flush_locked(&self, st: &mut State) -> Result<()> {
         let mut batch = WriteBatch::new();
         let mut written = Vec::new();
-        for (col, points) in std::mem::take(&mut st.buffer) {
-            let ty = st.col_types[&col];
-            for (bucket, part) in self.opts.partition.split(points) {
-                let chunk = Chunk::from_points(ty, part).expect("buffered values match their column type");
-                st.seq += 1;
-                let key = data_key(col, bucket, st.seq);
-                batch.put(&key, &chunk.encode());
-                let stats = chunk.stats().expect("a part has points");
-                batch.put(&stats_key(&key), &stats.encode());
-                written.push((col, (bucket, st.seq), stats));
-            }
+        let partition = self.opts.partition;
+        let columns: Vec<(u64, ColumnPoints)> = std::mem::take(&mut st.buffer).into_iter().collect();
+        // The chunks of the columns are made on several threads.
+        let build = |(col, points): (u64, ColumnPoints)| {
+            let chunk = Chunk::from_columns(points.ts, points.values);
+            let runs = partition.runs(chunk.timestamps());
+            let parts: Vec<(i64, Chunk)> = match runs.as_slice() {
+                [(bucket, _)] => vec![(*bucket, chunk)],
+                _ => runs
+                    .into_iter()
+                    .map(|(b, r)| (b, chunk.slice(r.start, r.end)))
+                    .collect(),
+            };
+            let encoded: Vec<_> = parts
+                .into_iter()
+                .map(|(bucket, part)| {
+                    let stats = part.stats().expect("a part has points");
+                    (col, bucket, part.encode(), stats)
+                })
+                .collect();
+            encoded
+        };
+        let threads = par::threads_for(self.opts.threads);
+        for (col, bucket, chunk, stats) in par::map(threads, columns, build).into_iter().flatten() {
+            st.seq += 1;
+            let key = data_key(col, bucket, st.seq);
+            batch.put(&key, &chunk);
+            batch.put(&stats_key(&key), &stats.encode());
+            written.push((col, (bucket, st.seq), stats));
         }
-        for k in st.wal.drain(..) {
-            batch.delete(&k);
-        }
+        // From now on, writes go to a new log: the points of the old ones are
+        // in these chunks, and the first log to read is the new one.
+        let next = st.wal_gen + 1;
+        let wal = self.start_wal(next).map_err(|e| self.poison(st, e))?;
+        batch.put(WAL_KEY, &next.to_le_bytes());
         batch.put(META_SEQ, &st.seq.to_le_bytes());
         self.commit(st, &batch)?;
+        st.wal = Some(wal);
+        let older = std::mem::take(&mut st.wal_older);
+        for gen in older.into_iter().chain([st.wal_gen]) {
+            let _ = self.opts.kv.env.remove(&self.dir.join(wal_name(gen)));
+        }
+        st.wal_gen = next;
+        st.wal_records = 0;
         for (col, key, stats) in written {
             if let Some(catalog) = st.catalog.get_mut(&col) {
                 Arc::make_mut(catalog).insert(key, stats);
@@ -543,8 +750,7 @@ impl Db {
             targets.push(Target {
                 series: st.index.series(sid).expect("indexed").clone(),
                 col,
-                ty: st.col_types[&col],
-                buffered: st.buffer.get(&col).cloned().unwrap_or_default(),
+                buffered: st.buffer.get(&col).cloned(),
                 stored,
             });
         }
@@ -564,12 +770,16 @@ impl Db {
                 source: Source::Stored(bucket, seq),
             })
             .collect();
-        let buffered = Chunk::from_points(target.ty, target.buffered).expect("buffered values match their column");
         let in_range = |stats: &ChunkStats| (stats.max_ts >= q.start) & (stats.min_ts < q.end);
-        pieces.extend(buffered.stats().filter(in_range).map(|stats| Piece {
-            stats,
-            source: Source::Buffered(buffered),
-        }));
+        if let Some(buffered) = target.buffered {
+            let buffered = Chunk::from_columns(buffered.ts, buffered.values);
+            if let Some(stats) = buffered.stats().filter(in_range) {
+                pieces.push(Piece {
+                    stats,
+                    source: Source::Buffered(buffered),
+                });
+            }
+        }
         pieces
     }
 
@@ -670,13 +880,12 @@ impl Db {
             };
         }
         // Of equal timestamps, the point that was written last is the newest.
-        let buffered = target
-            .buffered
-            .into_iter()
-            .enumerate()
-            .filter(|(_, p)| in_range(q, p))
-            .max_by_key(|(i, p)| (p.0, *i))
-            .map(|(_, p)| p);
+        let buffered = target.buffered.and_then(|b| {
+            let (i, &t) = (b.ts.iter().enumerate())
+                .filter(|&(_, &t)| (t >= q.start) & (t < q.end))
+                .max_by_key(|&(i, &t)| (t, i))?;
+            Some((t, b.values.get(i)))
+        });
         let newest = match (stored, buffered) {
             (Some(old), Some(new)) if new.0 < old.0 => Some(old),
             (old, new) => new.or(old),
@@ -705,7 +914,7 @@ impl Db {
                 push_rows(&mut rows, &series, points);
             }
         } else {
-            let threads = par::threads_for(self.opts.query_threads);
+            let threads = par::threads_for(self.opts.threads);
             for outcome in par::map(threads, targets, |t| evaluate(t, max)) {
                 let (series, points) = outcome?;
                 push_rows(&mut rows, &series, points);
@@ -803,14 +1012,16 @@ impl Db {
             series: st.index.len(),
             columns: st.col_types.len(),
             buffered_points: st.buffered,
-            wal_records: st.wal.len(),
+            wal_records: st.wal_records,
             flushes: st.flushes,
             compactions: self.compactions.load(Ordering::Relaxed),
+            fast_writes: self.fast_writes.load(Ordering::Relaxed),
         }
     }
 
     /// Closes the store; buffered points stay in the WAL and are replayed.
     pub fn close(self) -> Result<()> {
+        self.state.lock().wal.as_mut().expect("the log is open").sync()?;
         Ok(self.kv.close()?)
     }
 }
@@ -1201,7 +1412,7 @@ pub(crate) mod tests {
             (b"C\x00\x00\x00\x00\x00\x00\x00\x00f", &[0; 3]),
             (b"Mseq", &[1]),
             (b"S\x00", &[1]),
-            (b"W\xff", b"not line protocol"),
+            (b"Z", &[1]),
         ];
         for (k, v) in cases {
             let dir2 = tmpdir("corrupt2");
@@ -1256,7 +1467,7 @@ pub(crate) mod tests {
         let dir = tmpdir("threads");
         let mut o = opts();
         o.partition = Partitioner::new(100);
-        o.query_threads = 4;
+        o.threads = 4;
         let db = Db::open(&dir, o.clone()).unwrap();
         for round in 0..6 {
             let points: Vec<Point> = (0..40)
@@ -1278,7 +1489,7 @@ pub(crate) mod tests {
         assert_eq!(threaded[1].len(), 40);
         assert_eq!(threaded[1][39].tags["host"], "h39");
         db.close().unwrap();
-        o.query_threads = 1;
+        o.threads = 1;
         let db = Db::open(&dir, o).unwrap();
         let serial: Vec<_> = queries.iter().map(|q| db.query(q).unwrap()).collect();
         assert_eq!(threaded, serial);
@@ -1334,6 +1545,163 @@ pub(crate) mod tests {
         assert_eq!(db.query(&q).unwrap()[0].value, FieldValue::Float(4.0));
         // A range that cuts it needs its points.
         assert!(db.query(&q.range(0, 15)).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What `write_lines` made of the payloads, and what the line protocol
+    /// parser and `write_points` make of them, which is the reference.
+    #[test]
+    fn the_fast_way_makes_what_the_slow_way_makes() {
+        let (a, b) = (tmpdir("fast-a"), tmpdir("fast-b"));
+        let (fast, slow) = (Db::open(&a, opts()).unwrap(), Db::open(&b, opts()).unwrap());
+        let payloads = [
+            // Teaches: the series, and the order of the fields. Comments are left out.
+            "cpu,host=a usage=1.5,cores=4i,up=t,n=7u 100\ncpu,host=b usage=2.5,cores=8i,up=f,n=9u 100\n#c a=b\n#d a=1\n",
+            // The same, the fast way, and an empty line.
+            "cpu,host=a usage=2.5,cores=4i,up=f,n=8u 200\ncpu,host=b usage=3.5,cores=8i,up=t,n=10u 200\n\n",
+            // Out of order, and a point that is written again.
+            "cpu,host=a usage=9.5,cores=1i,up=t,n=1u 100\ncpu,host=a usage=0.5,cores=2i,up=t,n=2u 50\n",
+            // A series that is new, and fields in another order.
+            "cpu,host=c usage=1,cores=1i,up=t,n=1u 300\ncpu,host=a cores=5i,usage=1.25,n=3u,up=f 400\n",
+            // A string, an escape, a space where it should not be.
+            "cpu,host=a usage=1,cores=1i,up=t,n=1u,note=\"hi there\" 500\ncpu\\ x,host=a v=1 500\n  cpu,host=b usage=1,cores=1i,up=t,n=1u 500\n",
+            // A series with a string, again: nothing fast about it. And the others.
+            "cpu,host=a usage=1,cores=1i,up=t,n=1u,note=\"again\" 600\ncpu,host=b usage=4.5,cores=9i,up=f,n=11u 600\n",
+            "cpu,host=c usage=2,cores=2i,up=f,n=2u 700\ncpu,host=c usage=-3.25e1,cores=-2i,up=T,n=0u 800\n",
+            // Numbers that have to be parsed with care.
+            "cpu,host=b usage=0.1,cores=1i,up=t,n=1u 900\ncpu,host=b usage=123456789.123456789,cores=1i,up=t,n=1u 901\ncpu,host=b usage=1e3,cores=1i,up=t,n=1u 902\n",
+        ];
+        let errors = [
+            // The type of a field changes; a value that is nothing; a field twice; no field.
+            "cpu,host=a usage=1i,cores=4i,up=t,n=7u 1000\n",
+            "cpu,host=a usage=abc,cores=4i,up=t,n=7u 1000\n",
+            "cpu,host=a usage=1,usage=2,cores=4i,up=t,n=7u 1000\n",
+            "cpu,host=a\n",
+        ];
+        for (i, text) in payloads.iter().enumerate() {
+            let points = lineproto::parse(text).unwrap();
+            slow.write_points(&points).unwrap();
+            assert_eq!(fast.write_lines(text).unwrap(), points.len(), "{i}");
+            assert_eq!(fast.dump().unwrap(), slow.dump().unwrap(), "payload {i}");
+        }
+        let stats = fast.stats();
+        assert!(stats.fast_writes >= 3, "{stats:?}");
+        assert_eq!(slow.stats().fast_writes, 0);
+        for text in errors {
+            let want = lineproto::parse(text)
+                .map(|p| slow.write_points(&p))
+                .unwrap_or_else(Err);
+            let got = fast.write_lines(text).map(|_| ());
+            assert_eq!(got.unwrap_err().to_string(), want.unwrap_err().to_string(), "{text:?}");
+        }
+        assert_eq!(fast.dump().unwrap(), slow.dump().unwrap());
+        // The same from the files: the records of the log, and then the chunks.
+        fast.close().unwrap();
+        let fast = Db::open(&a, opts()).unwrap();
+        assert_eq!(fast.dump().unwrap(), slow.dump().unwrap(), "replayed");
+        fast.flush().unwrap();
+        slow.flush().unwrap();
+        assert_eq!(fast.dump().unwrap(), slow.dump().unwrap(), "flushed");
+        // Without a timestamp, now.
+        let before = now_ns();
+        fast.write_lines("cpu,host=a usage=1,cores=1i,up=t,n=1u\n").unwrap();
+        let q = Query::new("cpu", "usage").filter("host", "a").latest();
+        let ts = fast.query(&q).unwrap()[0].ts;
+        assert!((before..=now_ns()).contains(&ts));
+        for d in [a, b] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    fn logs(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tswal"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_log_is_a_file_that_is_read_back_and_that_a_flush_replaces() {
+        let dir = tmpdir("log-files");
+        let db = Db::open(&dir, opts()).unwrap();
+        assert_eq!(logs(&dir), ["0000000000000000.tswal"]);
+        db.write_points(&[cpu("a", 1, 1.0)]).unwrap();
+        db.write_points(&[cpu("a", 2, 2.0)]).unwrap();
+        assert_eq!(db.stats().wal_records, 2);
+        db.close().unwrap();
+        // Read back, and the new writes go to a log of their own.
+        let db = Db::open(&dir, opts()).unwrap();
+        assert_eq!(db.stats().wal_records, 2);
+        assert_eq!(db.stats().buffered_points, 2);
+        assert_eq!(logs(&dir), ["0000000000000000.tswal", "0000000000000001.tswal"]);
+        db.write_points(&[cpu("a", 3, 3.0)]).unwrap();
+        // A flush puts the points in chunks, and the logs of them go.
+        db.flush().unwrap();
+        assert_eq!(logs(&dir), ["0000000000000002.tswal"]);
+        assert_eq!(db.stats().wal_records, 0);
+        db.write_points(&[cpu("a", 4, 4.0)]).unwrap();
+        db.close().unwrap();
+        // A log that a crash left after its points were in chunks is not read, and goes.
+        let old = dir.join(wal_name(1));
+        let mut record = Vec::new();
+        let mut stale = Batch::default();
+        stale.insert(0, {
+            let mut c = ColumnPoints::new(FieldType::Float);
+            c.push(99, FieldValue::Float(99.0)).unwrap();
+            c
+        });
+        log::frame(&mut record, &batch::encode(&stale));
+        std::fs::write(&old, &record).unwrap();
+        let db = Db::open(&dir, opts()).unwrap();
+        assert!(!old.exists());
+        let times: Vec<i64> = db
+            .query(&Query::new("cpu", "usage"))
+            .unwrap()
+            .iter()
+            .map(|r| r.ts)
+            .collect();
+        assert_eq!(times, [1, 2, 3, 4]);
+        db.close().unwrap();
+        // A torn tail (a write that was cut short) is dropped, and the points before it are not.
+        let latest = dir.join(logs(&dir).last().unwrap());
+        let mut bytes = std::fs::read(&latest).unwrap();
+        let whole = bytes.len();
+        bytes.extend_from_slice(&[9, 9, 9, 9, 200, 0, 0, 0, 1, 2, 3]);
+        std::fs::write(&latest, &bytes).unwrap();
+        let db = Db::open(&dir, opts()).unwrap();
+        assert_eq!(db.query(&Query::new("cpu", "usage")).unwrap().len(), 4);
+        db.close().unwrap();
+        // Damage in the middle of a log is not that, and stops the open.
+        let latest = dir.join(logs(&dir)[0].clone());
+        bytes = std::fs::read(&latest).unwrap();
+        bytes.truncate(whole);
+        let mut second = Vec::new();
+        log::frame(&mut second, &batch::encode(&stale));
+        bytes.extend_from_slice(&second);
+        let at = bytes.len() / 4;
+        bytes[at] ^= 0xff;
+        std::fs::write(&latest, &bytes).unwrap();
+        assert!(Db::open(&dir, opts()).is_err());
+        // A record that is framed well but is not a record.
+        let mut framed = Vec::new();
+        log::frame(&mut framed, &[7, 7, 7]);
+        std::fs::write(&latest, &framed).unwrap();
+        let e = Db::open(&dir, opts()).err().unwrap().to_string();
+        assert!(e.contains("record of the log"), "{e}");
+        // A record of a column that is not there, or of another type, is no better.
+        for column in [999, 0] {
+            let mut wrong = Batch::default();
+            let ty = if column == 0 { FieldType::Int } else { FieldType::Float };
+            wrong.insert(column, ColumnPoints::new(ty));
+            let mut framed = Vec::new();
+            log::frame(&mut framed, &batch::encode(&wrong));
+            std::fs::write(&latest, &framed).unwrap();
+            let e = Db::open(&dir, opts()).err().unwrap().to_string();
+            assert!(e.contains("a column that is not there or not of that type"), "{e}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1426,10 +1794,13 @@ pub(crate) mod tests {
         assert_eq!(db.kv.get(FORMAT_KEY).unwrap(), Some(vec![FORMAT]));
         db.close().unwrap();
         assert!(Db::open(&dir, opts()).is_ok());
-        // Another format is not understood.
+        // A newer format is not understood; an older one is refused with a word.
         raw_put(&dir, FORMAT_KEY, &[FORMAT + 1]);
         let e = Db::open(&dir, opts()).err().unwrap().to_string();
         assert!(e.contains("bad format entry"), "{e}");
+        raw_put(&dir, FORMAT_KEY, &[FORMAT - 1]);
+        let e = Db::open(&dir, opts()).err().unwrap().to_string();
+        assert!(e.contains("made by an older version"), "{e}");
         // Chunks without a mark are those of a version that had no statistics.
         let old = tmpdir("format-old");
         raw_put(&old, &data_key(0, 0, 1), b"\x00");

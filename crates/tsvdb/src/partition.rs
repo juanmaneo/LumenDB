@@ -3,9 +3,7 @@
 //! negative timestamps (Euclidean division). Buckets are encoded big-endian
 //! with the sign bit flipped so that byte order equals time order in flashkv.
 
-use crate::lineproto::FieldValue;
-use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 
 pub const HOUR_NS: i64 = 3_600 * 1_000_000_000;
 
@@ -50,13 +48,18 @@ impl Partitioner {
         self.bucket(start)..=self.bucket(end.saturating_sub(1).max(start))
     }
 
-    /// Groups points by bucket, preserving their order inside each bucket.
-    pub fn split(&self, points: Vec<(i64, FieldValue)>) -> BTreeMap<i64, Vec<(i64, FieldValue)>> {
-        let mut out: BTreeMap<i64, Vec<(i64, FieldValue)>> = BTreeMap::new();
-        for p in points {
-            out.entry(self.bucket(p.0)).or_default().push(p);
+    /// The runs of `ts`, which is sorted, that are in one bucket each: the
+    /// bucket and the indexes of its points.
+    pub fn runs(&self, ts: &[i64]) -> Vec<(i64, Range<usize>)> {
+        let mut runs: Vec<(i64, Range<usize>)> = Vec::new();
+        for (i, &t) in ts.iter().enumerate() {
+            let bucket = self.bucket(t);
+            match runs.last_mut() {
+                Some((b, run)) if *b == bucket => run.end = i + 1,
+                _ => runs.push((bucket, i..i + 1)),
+            }
         }
-        out
+        runs
     }
 }
 
@@ -93,17 +96,14 @@ mod tests {
     }
 
     #[test]
-    fn split_groups_by_bucket() {
+    fn runs_group_sorted_timestamps_by_bucket() {
         let p = Partitioner::new(10);
-        let pts = vec![
-            (15, FieldValue::Int(1)),
-            (3, FieldValue::Int(2)),
-            (11, FieldValue::Int(3)),
-        ];
-        let parts = p.split(pts);
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[&0], vec![(3, FieldValue::Int(2))]);
-        assert_eq!(parts[&1], vec![(15, FieldValue::Int(1)), (11, FieldValue::Int(3))]);
+        assert_eq!(p.runs(&[]), vec![]);
+        assert_eq!(p.runs(&[3]), vec![(0, 0..1)]);
+        assert_eq!(
+            p.runs(&[-7, -1, 3, 9, 11, 12, 35]),
+            vec![(-1, 0..2), (0, 2..4), (1, 4..6), (3, 6..7)]
+        );
     }
 
     #[test]
