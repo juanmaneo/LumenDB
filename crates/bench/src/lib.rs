@@ -295,7 +295,7 @@ fn gen_pcap(a: &Args) -> Res<String> {
     let defaults = SynthOptions::default();
     let o = SynthOptions {
         packets: a.num("packets", 100_000)?,
-        flows: u32::try_from(a.num::<u64>("flows", 64)?)?,
+        flows: a.num::<u32>("flows", 64)?,
         seed: a.num("seed", defaults.seed)?,
         interval_ns: a.num("interval-ns", defaults.interval_ns)?,
         format,
@@ -679,7 +679,7 @@ fn cluster_demo(a: &Args) -> Res<String> {
     }
     let o = SynthOptions {
         packets: a.num("packets", 20_000)?,
-        flows: u32::try_from(a.num::<u64>("flows", 64)?)?,
+        flows: a.num::<u32>("flows", 64)?,
         ..SynthOptions::default()
     };
     let limit = Duration::from_millis(a.num("timeout-ms", 10_000)?);
@@ -1029,7 +1029,10 @@ mod tests {
         assert_eq!(err("gen-pcap"), "missing output file");
         assert_eq!(err("gen-pcap f --packets -1"), "--packets: invalid number \"-1\"");
         assert_eq!(err("gen-pcap f --format nope"), "unknown format \"nope\"");
-        assert!(err("gen-pcap f --flows 99999999999").contains("too large"));
+        assert_eq!(
+            err("gen-pcap f --flows 99999999999"),
+            "--flows: invalid number \"99999999999\""
+        );
         assert_eq!(
             err("query --db x --where nope"),
             "--where expects tag=value, got \"nope\""
@@ -1280,7 +1283,7 @@ mod tests {
         assert_eq!(err("cluster-demo --nodes 8"), "--nodes must be between 1 and 7");
         assert_eq!(
             err("cluster-demo --flows 99999999999"),
-            "number too large to fit in target type"
+            "--flows: invalid number \"99999999999\""
         );
         assert!(err("cluster-demo --nodes x").contains("--nodes: invalid number"));
         assert_eq!(err("cluster-demo --x 1"), "unknown flag --x");

@@ -5,8 +5,9 @@ members = ["crates/cpu", "crates/raft", "crates/flashkv", "crates/pcapfast", "cr
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# The oldest toolchain the workspace is checked with (`cargo +1.95 check`).
-rust-version = "1.95"
+# The oldest toolchain that builds and passes the tests (the CI job msrv):
+# 1.89 made `File::lock` stable, which flashkv uses.
+rust-version = "1.89"
 license = "MIT"
 authors = ["Juan Manuel CABA <contact@juan.email>"]
 repository = "https://github.com/juanmaneo/LumenDB"

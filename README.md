@@ -362,7 +362,9 @@ small finite domain instead, because CBMC runs out of memory on them.
 1. `cargo xtask dev-check` (fmt, clippy, tests, 100% coverage);
 2. `cargo xtask kani`, with a pinned kani and a cached, retried download;
 3. `cargo build --release --workspace`;
-4. on `ubuntu-24.04-arm`: clippy, tests and `bench crc-bench`.
+4. on `ubuntu-24.04-arm`: clippy, tests and `bench crc-bench`;
+5. the tests on Rust 1.89, the `rust-version` (1.89 made `File::lock`
+   stable).
 
 ## Authorship
 
