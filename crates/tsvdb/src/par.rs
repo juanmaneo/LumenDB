@@ -36,10 +36,7 @@ pub(crate) fn map<T: Send, R: Send>(threads: usize, items: Vec<T>, f: impl Fn(T)
         done.push((i, f(item)));
     }
     let per_item = start.elapsed() / done.len().max(1) as u32;
-    let estimate = per_item.saturating_mul(items.len() as u32);
-    // One more thread for every WORTH of work that is left.
-    let workers = (estimate.as_micros() / WORTH.as_micros()) as usize;
-    let workers = workers.min(threads).min(items.len());
+    let workers = workers(per_item, items.len(), threads);
     if workers < 2 {
         done.extend(items.map(|(i, item)| (i, f(item))));
     } else {
@@ -65,6 +62,15 @@ pub(crate) fn map<T: Send, R: Send>(threads: usize, items: Vec<T>, f: impl Fn(T)
     }
     done.sort_unstable_by_key(|d| d.0);
     done.into_iter().map(|d| d.1).collect()
+}
+
+/// How many threads (this one included) should share `left` items that are
+/// measured to take `per_item` each: one for every WORTH of work, at most
+/// `threads`, and not more than there are items.
+fn workers(per_item: Duration, left: usize, threads: usize) -> usize {
+    let estimate = per_item.saturating_mul(left as u32);
+    let workers = (estimate.as_micros() / WORTH.as_micros()) as usize;
+    workers.min(threads).min(left)
 }
 
 #[cfg(test)]
@@ -104,10 +110,16 @@ mod tests {
 
     #[test]
     fn light_work_stays_on_this_thread_and_heavy_work_is_shared() {
-        // Items that cost nothing, and no matter how many threads are allowed.
-        let (_, threads) = run(8, 500, Duration::ZERO);
-        assert_eq!(threads.len(), 1);
-        // Items of a millisecond each, forty of them.
+        // (Decided on fixed measurements: a real one of light work depends
+        // on how busy the machine is.)
+        let us = Duration::from_micros;
+        assert_eq!(workers(Duration::from_nanos(50), 500, 8), 0, "25 us of work");
+        assert_eq!(workers(us(100), 20, 8), 2, "2 ms of work");
+        assert_eq!(workers(us(1000), 39, 4), 4, "no more than allowed");
+        assert_eq!(workers(us(1000), 39, 1), 1);
+        assert_eq!(workers(us(5000), 3, 8), 3, "no more than there are items");
+        // Items of a millisecond each, forty of them: slowness only adds to
+        // the measurement, so the work is shared.
         let (_, threads) = run(4, 40, Duration::from_millis(1));
         assert!(threads.len() > 1, "{threads:?}");
         // Not more threads than are allowed, and not the first one alone.

@@ -288,11 +288,25 @@ mod tests {
             db.write_points(&[cpu("a", ts, 1.0)]).unwrap();
             db.flush().unwrap();
         }
+        // Waits for the thread to have merged `n` partitions in all, however
+        // slow the machine is.
+        let merged = |n: u64| {
+            let start = std::time::Instant::now();
+            while db.stats().compactions < n {
+                assert!(start.elapsed() < Duration::from_secs(30), "no compaction {n}");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
         let c = Compactor::start(db.clone(), Duration::from_millis(1));
-        thread::sleep(Duration::from_millis(50));
+        merged(1);
+        // One more chunk makes two in the partition again: only a later pass
+        // of the thread can merge them.
+        db.write_points(&[cpu("a", 2, 1.0)]).unwrap();
+        db.flush().unwrap();
+        merged(2);
         assert!(c.stop() >= 2);
-        assert_eq!(db.stats().compactions, 1);
-        assert_eq!(db.query(&Query::new("cpu", "usage")).unwrap().len(), 2);
+        assert_eq!(db.stats().compactions, 2);
+        assert_eq!(db.query(&Query::new("cpu", "usage")).unwrap().len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
