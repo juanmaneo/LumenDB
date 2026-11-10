@@ -10,17 +10,17 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 The crates are published as the packages in parentheses; in the code they
 keep the short names (`use flashkv::Db`, through `package = "lumen-flashkv"`).
 
-| crate | what it is | inspired by |
-|---|---|---|
-| [`cpu`](crates/cpu) (`lumen-cpu`) | portability layer for special instructions (x86_64, aarch64, portable fallback) | corsix/fast-crc32 |
-| [`flashkv`](crates/flashkv) (`lumen-flashkv`) | crash-safe ordered key-value store (LSM) | LevelDB, LMDB, FoundationDB, eguan/ibs |
-| [`raft`](crates/raft) (`lumen-raft`) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron, TigerBeetle |
-| [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
-| [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli, QuestDB |
-| [`cluster`](crates/cluster) (`lumen-cluster`) | tsvdb replicated by raft | TigerBeetle, CockroachDB |
-| [`bench`](crates/bench) (`lumen-bench`) | command line, binary `bench`: generate, ingest, query, benchmark, run and drive a cluster | — |
-| [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `vopr` / `bench` / `release` / `publish` | cargo-xtask |
-| [`proofs`](proofs) | kani model-checking harnesses | — |
+| crate | what it is | inspired by | crates.io |
+|---|---|---|---|
+| [`cpu`](crates/cpu) (`lumen-cpu`) | portability layer for special instructions (x86_64, aarch64, portable fallback) | corsix/fast-crc32 | [![crates.io](https://img.shields.io/crates/v/lumen-cpu.svg)](https://crates.io/crates/lumen-cpu) [![docs.rs](https://img.shields.io/docsrs/lumen-cpu)](https://docs.rs/lumen-cpu) |
+| [`flashkv`](crates/flashkv) (`lumen-flashkv`) | crash-safe ordered key-value store (LSM) | LevelDB, LMDB, FoundationDB, eguan/ibs | [![crates.io](https://img.shields.io/crates/v/lumen-flashkv.svg)](https://crates.io/crates/lumen-flashkv) [![docs.rs](https://img.shields.io/docsrs/lumen-flashkv)](https://docs.rs/lumen-flashkv) |
+| [`raft`](crates/raft) (`lumen-raft`) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron, TigerBeetle | [![crates.io](https://img.shields.io/crates/v/lumen-raft.svg)](https://crates.io/crates/lumen-raft) [![docs.rs](https://img.shields.io/docsrs/lumen-raft)](https://docs.rs/lumen-raft) |
+| [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — | [![crates.io](https://img.shields.io/crates/v/pcapfast.svg)](https://crates.io/crates/pcapfast) [![docs.rs](https://img.shields.io/docsrs/pcapfast)](https://docs.rs/pcapfast) |
+| [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli, QuestDB | [![crates.io](https://img.shields.io/crates/v/tsvdb.svg)](https://crates.io/crates/tsvdb) [![docs.rs](https://img.shields.io/docsrs/tsvdb)](https://docs.rs/tsvdb) |
+| [`cluster`](crates/cluster) (`lumen-cluster`) | tsvdb replicated by raft | TigerBeetle, CockroachDB | [![crates.io](https://img.shields.io/crates/v/lumen-cluster.svg)](https://crates.io/crates/lumen-cluster) [![docs.rs](https://img.shields.io/docsrs/lumen-cluster)](https://docs.rs/lumen-cluster) |
+| [`bench`](crates/bench) (`lumen-bench`) | command line, binary `bench`: generate, ingest, query, benchmark, run and drive a cluster | — | [![crates.io](https://img.shields.io/crates/v/lumen-bench.svg)](https://crates.io/crates/lumen-bench) [![docs.rs](https://img.shields.io/docsrs/lumen-bench)](https://docs.rs/lumen-bench) |
+| [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `vopr` / `bench` / `release` / `publish` | cargo-xtask | not published |
+| [`proofs`](proofs) | kani model-checking harnesses | — | not published |
 
 ## Architecture
 
