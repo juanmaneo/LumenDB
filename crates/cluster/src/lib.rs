@@ -22,6 +22,15 @@
 //! ([`Error::Rejected`]). Anything else, such as a failing disk, stops the
 //! node: it can no longer follow the log.
 //!
+//! **Retention is replicated too.** [`ReplicatedDb::retain`] works out a cutoff
+//! time on the leader, from its own clock and data, and puts it in the log as
+//! an order (`#retain <cutoff> <measurement>`): every node then drops the
+//! partitions that end before that very time, whatever its own clock says. A
+//! replayed order drops the same partitions again, and a snapshot is a dump of
+//! what was left. A node that does not know the order would read it as a
+//! comment of line protocol and keep the data, so use it only once every node
+//! has this version.
+//!
 //! **Snapshots are dumps.** To compact the Raft log the node dumps the whole
 //! database as compressed line protocol ([`tsvdb::Db::dump`]); a node that
 //! is too far behind, or new, is restored from it. A snapshot is held in
@@ -62,6 +71,13 @@ use tsvdb::{lineproto, Db, DbOptions, Point, Query, Row};
 
 /// The node notes how far it has applied the log every this many entries.
 pub const NOTE_EVERY: u64 = 64;
+
+/// A log entry that starts with this is a retention order, not line protocol:
+/// `#retain <cutoff ns> <measurement, percent-encoded, or *>`. Entries of
+/// line protocol are written by the leader from parsed points, never from the
+/// text of a client, and the leader writes no comments, so no write can look
+/// like an order.
+const RETAIN: &str = "#retain ";
 
 /// How many refusals are kept for the writers that have not asked yet.
 const KEPT_REFUSALS: usize = 1024;
@@ -277,10 +293,15 @@ impl StateMachine for App {
         if entry.index <= shared.applied() {
             return Ok(());
         }
-        match shared.db.write_lines(&String::from_utf8_lossy(&entry.data)) {
-            Ok(_) => Counters::bump(&shared.counters.applied_entries),
+        let text = String::from_utf8_lossy(&entry.data);
+        let done = match text.strip_prefix(RETAIN) {
+            Some(order) => apply_retain(&shared.db, order),
+            None => shared.db.write_lines(&text).map(|_| ()),
+        };
+        match done {
+            Ok(()) => Counters::bump(&shared.counters.applied_entries),
             // These follow from the data, so every node refuses the entry.
-            Err(e @ (tsvdb::Error::Schema(_) | tsvdb::Error::Parse { .. })) => {
+            Err(e @ (tsvdb::Error::Schema(_) | tsvdb::Error::Parse { .. } | tsvdb::Error::Query(_))) => {
                 shared.refuse(entry.index, e.to_string());
             }
             Err(e) => return Err(e.to_string()),
@@ -308,6 +329,18 @@ impl StateMachine for App {
         let text = shared.db.dump().map_err(|e| e.to_string())?;
         Ok(flashkv::lz::compress(text.as_bytes()))
     }
+}
+
+/// Does a retention order: `<cutoff ns> <measurement, percent-encoded, or *>`.
+fn apply_retain(db: &Db, order: &str) -> tsvdb::Result<()> {
+    let malformed = || tsvdb::Error::Query(format!("malformed retention order {order:?}"));
+    let (cutoff, name) = order.trim_end().split_once(' ').ok_or_else(malformed)?;
+    let cutoff = cutoff.parse().map_err(|_| malformed())?;
+    let measurement = match name {
+        "*" => None,
+        token => Some(client::decode_token(token).map_err(|_| malformed())?),
+    };
+    db.drop_before(measurement.as_deref(), cutoff).map(|_| ())
 }
 
 fn now_ns() -> i64 {
@@ -465,12 +498,35 @@ impl ReplicatedDb {
             lineproto::write_line(&mut data, p, Some(p.timestamp.unwrap_or(now)));
             data.push('\n');
         }
-        let index = self.server.propose(data.into_bytes())?;
+        self.replicate(data.into_bytes(), timeout)?;
+        Ok(points.len())
+    }
+
+    /// Appends `data` to the log through the leader, and waits up to
+    /// `timeout` for the leader to apply it. [`Error::Rejected`] if it did
+    /// and the database refused it.
+    fn replicate(&self, data: Vec<u8>, timeout: Duration) -> Result<()> {
+        let index = self.server.propose(data)?;
         self.server.wait_applied(index, timeout)?;
         match self.shared.refused.lock().remove(&index) {
             Some(why) => Err(Error::Rejected(why)),
-            None => Ok(points.len()),
+            None => Ok(()),
         }
+    }
+
+    /// Keeps the last `keep` ns of data, on every node: the leader works out
+    /// the cutoff, which is the earlier of its clock and its newest point
+    /// (of `measurement`, or of everything) minus `keep`, and the nodes drop
+    /// the partitions that end before it. Returns the cutoff, or `None` when
+    /// there is no data to keep or to drop. Only on the leader, like a write.
+    pub fn retain(&self, measurement: Option<&str>, keep: i64, timeout: Duration) -> Result<Option<i64>> {
+        self.server.read_barrier(timeout)?;
+        let Some(cutoff) = self.shared.db.retention_cutoff(measurement, keep, now_ns())? else {
+            return Ok(None);
+        };
+        let name = measurement.map_or("*".to_string(), client::encode_token);
+        let order = format!("{RETAIN}{cutoff} {name}\n");
+        self.replicate(order.into_bytes(), timeout).map(|()| Some(cutoff))
     }
 
     /// Runs `q` on this node's copy, which may lag the leader.
@@ -631,6 +687,11 @@ mod tests {
         fn write(&self, text: &str) -> usize {
             wait_until("a write", || self.leader().write_lines(text, LONG).ok())
         }
+
+        /// Keeps `keep` ns through the leader, retrying while the cluster settles.
+        fn retain(&self, measurement: Option<&str>, keep: i64) -> Option<i64> {
+            wait_until("a retention", || self.leader().retain(measurement, keep, LONG).ok())
+        }
     }
 
     impl Drop for Cluster {
@@ -714,6 +775,37 @@ mod tests {
         assert_eq!(c.write("cpu,host=a usage=3 30"), 1);
         same_everywhere(&c, &usage("a"), 2);
         assert!(leader.server().failure().is_none());
+    }
+
+    #[test]
+    fn retention_is_decided_by_the_leader_and_done_by_every_node() {
+        let c = Cluster::start("retain", 3, 0, fast(0));
+        let leader = c.leader();
+        let hour = 3_600_000_000_000;
+        // No data: nothing to keep, nothing to drop, and nothing in the log.
+        assert_eq!(c.retain(None, hour), None);
+        let before = leader.server().node().commit_index();
+        assert_eq!(c.retain(None, hour), None);
+        assert_eq!(leader.server().node().commit_index(), before);
+        // The first points are 25 hours older than the second, and long ago:
+        // the cutoff goes by the newest point, not by the clock.
+        c.write("cpu,host=a usage=1 1000000000000\ncpu,host=a usage=2 90000000000000\n");
+        c.write("mem,host=a free=3u 1000000000000\n");
+        assert_eq!(c.retain(Some("cpu"), hour), Some(24 * hour));
+        let rows = same_everywhere(&c, &usage("a"), 1);
+        assert_eq!(rows[0].ts, 90_000_000_000_000);
+        same_everywhere(&c, &Query::new("mem", "free"), 1);
+        // Everything: now mem goes too.
+        assert_eq!(c.retain(None, hour), Some(24 * hour));
+        same_everywhere(&c, &Query::new("mem", "free"), 0);
+        same_everywhere(&c, &usage("a"), 1);
+        // Only the leader decides, and the time to keep is a positive time.
+        let follower = c.up().find(|n| n.id() != leader.id()).unwrap();
+        let err = follower.retain(None, hour, LONG).unwrap_err();
+        assert!(err.to_string().starts_with("raft: not leader"), "{err}");
+        let err = leader.retain(None, 0, LONG).unwrap_err();
+        assert!(err.to_string().starts_with("database: invalid query"), "{err}");
+        assert_eq!(leader.stats().refused_entries, 0);
     }
 
     #[test]
@@ -957,6 +1049,50 @@ mod tests {
         assert_eq!(kept.len(), KEPT_REFUSALS);
         assert!(!kept.contains_key(&2) && kept.contains_key(&(1_004 + KEPT_REFUSALS as u64)));
         drop(kept);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retention_orders_are_applied_replayed_and_refused_when_malformed() {
+        let (mut app, dir) = app("app-retain", quiet());
+        let shared = app.shared.clone();
+        let hour = 3_600_000_000_000_i64;
+        let old = "a\\ b,host=a usage=1 1000\na\\ b,host=a usage=2 7200000000000\ncpu,host=a usage=3 1000\n";
+        let ts = |m: &str| -> Vec<i64> {
+            let rows = shared.db.query(&Query::new(m, "usage")).unwrap();
+            rows.into_iter().map(|r| r.ts).collect()
+        };
+        let orders = [
+            entry(1, old),
+            // One measurement, named in percent-encoding (it has a space)...
+            entry(2, &format!("{RETAIN}{hour} a%20b\n")),
+            // ...and all of them.
+            entry(3, &format!("{RETAIN}{hour} *\n")),
+        ];
+        for e in &orders[..2] {
+            app.apply(e).unwrap();
+        }
+        assert_eq!((ts("a b"), ts("cpu")), (vec![7_200_000_000_000], vec![1000]));
+        app.apply(&orders[2]).unwrap();
+        assert_eq!((ts("a b"), ts("cpu")), (vec![7_200_000_000_000], vec![]));
+        // A replay from an older note writes the old points again, and the
+        // orders after them drop them again: the same data in the end.
+        shared.progress.lock().0 = 0;
+        for e in &orders {
+            app.apply(e).unwrap();
+        }
+        assert_eq!((ts("a b"), ts("cpu")), (vec![7_200_000_000_000], vec![]));
+        assert_eq!(shared.counters.applied_entries.load(Ordering::Relaxed), 6);
+        // A damaged order is refused, by every node alike.
+        for (i, bad) in ["garbage", "x *", "5 %zz"].into_iter().enumerate() {
+            let index = 10 + i as u64;
+            app.apply(&entry(index, &format!("{RETAIN}{bad}\n"))).unwrap();
+            assert!(
+                shared.refused.lock()[&index].contains("malformed retention order"),
+                "{bad}"
+            );
+        }
+        assert_eq!(shared.counters.refused_entries.load(Ordering::Relaxed), 3);
         let _ = fs::remove_dir_all(dir);
     }
 

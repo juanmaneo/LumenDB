@@ -12,6 +12,7 @@
 //! | `STATUS` | `OK id=1 role=leader term=3 leader=1 voters=1,2,3 learners= commit=9 applied=9 snapshot=0 raft=ADDR` |
 //! | `WRITE <bytes>`, a newline, then that many bytes of line protocol | `OK <points>` |
 //! | `QUERY <consistent\|local> <measurement> <field> [start=NS] [end=NS] [agg=A] [every=NS] [align=calendar\|start] [fill=prev\|linear\|NUMBER] [latest=1] [top=N] [where=<tag>=<value>]...` | `ROWS <n>`, then n lines `series TAB ts TAB value` |
+//! | `RETAIN <measurement\|*> <keep-ns>` | `OK <cutoff-ns>`, or `OK nothing`: on every node, the partitions that end before the cutoff (the earlier of the leader's clock and its newest point, minus `keep`) are dropped |
 //! | `PEER <id> <addr>` | `OK ok`: where to send messages to node `id` (saved: it is still known after a restart) |
 //! | `ADD-LEARNER <id>`, `REMOVE-LEARNER <id>` | `OK added`, `OK removed` |
 //! | `ADD-VOTER <id>`, `REMOVE-VOTER <id>` | `OK <index of the configuration entry>` |
@@ -141,6 +142,12 @@ pub enum Request {
     Member(Change, NodeId),
     /// Hand leadership to this voter.
     Transfer(NodeId),
+    /// Keep the last `keep` ns of the data of a measurement (of everything
+    /// if `None`), on every node.
+    Retain {
+        measurement: Option<String>,
+        keep: i64,
+    },
     Shutdown,
 }
 
@@ -321,6 +328,10 @@ impl Request {
             Request::Peer(id, addr) => format!("PEER {id} {addr}"),
             Request::Member(change, id) => format!("{} {id}", change.verb()),
             Request::Transfer(id) => format!("TRANSFER {id}"),
+            Request::Retain { measurement, keep } => {
+                let name = measurement.as_deref().map_or("*".to_string(), encode_token);
+                format!("RETAIN {name} {keep}")
+            }
             Request::Query { consistent, query, top } => query_line(*consistent, query, *top),
         };
         out.push('\n');
@@ -396,6 +407,13 @@ fn parse_request(line: &str) -> Parse<Request> {
         ["PEER", id, addr] => Request::Peer(uint(id)?, addr.parse().map_err(|_| format!("bad address {addr:?}"))?),
         ["QUERY", mode, measurement, field, ref options @ ..] => parse_query(mode, measurement, field, options)?,
         ["TRANSFER", id] => Request::Transfer(uint(id)?),
+        ["RETAIN", name, keep] => Request::Retain {
+            measurement: match name {
+                "*" => None,
+                token => Some(decode_token(token)?),
+            },
+            keep: int(keep)?,
+        },
         [verb, id] => Request::Member(Change::parse(verb)?, uint(id)?),
         _ => return Err(MALFORMED.to_string()),
     })
@@ -579,6 +597,9 @@ pub fn execute(db: &ReplicatedDb, req: &Request, timeout: Duration) -> Reply {
         Request::Peer(id, addr) => db.set_peer(*id, *addr).map(|()| Reply::Ok("ok".to_string())),
         Request::Member(change, id) => change_membership(db, *change, *id).map(Reply::Ok),
         Request::Transfer(id) => transfer(db, *id, timeout).map(Reply::Ok),
+        Request::Retain { measurement, keep } => db
+            .retain(measurement.as_deref(), *keep, timeout)
+            .map(|cutoff| Reply::Ok(cutoff.map_or("nothing".to_string(), |ns| ns.to_string()))),
     };
     done.unwrap_or_else(|e| error_reply(&e))
 }
@@ -1050,6 +1071,14 @@ mod tests {
         ];
         all.extend(Change::ALL.map(|change| Request::Member(change, 4)));
         all.push(Request::Transfer(4));
+        all.push(Request::Retain {
+            measurement: None,
+            keep: 3_600_000_000_000,
+        });
+        all.push(Request::Retain {
+            measurement: Some("my meas*".to_string()),
+            keep: 1,
+        });
         all
     }
 
@@ -1110,6 +1139,9 @@ mod tests {
             ("ADD-VOTER x\n", "not a number"),
             ("TRANSFER x\n", "not a number"),
             ("TRANSFER\n", MALFORMED),
+            ("RETAIN *\n", MALFORMED),
+            ("RETAIN * x\n", "not a number"),
+            ("RETAIN %zz 5\n", "bad %-escape"),
             ("QUERY now m f\n", "the query mode is consistent or local"),
             ("QUERY local %zz f\n", "bad %-escape"),
             ("QUERY local m %zz\n", "bad %-escape"),
@@ -1327,6 +1359,24 @@ mod tests {
         let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert_eq!(run(Request::Peer(9, elsewhere)), Reply::Ok("ok".to_string()));
         assert_eq!(n.db.server().transport().peers().get(&9), Some(&elsewhere));
+
+        // Retention: points a day apart, then an hour kept of them.
+        let day = 86_400_000_000_000_i64;
+        let kept = "cpu,host=c usage=1 0\ncpu,host=c usage=2 86400000000000\n";
+        assert_eq!(run(Request::Write(kept.to_string())), Reply::Ok("2".to_string()));
+        let retain = |measurement: Option<&str>, keep| {
+            run(Request::Retain {
+                measurement: measurement.map(str::to_string),
+                keep,
+            })
+        };
+        assert_eq!(retain(Some("nothing"), 1), Reply::Ok("nothing".to_string()));
+        let cutoff = (day - 3_600_000_000_000).to_string();
+        assert_eq!(retain(Some("cpu"), 3_600_000_000_000), Reply::Ok(cutoff));
+        let left = query(false, Query::new("cpu", "usage"), None);
+        assert_eq!(left, Reply::Rows(vec![row("cpu,host=c", day, "2")]));
+        let bad = retain(None, 0);
+        assert!(bad.to_string().starts_with("bad database: invalid query"), "{bad}");
 
         // Nobody to hand leadership to in a cluster of one.
         assert_eq!(

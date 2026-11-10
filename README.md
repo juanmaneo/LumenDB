@@ -12,7 +12,7 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 | [`flashkv`](crates/flashkv) | crash-safe ordered key-value store (LSM) | LevelDB, LMDB, FoundationDB, eguan/ibs |
 | [`raft`](crates/raft) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron |
 | [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
-| [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli |
+| [`tsvdb`](crates/tsvdb) | columnar TSDB on flashkv | InfluxDB v3 (IOx), Gorilla, Akumuli, QuestDB |
 | [`cluster`](crates/cluster) | tsvdb replicated by raft: writes through the leader, every node holds a copy | TigerBeetle, CockroachDB |
 | [`bench`](crates/bench) | command line: generate, ingest, query, benchmark, run a cluster node (`serve`) and talk to a cluster (`client`) | — |
 | [`xtask`](xtask) | `cargo xtask dev-check` / `kani` / `bench` | cargo-xtask |
@@ -331,6 +331,19 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
   from a snapshot and publishes the result with one atomic batch, so reads
   are never blocked. `rollup` writes windowed aggregates as a new measurement
   (downsampling).
+- **Retention (TTL).** `retain --keep 7d` keeps the last seven days of data
+  and drops the rest, a whole partition at a time (QuestDB's TTL). A
+  partition is a range of keys, so dropping it is a run of deletes that reads
+  no point. The cutoff is `keep` before the *earlier* of the wall clock and
+  the newest point, as in QuestDB: a point dated in the future does not move
+  it, and a database that nobody writes to any more keeps its last week of
+  data instead of being emptied by the passing of time. Only partitions that
+  end before the cutoff go, so the partition that holds it stays whole. The
+  write buffer is flushed first, so that nothing that was dropped comes back
+  from the write-ahead log after a restart. A series whose data is all gone
+  stays listed. In a cluster, the leader works out the cutoff and puts it in
+  the Raft log as an order, so every node drops the same partitions whatever
+  its own clock says (see below).
 - **Queries.** Range scans with tag filters, `sum`/`count`/`min`/`max`/`mean`
   and `first`/`last` per series and optional time window, and top-N (for
   example the heaviest flows of a capture).
@@ -362,7 +375,32 @@ the parse itself scales with threads. Medians are noisier, about 200 ms and
     key scan, not a decode of every point. It takes no aggregate and no
     window.
   - Times and durations are written the way a person does:
-    `--start 2024-05-01 --end now --every 15m --fill prev`.
+    `--start 2024-05-01 --end now --every 15m --fill prev`. Units are
+    `ns us ms s m h d w`; a month or a year is not one, because it is not
+    a fixed number of nanoseconds.
+
+#### Ideas taken from QuestDB
+
+[QuestDB](https://github.com/questdb/questdb) is a Java time-series database
+with a native column store. These are the ideas of it that fit LumenDB, and
+what was left out.
+
+| QuestDB | LumenDB |
+|---|---|
+| `SAMPLE BY` with calendar-aligned buckets, `ALIGN TO FIRST OBSERVATION` | `--every` windows start at multiples of the duration since 1970; `--align start` anchors them at `--start` instead |
+| `FILL(PREV \| LINEAR \| const)` | `--fill prev\|linear\|NUMBER` |
+| `first`, `last`, `nsum` | `first`, `last`; `sum` and `mean` are compensated |
+| `LATEST ON ts PARTITION BY` | `--latest 1` |
+| TTL, with the earlier of the clock and the newest row as reference | `retain --keep`, replicated by the cluster |
+| `1h`, `7d`, ISO dates, `now()` | durations, RFC 3339 dates and `now-1h` on the command line |
+
+Not taken: `ASOF JOIN` (a query reads one field of one measurement),
+materialized views (`rollup` downsamples, but by hand), a dictionary-encoded
+`SYMBOL` column (tags are an inverted index of strings, and a string field is
+a plain column), `FILL(NULL)` (there is no null), `DEDUP` (the last write to
+a series, field and timestamp already wins), Parquet, and the network
+interfaces (ILP over TCP, REST, the PostgreSQL wire protocol): each needs a
+library or a wire format this project would have to write and keep.
 
 ### cluster: a tsvdb replicated by Raft
 
@@ -392,6 +430,15 @@ linearizable read on the leader (`query` reads the local copy, which may lag).
   entry is applied, on every node alike; the writer gets `Error::Rejected`.
   Anything else, such as a failing disk, stops the node: it can no longer
   follow the log.
+- **Retention is an order in the log.** `ReplicatedDb::retain` reads the
+  leader's clock and data (after a read barrier), works out the cutoff, and
+  proposes `#retain <cutoff> <measurement>`; every node then drops the
+  partitions that end before that very time, whatever its own clock says. A
+  replayed order drops the same partitions again, and a snapshot is a dump of
+  what was left. The leader writes no comments in line protocol, so no write
+  from a client can look like an order. A node of an older version would
+  read the order as a comment and keep its data: use `retain` once every node
+  runs this version.
 - **Snapshots are dumps.** `Node::compact` stores a compressed dump of the
   database (`tsvdb::Db::dump`), and a node that is new or far behind is
   restored from it. A snapshot lives in memory, on the node that sends it and
@@ -416,8 +463,9 @@ linearizable read on the leader (`query` reads the local copy, which may lag).
         |                                   |<---- Raft port <-----> Raft port ->|
   ```
 
-  The protocol is one request per line over TCP (`WRITE`, `QUERY`, `STATUS`,
-  `PEER`, the four membership changes, `TRANSFER`, `SHUTDOWN`; replies `OK`, `ROWS` or
+  The protocol is one request per line over TCP (`WRITE`, `QUERY`, `RETAIN`,
+  `STATUS`, `PEER`, the four membership changes, `TRANSFER`, `SHUTDOWN`;
+  replies `OK`, `ROWS` or
   `ERR <code>`), documented in `cluster::client`. A node that is not the
   leader answers `ERR notleader <id>`; `ClusterClient` tries the nodes it
   knows until one is. It retries only what cannot have been applied: a node
@@ -441,7 +489,11 @@ $B ingest /tmp/cap.pcapng --db /tmp/lumendb
 $B query --db /tmp/lumendb --agg sum --top 10                       # heaviest flows (bytes)
 $B query --db /tmp/lumendb --measurement traffic --field packets \
          --agg sum --every 1m                                     # packets per minute
+$B query --db /tmp/lumendb --measurement traffic --field packets \
+         --agg sum --every 1m --fill 0 --start 2024-05-01 --end now   # a row for every minute
 $B query --db /tmp/lumendb --where proto=udp --where dport=53 --agg count
+$B query --db /tmp/lumendb --measurement cpu --field usage --latest 1 # newest point of each series
+$B retain --db /tmp/lumendb --keep 7d                             # drop what is older than a week
 echo 'cpu,host=a usage=0.5 1700000000000000000' > /tmp/m.lp
 $B write /tmp/m.lp --db /tmp/lumendb
 $B kv-bench --db /tmp/kv --ops 1000000 --sync 0                   # flashkv throughput
@@ -465,6 +517,7 @@ c() { $B client --nodes "$NODES" "$@"; }
 c write /tmp/m.lp                                      # through the leader, wherever it is
 c query --measurement cpu --field usage --agg mean     # linearizable, on the leader
 c query --measurement cpu --field usage --local 1      # the first node's own copy
+c retain --keep 7d                                     # every node drops what is older than a week
 c status                                               # role, term, leader, voters, log positions
 c ping                                                 # every node answers PONG (fails if one does not)
 kill -9 %1                                             # lose node 1 (if it led, the others elect a new leader)

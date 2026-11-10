@@ -531,6 +531,17 @@ impl Db {
         self.write_all(&capture_points(stats))
     }
 
+    /// The ids of the columns of the series of `measurement`, or of every
+    /// series without one.
+    pub(crate) fn columns(&self, measurement: Option<&str>) -> Vec<u64> {
+        let st = self.state.lock();
+        let series = match measurement {
+            Some(m) => st.index.lookup(m, &[]),
+            None => st.cols.keys().copied().collect(),
+        };
+        series.iter().flat_map(|sid| st.cols[sid].values().copied()).collect()
+    }
+
     pub fn measurements(&self) -> Vec<String> {
         self.state.lock().index.measurements()
     }

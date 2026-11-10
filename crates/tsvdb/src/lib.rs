@@ -10,8 +10,11 @@
 //!   ([`partition`]).
 //! - [`compact`] merges partitions in the background from a snapshot with one
 //!   atomic batch, so reads are never blocked, and rolls data up (downsampling).
-//! - [`query`] evaluates range scans and sum/count/min/max/mean aggregates,
-//!   optionally per time window, and top-N (e.g. the heaviest pcap flows).
+//! - [`query`] evaluates range scans and sum/count/min/max/mean/first/last
+//!   aggregates, optionally per calendar-aligned time window with a fill for
+//!   empty ones, the latest point of each series, and top-N (e.g. the
+//!   heaviest pcap flows). [`time`] reads durations and dates.
+//! - [`retain`] drops the partitions older than a time to live.
 
 pub mod chunk;
 pub mod compact;
@@ -20,6 +23,7 @@ pub mod error;
 pub mod lineproto;
 pub mod partition;
 pub mod query;
+pub mod retain;
 pub mod tags;
 pub mod time;
 

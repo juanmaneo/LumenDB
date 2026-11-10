@@ -55,6 +55,14 @@ commands:
       --latest 1 gives only the newest point of each series in the range,
       with its own timestamp (no --agg, no --every); with --top N, the N
       series with the largest latest values
+  retain --db DIR --keep DURATION [--measurement M]
+      keep the last DURATION (1h, 7d, 4w...) of the data of M (default: of
+      every measurement) and drop the rest, a whole partition (an hour) at a
+      time: the partitions that end before the cutoff, which is DURATION
+      before the newest point, or before now if that is earlier (so a
+      database nobody writes to any more keeps its last DURATION of data, and
+      a point dated in the future moves nothing). A cluster is not reached by
+      this: use `client retain`
   kv-bench --db DIR [--ops N] [--value-size N] [--batch N]
       flashkv write / point-read / scan throughput
   parse-bench <capture> [--threads N] [--runs N] [--min-mpps X]
@@ -111,6 +119,9 @@ commands:
         transfer ID            hand leadership to voter ID (to take the
                                leader out of service without an election
                                timeout); it returns once ID leads
+        retain --keep DURATION [--measurement M]
+                               like `retain`, on every node: the leader works
+                               out the cutoff and puts it in the log
         peer ID ADDR           tell every node where node ID's Raft listens
         shutdown               stop every node
       The leader is looked for among the nodes for up to --patience-ms
@@ -120,7 +131,7 @@ commands:
       that fails with a timeout or a lost connection may or may not have been
       applied
 
-storage options (ingest, write, query, kv-bench):
+storage options (ingest, write, query, retain, kv-bench):
   --sync 0|1        fsync every write (default 1)
   --background 0|1  flush/compact on a background thread (default 1)
   --fail-after N    inject an I/O error at the N-th filesystem operation
@@ -381,6 +392,29 @@ fn run_query(a: &Args) -> Res<String> {
         let _ = writeln!(out, "{}\t{}\t{}", r.series, r.ts, r.value);
     }
     let _ = writeln!(out, "{} rows", rows.len());
+    Ok(out)
+}
+
+/// What `retain` and `client retain` keep: a measurement (all if none), and
+/// for how long.
+fn retain_args(a: &Args) -> Res<(Option<String>, i64)> {
+    let keep = a.duration("keep")?.ok_or("missing --keep")?;
+    Ok((a.get("measurement").map(str::to_string), keep))
+}
+
+fn retain(a: &Args) -> Res<String> {
+    a.check(&["keep", "measurement"])?;
+    let (measurement, keep) = retain_args(a)?;
+    let measurement = measurement.as_deref();
+    let db = open_db(db_options(a)?)?;
+    let out = match db.retention_cutoff(measurement, keep, now_ns())? {
+        None => "no data: nothing to drop\n".to_string(),
+        Some(cutoff) => {
+            let chunks = db.drop_before(measurement, cutoff)?;
+            format!("dropped {chunks} chunks that end before {cutoff} ns since 1970\n")
+        }
+    };
+    db.close()?;
     Ok(out)
 }
 
@@ -805,7 +839,7 @@ fn each_report(c: &ClusterClient, req: &Request, strict: bool) -> Res<String> {
 }
 
 fn client(a: &Args) -> Res<String> {
-    let own = ["nodes", "timeout-ms", "patience-ms", "secret-file", "local"];
+    let own = ["nodes", "timeout-ms", "patience-ms", "secret-file", "local", "keep"];
     a.check(&[&own[..], &QUERY_FLAGS[..]].concat())?;
     let nodes = (a.req("nodes")?.split(','))
         .map(|n| socket_addr("--nodes", n))
@@ -830,6 +864,10 @@ fn client(a: &Args) -> Res<String> {
             let text = std::fs::read_to_string(a.pos(2, "line protocol file")?)?;
             (Request::Write(text), None)
         }
+        "retain" => {
+            let (measurement, keep) = retain_args(a)?;
+            (Request::Retain { measurement, keep }, None)
+        }
         "query" => {
             let (query, top) = query_args(a)?;
             let consistent = a.num::<u64>("local", 0)? == 0;
@@ -847,6 +885,10 @@ fn client(a: &Args) -> Res<String> {
     let out = render(c.call(&req)?)?;
     Ok(match command {
         "write" => format!("wrote {} points\n", out.trim_end()),
+        "retain" => match out.trim_end().parse::<i64>() {
+            Ok(cutoff) => format!("dropped what ends before {cutoff} ns since 1970, on every node\n"),
+            Err(_) => "no data: nothing to drop\n".to_string(),
+        },
         _ => out,
     })
 }
@@ -861,6 +903,7 @@ pub fn run(args: &[String]) -> Res<String> {
         Some("ingest") => ingest(&a),
         Some("write") => write_lp(&a),
         Some("query") => run_query(&a),
+        Some("retain") => retain(&a),
         Some("kv-bench") => kv_bench(&a),
         Some("parse-bench") => parse_bench(&a),
         Some("vopr") => vopr(&a),
@@ -1228,6 +1271,20 @@ mod tests {
             .to_string()
             .starts_with("bad database: invalid query"));
 
+        // Retention: an hour of data kept, on every node.
+        assert_eq!(
+            c("retain --keep 1h").unwrap(),
+            "dropped what ends before -3599999999980 ns since 1970, on every node\n"
+        );
+        assert_eq!(
+            c("retain --keep 1h --measurement nothing").unwrap(),
+            "no data: nothing to drop\n"
+        );
+        assert!(c("retain --keep 0")
+            .unwrap_err()
+            .to_string()
+            .starts_with("bad database: invalid query"));
+
         // Membership: the leader does it or says why not.
         assert_eq!(c("add-learner 2").unwrap(), "added\n");
         assert_eq!(c("remove-learner 2").unwrap(), "removed\n");
@@ -1260,6 +1317,8 @@ mod tests {
             ("peer 1", "missing address"),
             ("peer 1 nope", "peer: bad address \"nope\""),
             ("write", "missing line protocol file"),
+            ("retain", "missing --keep"),
+            ("retain --keep soon", "--keep: invalid duration \"soon\""),
             ("add-voter", "missing node id"),
             ("transfer", "missing node id"),
             ("transfer x", "transfer: invalid node id \"x\""),
@@ -1472,6 +1531,49 @@ mod tests {
     }
 
     #[test]
+    fn retention_from_the_command_line() {
+        let d = tmp("retain");
+        let (db, lp) = (d.join("db"), d.join("in.lp"));
+        let (db, lp) = (db.display(), lp.display());
+        // 25 hours apart, and long ago: the cutoff goes by the newest point.
+        std::fs::write(
+            d.join("in.lp"),
+            "cpu,host=a usage=1 1000000000000\ncpu,host=a usage=2 90000000000000\nmem,host=a free=3u 1000000000000\n",
+        )
+        .unwrap();
+        assert_eq!(cmd(&format!("write {lp} --db {db}")).unwrap(), "wrote 3 points\n");
+        let rows = |m: &str, f: &str| cmd(&format!("query --db {db} --measurement {m} --field {f}")).unwrap();
+        assert_eq!(
+            cmd(&format!("retain --db {db} --keep 1h --measurement nothing")).unwrap(),
+            "no data: nothing to drop\n"
+        );
+        let out = cmd(&format!("retain --db {db} --keep 1h --measurement cpu")).unwrap();
+        assert_eq!(out, "dropped 1 chunks that end before 86400000000000 ns since 1970\n");
+        assert_eq!(rows("cpu", "usage"), "cpu,host=a\t90000000000000\t2\n1 rows\n");
+        assert_eq!(rows("mem", "free"), "mem,host=a\t1000000000000\t3u\n1 rows\n");
+        // Without a measurement, all of them; and again: nothing is left to drop.
+        let out = cmd(&format!("retain --db {db} --keep 1h")).unwrap();
+        assert_eq!(out, "dropped 1 chunks that end before 86400000000000 ns since 1970\n");
+        assert_eq!(rows("mem", "free"), "0 rows\n");
+        let out = cmd(&format!("retain --db {db} --keep 1h")).unwrap();
+        assert_eq!(out, "dropped 0 chunks that end before 86400000000000 ns since 1970\n");
+        assert_eq!(rows("cpu", "usage"), "cpu,host=a\t90000000000000\t2\n1 rows\n");
+        for (args, want) in [
+            ("retain --db x", "missing --keep"),
+            ("retain --keep 1h", "missing --db"),
+            ("retain --db x --keep soon", "--keep: invalid duration \"soon\""),
+            (
+                "retain --db x --keep 0",
+                "invalid query: the time to keep data must be positive",
+            ),
+            ("retain --db x --keep 1h --every 1m", "unknown flag --every"),
+        ] {
+            assert_eq!(err(args), want, "{args}");
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn fault_injection_sweeps() {
         let d = tmp("sweep-input");
         let cap = d.join("c.pcap");
@@ -1485,6 +1587,13 @@ mod tests {
             format!("write {} --db {}", lp.display(), db.display())
         });
         sweep("sweep-query", |db| format!("query --db {}", db.display()));
+        // Old and new points, so that there is something to drop.
+        let old_and_new = d.join("old.lp");
+        std::fs::write(&old_and_new, "m v=1 1000000000000\nm v=2 90000000000000\n").unwrap();
+        sweep("sweep-retain", |db| {
+            cmd(&format!("write {} --db {}", old_and_new.display(), db.display())).unwrap();
+            format!("retain --db {} --keep 1h", db.display())
+        });
         sweep("sweep-kv", |db| {
             format!("kv-bench --db {} --ops 40 --batch 8", db.display())
         });
