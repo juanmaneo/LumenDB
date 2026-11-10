@@ -701,6 +701,13 @@ following, within the bounds stated in each harness:
 - CRC32C matches its published check values, and CRC masking is a
   bijection;
 
+  The check values are proved for flashkv's pure Rust table version of
+  CRC32C. Kani can model neither the CPUID feature detection (inline
+  assembly) nor the SSE4.2 instruction, so under `cfg(kani)` flashkv uses
+  the tables only. The unit test `the_ways_agree` checks that the SSE4.2
+  version gives the same result as the tables over many lengths,
+  alignments and starting values.
+
   A masked CRC is the raw CRC passed through a fixed post-processing step.
   flashkv uses the LevelDB form,
   `mask(c) = c.rotate_right(15).wrapping_add(0xa282_e8a8)`. Other common

@@ -4,8 +4,7 @@
 //! it does 8 bytes per instruction, a few GB/s a core; anywhere else it is
 //! slicing-by-8 over tables computed at compile time (`const fn`), which does
 //! several hundred MB/s. Both are checked against a bit by bit version.
-
-use std::sync::OnceLock;
+//! Under kani it is always the tables, which kani can model.
 
 const POLY: u32 = 0x82f6_3b78;
 
@@ -52,12 +51,22 @@ pub fn crc32c(data: &[u8]) -> u32 {
 
 /// Continue a finalized CRC32C `init` over more `data`
 /// (`crc32c_extend(crc32c(a), b) == crc32c(a ++ b)`).
+#[cfg(not(kani))]
 pub fn crc32c_extend(init: u32, data: &[u8]) -> u32 {
-    static BEST: OnceLock<fn(u32, &[u8]) -> u32> = OnceLock::new();
+    static BEST: std::sync::OnceLock<fn(u32, &[u8]) -> u32> = std::sync::OnceLock::new();
     BEST.get_or_init(best)(init, data)
 }
 
+/// [`crc32c_extend`] for kani proofs: the tables only, because kani can model
+/// neither the feature detection (CPUID is inline assembly) nor the SSE4.2
+/// instruction. `the_ways_agree` tests that both ways are the same function.
+#[cfg(kani)]
+pub fn crc32c_extend(init: u32, data: &[u8]) -> u32 {
+    software(init, data)
+}
+
 /// The fastest way there is here.
+#[cfg(not(kani))]
 fn best() -> fn(u32, &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
     return std::arch::is_x86_feature_detected!("sse4.2")
@@ -69,7 +78,7 @@ fn best() -> fn(u32, &[u8]) -> u32 {
 
 /// [`crc32c_extend`] by the instruction of the processor, which must be there
 /// (it is for what [`best`] says).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(kani)))]
 fn hardware(init: u32, data: &[u8]) -> u32 {
     #[target_feature(enable = "sse4.2")]
     fn run(init: u32, data: &[u8]) -> u32 {
@@ -179,7 +188,7 @@ mod tests {
                 for init in [0, 1, 0xdead_beef, u32::MAX] {
                     let want = software(init, part);
                     assert_eq!(crc32c_extend(init, part), want, "{offset} {len} {init}");
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(all(target_arch = "x86_64", not(kani)))]
                     assert_eq!(hardware(init, part), want, "{offset} {len} {init}");
                 }
                 assert_eq!(software(0, part), bitwise(part));

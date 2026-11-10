@@ -7,7 +7,9 @@
 //!
 //! 1. flashkv varint encoding round-trips every `u64`;
 //! 2. flashkv CRC32C matches the published check values, and CRC masking is
-//!    a bijection;
+//!    a bijection (the check values for the table version, which flashkv
+//!    uses under `cfg(kani)`: kani cannot model CPUID or SSE4.2, and
+//!    flashkv's `the_ways_agree` test checks that both are the same function);
 //! 3. raft `Log::append` keeps the log invariants (contiguous indices,
 //!    non-decreasing terms, sentinel), keeps the matching prefix, contains the
 //!    batch afterwards, and is atomic on error;
