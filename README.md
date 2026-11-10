@@ -9,6 +9,7 @@ time-series database. LumenDB is written entirely in Rust and depends only on
 
 | crate | what it is | inspired by |
 |---|---|---|
+| [`cpu`](crates/cpu) | the portability layer: one trait per kind of special instruction, implemented for x86_64 and aarch64, with a portable fallback | corsix/fast-crc32 |
 | [`flashkv`](crates/flashkv) | crash-safe ordered key-value store (LSM) | LevelDB, LMDB, FoundationDB, eguan/ibs |
 | [`raft`](crates/raft) | Raft consensus, SWIM membership, Lamport clocks, shared-secret authentication | Raft paper, CockroachDB, Serf/dkron |
 | [`pcapfast`](crates/pcapfast) | zero-copy multithreaded pcap / pcapng parser | — |
@@ -60,6 +61,67 @@ time-series database. LumenDB is written entirely in Rust and depends only on
  | raft: Raft + SWIM + Lamport                         |
  +-----------------------------------------------------+
 ```
+
+### cpu: the portability layer
+
+Everything that needs a particular processor instruction to be fast lives in
+the `cpu` crate, and no other crate touches `std::arch`:
+
+1. A **trait** says what an instruction computes, independent of the
+   architecture: `Crc32cInstr` is one step of the CRC32C register, `Clmul` is
+   carry-less multiplication on 128-bit vectors.
+2. Each **architecture implements** the traits on token types that only its
+   feature detection creates: `x86_64` with SSE4.2 `crc32` and `pclmulqdq`
+   (every Intel processor since Westmere, every AMD one since Bulldozer),
+   `aarch64` with `crc32cx` and NEON `pmull` (Ampere Altra and AmpereOne,
+   Graviton, Apple M).
+3. The **algorithms** are written once, generic over the traits, and each
+   architecture runs them inside a `#[target_feature]` function, where every
+   trait method inlines to the bare instruction (checked in the generated
+   assembly: no calls in the hot loops).
+4. A **portable** version in plain Rust (slicing-by-8 tables) runs on any
+   other processor and under kani.
+
+The fastest implementation the processor reports is picked at the first
+call. CRC32C uses Peter Cawley's "fusion" algorithm
+([corsix/fast-crc32](https://github.com/corsix/fast-crc32)). It cuts each
+block into several scalar streams, each run through the CRC instruction by
+its own dependency chain, plus a region that vector accumulators fold with
+carry-less multiplication at the same time. The partial CRCs are then moved
+to the end of the block with one carry-less multiply each and combined. The
+folding constants are powers of x modulo the polynomial, computed by
+`const fn`.
+
+The block shape (accumulators, streams, words per stream) is a const generic
+parameter of each architecture:
+
+- **x86_64:** 2 accumulators and 3 streams of 4 words. It was the fastest of
+  9 shapes on a Ryzen 7 5800U (Zen 3), measured with hyperfine over buffers
+  of 256 bytes to 1 MiB. `bench crc-bench` on that machine, a laptop
+  running well below its boost clock:
+
+  | buffer | fused | one stream (the previous code) | tables |
+  |---|---|---|---|
+  | 64 B | 4.4 GB/s | 4.5 GB/s | 0.96 GB/s |
+  | 512 B | 11.2 GB/s | 4.9 GB/s | 0.98 GB/s |
+  | 4 KiB | 16.0 GB/s | 4.9 GB/s | 0.97 GB/s |
+  | 64 KiB | 16.5 GB/s | 4.9 GB/s | 0.98 GB/s |
+  | 1 MiB | 13.7 GB/s | 4.6 GB/s | 0.96 GB/s |
+
+  A 64-byte buffer is smaller than one block (128 bytes), so it takes the
+  single-stream path.
+- **aarch64:** 3 accumulators and 4 streams of 2 words. Cawley measured
+  this shape fastest on Ampere Altra (Neoverse N1), at about 36 GB/s a core
+  against about 23 GB/s for scalar streams alone. **LumenDB's aarch64 speed
+  has not been measured on Ampere hardware.** Correctness is tested under
+  QEMU emulating a Neoverse N1 and N2 (`cargo test-aarch64`, see
+  `.cargo/config.toml`), and the CI's ARM job prints the speed it gets on
+  GitHub's ARM runner.
+
+Every hardware version, and every shape in the tests (including one
+accumulator and one stream), is checked against a bit-by-bit CRC32C at
+every length up to 2100 bytes and several larger ones, at three alignments
+and from two starting values.
 
 ### flashkv: the storage engine
 
@@ -581,6 +643,7 @@ $B retain --db /tmp/lumendb --keep 7d                             # drop what is
 echo 'cpu,host=a usage=0.5 1700000000000000000' > /tmp/m.lp
 $B write /tmp/m.lp --db /tmp/lumendb
 $B kv-bench --db /tmp/kv --ops 1000000 --sync 0                   # flashkv throughput
+$B crc-bench --size 4096 --size 1048576                           # every CRC32C implementation, GB/s
 $B gen-cpu /tmp/cpu.lp                                            # TSBS-like cpu data, as line protocol
 $B tsdb-bench --db /tmp/tsdb --sync 0 --runs 10 --writers 4       # ingest it, then time queries
 $B parse-bench /tmp/cap.pcapng --runs 5 --min-mpps 5              # pcapfast throughput
@@ -701,12 +764,14 @@ following, within the bounds stated in each harness:
 - CRC32C matches its published check values, and CRC masking is a
   bijection;
 
-  The check values are proved for flashkv's pure Rust table version of
-  CRC32C. Kani can model neither the CPUID feature detection (inline
-  assembly) nor the SSE4.2 instruction, so under `cfg(kani)` flashkv uses
-  the tables only. The unit test `the_ways_agree` checks that the SSE4.2
-  version gives the same result as the tables over many lengths,
-  alignments and starting values.
+  The check values are proved for the pure Rust table version of CRC32C
+  in the [`cpu`](crates/cpu) crate. Kani can model neither the CPUID
+  feature detection (inline assembly) nor the CRC and carry-less multiply
+  instructions, so under `cfg(kani)` the `cpu` crate uses the tables only.
+  The unit tests `every_engine_is_crc32c` and `every_shape_is_crc32c`
+  check every hardware version against a bit-by-bit CRC32C over every
+  length up to 2000 bytes and a few larger ones, three alignments and two
+  starting values.
 
   A masked CRC is the raw CRC passed through a fixed post-processing step.
   flashkv uses the LevelDB form,
@@ -760,6 +825,10 @@ even for a one-entry log and a one-entry batch.
    `cargo kani setup` does one download with no retry, so a single GitHub 5xx
    would fail the job.
 3. `cargo build --release --workspace`.
+4. On `ubuntu-24.04-arm` (aarch64): clippy `-D warnings`, `cargo test
+   --workspace` (which runs the CRC32C `crc32cx` and `pmull` code on real
+   hardware), and `bench crc-bench`, which prints the speed of each CRC32C
+   implementation on that runner.
 
 ## Authorship
 

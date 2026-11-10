@@ -67,6 +67,11 @@ commands:
       this: use `client retain`
   kv-bench --db DIR [--ops N] [--value-size N] [--batch N]
       flashkv write / point-read / scan throughput
+  crc-bench [--size N]... [--mb N]
+      CRC32C throughput of every implementation this processor can run, the
+      one LumenDB uses first: on buffers of each --size bytes (default 64,
+      4096 and 1048576), over about --mb MB in all (default 256), one buffer
+      after the other. Every result is checked against the portable one
   gen-cpu <out> [--hosts N] [--hours N] [--interval DURATION] [--seed N]
       write the line protocol of a workload like TSBS's cpu-only: every host
       (default 100) reports ten CPU gauges every --interval (default 10s) for
@@ -490,6 +495,50 @@ fn kv_bench(a: &Args) -> Res<String> {
         s * 1e3,
         scanned as f64 / s,
     ))
+}
+
+fn crc_bench(a: &Args) -> Res<String> {
+    crc_bench_on(a, &cpu::crc32c::engines())
+}
+
+/// `crc-bench` on `engines`, whose last one is the reference.
+fn crc_bench_on(a: &Args, engines: &[cpu::crc32c::Engine]) -> Res<String> {
+    a.check(&["size", "mb"])?;
+    let mut sizes = a
+        .all("size")
+        .map(|s| s.parse::<usize>().map_err(|_| format!("--size: invalid number {s:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    sizes.is_empty().then(|| sizes.extend([64, 4096, 1 << 20]));
+    let total = a.num::<usize>("mb", 256)? << 20;
+    let portable = engines[engines.len() - 1].extend;
+    let largest = sizes.iter().copied().max().unwrap_or(0);
+    let data: Vec<u8> = (0..largest as u64)
+        .map(|i| (i.wrapping_mul(0x9e37_79b9) >> 13) as u8)
+        .collect();
+    let mut out = String::new();
+    for size in sizes {
+        let buf = &data[..size];
+        let want = portable(0, buf);
+        let reps = (total / size.max(1)).max(1);
+        let _ = writeln!(out, "{size} bytes, {reps} times:");
+        for e in engines {
+            let got = (e.extend)(0, buf);
+            let name = e.name;
+            (got == want).then_some(()).ok_or(format!(
+                "{name}: CRC32C of {size} bytes is {got:#010x}, the portable one {want:#010x}"
+            ))?;
+            let t = Instant::now();
+            // Each CRC goes on from the one before, so none can be skipped.
+            let mut crc = 0;
+            for _ in 0..reps {
+                crc = (e.extend)(crc, std::hint::black_box(buf));
+            }
+            std::hint::black_box(crc);
+            let gbps = (reps * size) as f64 / secs(t.elapsed()) / 1e9;
+            let _ = writeln!(out, "  {gbps:7.2} GB/s  {name}");
+        }
+    }
+    Ok(out)
 }
 
 fn parse_bench(a: &Args) -> Res<String> {
@@ -938,6 +987,7 @@ pub fn run(args: &[String]) -> Res<String> {
         Some("gen-cpu") => tsbs::gen_cpu(&a),
         Some("tsdb-bench") => tsbs::tsdb_bench(&a),
         Some("parse-bench") => parse_bench(&a),
+        Some("crc-bench") => crc_bench(&a),
         Some("vopr") => vopr(&a),
         Some("cluster-demo") => cluster_demo(&a),
         Some("serve") => serve(&a),
@@ -1020,6 +1070,9 @@ mod tests {
             ("kv-bench --batch z", "--batch: invalid number \"z\""),
             ("kv-bench", "missing --db"),
             ("kv-bench --db x --sync z", "--sync: invalid number \"z\""),
+            ("crc-bench --x 1", "unknown flag --x"),
+            ("crc-bench --size z", "--size: invalid number \"z\""),
+            ("crc-bench --mb z", "--mb: invalid number \"z\""),
             ("parse-bench", "missing capture file"),
             ("parse-bench c --x 1", "unknown flag --x"),
             ("parse-bench c --threads z", "--threads: invalid number \"z\""),
@@ -1139,6 +1192,27 @@ mod tests {
         assert!(out.contains("read:  500/500 found"), "{out}");
         assert!(out.contains("scan:  500 entries"), "{out}");
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn crc_bench_times_every_engine() {
+        let out = cmd("crc-bench --size 0 --size 1000 --mb 1").unwrap();
+        assert!(out.starts_with("0 bytes, 1048576 times:"), "{out}");
+        assert!(out.contains("1000 bytes, 1048 times:"), "{out}");
+        assert_eq!(out.matches("portable").count(), 2, "{out}");
+        let out = cmd("crc-bench --mb 0").unwrap();
+        for size in ["64 bytes", "4096 bytes", "1048576 bytes"] {
+            assert!(out.contains(&format!("{size}, 1 times:")), "{out}");
+        }
+        // An engine that disagrees with the reference fails the command.
+        let wrong = cpu::crc32c::Engine {
+            name: "wrong",
+            extend: |crc, data| !cpu::crc32c::extend(crc, data),
+        };
+        let engines = [wrong, cpu::crc32c::engines().pop().unwrap()];
+        let a = Args::parse(&["crc-bench".into(), "--size".into(), "9".into()]).unwrap();
+        let e = crc_bench_on(&a, &engines).unwrap_err().to_string();
+        assert_eq!(e, "wrong: CRC32C of 9 bytes is 0x3958f586, the portable one 0xc6a70a79");
     }
 
     #[test]
