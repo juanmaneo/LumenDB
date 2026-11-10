@@ -13,7 +13,8 @@
 //! [`Compactor`] runs `compact` periodically on a background thread.
 
 use crate::chunk::Chunk;
-use crate::db::{Db, PARTITION_PREFIX};
+use crate::chunk::ChunkStats;
+use crate::db::{key_parts, stats_key, Db, PARTITION_PREFIX};
 use crate::error::{Error, Result};
 use crate::lineproto::Point;
 use crate::query::Query;
@@ -24,51 +25,96 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-type Entry = (Vec<u8>, Vec<u8>);
+/// A partition of a column that was merged: the keys of the chunks that went,
+/// and the key and statistics of the one that is left.
+struct Merged {
+    removed: Vec<Vec<u8>>,
+    key: Vec<u8>,
+    stats: ChunkStats,
+}
 
 impl Db {
     /// Merges every partition holding at least `compact_min_chunks` chunks
-    /// (and at least 2). Returns the number of partitions merged.
+    /// (and at least 2). Returns the number of partitions merged. Only the
+    /// small entries with the statistics of all the chunks are read to find
+    /// them, and the chunks of the partitions that are merged.
     pub fn compact(&self) -> Result<usize> {
         let _serial = self.compact_lock.lock();
         self.state.lock().healthy()?;
         let snapshot = self.kv.snapshot();
         let mut batch = WriteBatch::new();
-        let mut merged = 0;
-        let mut group: Vec<Entry> = Vec::new();
-        for item in self.kv.iter_at(&snapshot, b"D", Some(b"E")) {
-            let (k, v) = item?;
+        let mut merges = Vec::new();
+        let mut group: Vec<Vec<u8>> = Vec::new();
+        for item in self.kv.iter_at(&snapshot, b"E", Some(b"F")) {
+            let (k, _) = item?;
             if group
                 .first()
-                .is_some_and(|(g, _)| g[..PARTITION_PREFIX] != k[..PARTITION_PREFIX])
+                .is_some_and(|g| g.get(..PARTITION_PREFIX) != k.get(..PARTITION_PREFIX))
             {
-                merged += self.merge_group(std::mem::take(&mut group), &mut batch)?;
+                merges.extend(self.merge_group(&snapshot, std::mem::take(&mut group), &mut batch)?);
             }
-            group.push((k, v));
+            group.push(k);
         }
-        merged += self.merge_group(group, &mut batch)?;
+        merges.extend(self.merge_group(&snapshot, group, &mut batch)?);
+        // The store and the statistics that queries have copied change together.
+        let mut guard = self.state.lock();
         self.kv.write(&batch)?;
-        self.compactions.fetch_add(merged as u64, Ordering::Relaxed);
-        Ok(merged)
+        for m in &merges {
+            for (col, bucket, seq) in m.removed.iter().filter_map(|key| key_parts(key)) {
+                if let Some(catalog) = guard.catalog.get_mut(&col) {
+                    Arc::make_mut(catalog).remove(&(bucket, seq));
+                }
+            }
+            for (col, bucket, seq) in [&m.key].into_iter().filter_map(|key| key_parts(key)) {
+                if let Some(catalog) = guard.catalog.get_mut(&col) {
+                    Arc::make_mut(catalog).insert((bucket, seq), m.stats.clone());
+                }
+            }
+        }
+        self.compactions.fetch_add(merges.len() as u64, Ordering::Relaxed);
+        Ok(merges.len())
     }
 
-    fn merge_group(&self, group: Vec<Entry>, batch: &mut WriteBatch) -> Result<usize> {
-        if group.len() < self.opts.compact_min_chunks.max(2) {
-            return Ok(0);
+    /// Puts the merging of the chunks that the statistics `keys` (of one
+    /// partition of a column, in the order they were written) are of in
+    /// `batch`, if there are enough of them.
+    fn merge_group(
+        &self,
+        snapshot: &flashkv::Snapshot,
+        keys: Vec<Vec<u8>>,
+        batch: &mut WriteBatch,
+    ) -> Result<Option<Merged>> {
+        if keys.len() < self.opts.compact_min_chunks.max(2) {
+            return Ok(None);
         }
-        let chunks = group
+        let data_keys: Vec<Vec<u8>> = keys
             .iter()
-            .map(|(_, v)| Chunk::decode(v))
+            .map(|k| {
+                let mut data = k.clone();
+                data[0] = b'D';
+                data
+            })
+            .collect();
+        let chunks = data_keys
+            .iter()
+            .map(|k| self.chunk_at(snapshot, k))
             .collect::<Result<Vec<_>>>()?;
         let ty = chunks[0].field_type();
         let points = chunks.iter().flat_map(Chunk::points).collect();
         let merged = Chunk::from_points(ty, points).expect("a column has a single type");
-        let (newest, older) = group.split_last().expect("at least two chunks");
-        for (k, _) in older {
+        let (newest, older) = data_keys.split_last().expect("at least two chunks");
+        for k in older {
             batch.delete(k);
+            batch.delete(&stats_key(k));
         }
-        batch.put(&newest.0, &merged.encode());
-        Ok(1)
+        batch.put(newest, &merged.encode());
+        let stats = merged.stats().expect("a merged chunk has points");
+        batch.put(&stats_key(newest), &stats.encode());
+        Ok(Some(Merged {
+            removed: older.to_vec(),
+            key: newest.clone(),
+            stats,
+        }))
     }
 
     /// Writes the aggregated rows of `q` (which needs an aggregate and a
@@ -83,7 +129,7 @@ impl Db {
             .into_iter()
             .map(|r| Point {
                 measurement: target.to_string(),
-                tags: r.tags,
+                tags: (*r.tags).clone(),
                 fields: [(q.field.clone(), r.value)].into(),
                 timestamp: Some(r.ts),
             })
@@ -171,12 +217,43 @@ mod tests {
         // The corrupt group (column 0) is followed by another column's group.
         db.write_points(&[cpu("a", 1, 1.0), cpu("b", 1, 1.0)]).unwrap();
         db.flush().unwrap();
-        db.kv.put(&crate::db::data_key(0, 0, 999), b"\x09").unwrap();
+        let junk = |col: u64| {
+            let key = crate::db::data_key(col, 0, 999);
+            db.kv.put(&key, b"\x09").unwrap();
+            let text = ChunkStats {
+                count: 1,
+                min_ts: 0,
+                max_ts: 0,
+                numbers: None,
+            };
+            db.kv.put(&stats_key(&key), &text.encode()).unwrap();
+            key
+        };
+        let key = junk(0);
         assert!(db.compact().is_err());
         // ... and as the last group.
-        db.kv.delete(&crate::db::data_key(0, 0, 999)).unwrap();
-        db.kv.put(&crate::db::data_key(1, 0, 999), b"\x09").unwrap();
+        db.kv.delete(&key).unwrap();
+        db.kv.delete(&stats_key(&key)).unwrap();
+        junk(1);
         assert!(db.compact().is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keys_that_are_not_those_of_chunks_stop_compaction_and_not_the_process() {
+        let dir = tmpdir("compact-junk");
+        let mut o = opts();
+        o.compact_min_chunks = 2;
+        let db = Db::open(&dir, o).unwrap();
+        db.write_points(&[cpu("a", 1, 1.0)]).unwrap();
+        db.flush().unwrap();
+        // One such key is a group of one; with a second, the merge looks for
+        // the chunk and does not find it.
+        db.kv.put(b"Eab", b"").unwrap();
+        assert_eq!(db.compact().unwrap(), 0);
+        db.kv.put(b"Eac", b"").unwrap();
+        let e = db.compact().unwrap_err().to_string();
+        assert!(e.contains("chunk (it has statistics)"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

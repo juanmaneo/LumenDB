@@ -235,13 +235,25 @@ fn disk_bytes(dir: &str) -> u64 {
 }
 
 pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
-    a.check(&[&DATA_FLAGS[..], &["batch", "runs", "flush-points"]].concat())?;
+    a.check(
+        &[
+            &DATA_FLAGS[..],
+            &["batch", "runs", "flush-points", "ingest", "query-threads", "only"],
+        ]
+        .concat(),
+    )?;
     let w = Workload::from_args(a)?;
     let batch = a.num::<usize>("batch", 5000)?.max(1);
     let runs = a.num::<usize>("runs", 5)?;
-    let (dir, opts) = db_options(a)?;
+    let ingest = a.num::<u64>("ingest", 1)? != 0;
+    let only = a.get("only").unwrap_or("");
+    let (dir, mut opts) = db_options(a)?;
+    opts.query_threads = a.num("query-threads", 0)?;
     let db = open_db((dir, opts))?;
     let (mut parse, mut write, mut text, mut gen) = (Duration::ZERO, Duration::ZERO, String::new(), Gen::new(&w));
+    if !ingest {
+        gen.next = w.rows();
+    }
     while !gen.done() {
         text.clear();
         gen.batch(batch, &mut text);
@@ -258,15 +270,9 @@ pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
     let (rows, values) = (w.rows(), w.rows() * FIELDS.len() as u64);
     let total = secs(parse + write + flush);
     let stats = db.stats();
-    let out = format!(
-        "{} hosts x {} gauges, {} readings each every {} ms: {rows} rows, {values} values, batch {batch}\n\
-         ingest: {:.1} ms: {:.0} rows/s, {:.2} M values/s\n\
-         \x20 parse {:.1} ms, write {:.1} ms, final flush {:.1} ms; {} flushes, {} series, {} columns\n\
-         queries (best of {runs} runs):\n",
-        w.hosts,
-        FIELDS.len(),
-        w.steps,
-        w.interval / 1_000_000,
+    let ingested = format!(
+        "ingest: {:.1} ms: {:.0} rows/s, {:.2} M values/s\n\
+         \x20 parse {:.1} ms, write {:.1} ms, final flush {:.1} ms; {} flushes, {} series, {} columns\n",
         total * 1e3,
         rows as f64 / total,
         values as f64 / total / 1e6,
@@ -277,9 +283,22 @@ pub(crate) fn tsdb_bench(a: &Args) -> Res<String> {
         stats.series,
         stats.columns,
     );
+    let out = format!(
+        "{} hosts x {} gauges, {} readings each every {} ms: {rows} rows, {values} values, batch {batch}\n\
+         {}queries (best of {runs} runs):\n",
+        w.hosts,
+        FIELDS.len(),
+        w.steps,
+        w.interval / 1_000_000,
+        if ingest {
+            ingested
+        } else {
+            "ingest: skipped\n".to_string()
+        },
+    );
     let queries = cases(&w)
         .iter()
-        .filter(|_| runs > 0)
+        .filter(|c| (runs > 0) & c.name.contains(only))
         .map(|c| run_case(&db, c, runs))
         .collect::<Res<String>>();
     db.close()?;
@@ -358,6 +377,11 @@ mod tests {
             ("tsdb-bench", "missing --db"),
             ("tsdb-bench --db x --batch z", "--batch: invalid number \"z\""),
             ("tsdb-bench --db x --runs z", "--runs: invalid number \"z\""),
+            ("tsdb-bench --db x --ingest z", "--ingest: invalid number \"z\""),
+            (
+                "tsdb-bench --db x --query-threads z",
+                "--query-threads: invalid number \"z\"",
+            ),
             (
                 "tsdb-bench --db x --hosts 0",
                 "--hosts, --hours and --interval must be more than 0",
@@ -407,7 +431,28 @@ mod tests {
         assert!(out.contains("   40 rows\n"), "{out}");
         assert!(out.contains("   8 rows\n"), "{out}");
         assert!(out.contains("\ndisk: "), "{out}");
+        // Queries on what is there: the same rows, and no ingestion.
+        let again = cmd(&format!(
+            "tsdb-bench --db {} --hosts 4 --hours 2 --interval 1m --runs 1 --ingest 0 --sync 0",
+            d.display()
+        ))
+        .unwrap();
+        assert!(
+            again.contains("\ningest: skipped\nqueries (best of 1 runs):\n"),
+            "{again}"
+        );
+        assert!(
+            again.contains("   120 rows\n") && again.contains("   40 rows\n"),
+            "{again}"
+        );
         std::fs::remove_dir_all(&d).unwrap();
+        // One case.
+        let one = cmd(&format!(
+            "tsdb-bench --db {} --hosts 4 --hours 2 --interval 1m --runs 1 --ingest 0 --sync 0 --only lastpoint",
+            d.display()
+        ))
+        .unwrap();
+        assert!(one.contains("  lastpoint") && !one.contains("groupby"), "{one}");
         // No runs, no queries.
         let out = cmd(&format!(
             "tsdb-bench --db {} --hosts 2 --hours 1 --interval 10m --runs 0 --sync 0",

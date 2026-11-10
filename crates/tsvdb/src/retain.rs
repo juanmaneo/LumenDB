@@ -17,10 +17,11 @@
 //! Dropping and compaction share a lock, so a merge never puts back a chunk
 //! that was just dropped.
 
-use crate::db::{data_key, Db};
+use crate::db::{data_key, key_parts, stats_key, Db};
 use crate::error::{Error, Result};
 use crate::query::Query;
 use flashkv::WriteBatch;
+use std::sync::Arc;
 
 /// Chunks deleted by one batch.
 const DROP_BATCH: usize = 4096;
@@ -82,8 +83,17 @@ impl Db {
             let mut batch = WriteBatch::new();
             doomed.iter().for_each(|key| {
                 batch.delete(key);
+                batch.delete(&stats_key(key));
             });
+            // The store and the statistics that queries have copied change together.
+            let mut guard = self.state.lock();
             self.kv.write(&batch)?;
+            for (col, bucket, seq) in doomed.iter().filter_map(|key| key_parts(key)) {
+                if let Some(catalog) = guard.catalog.get_mut(&col) {
+                    Arc::make_mut(catalog).remove(&(bucket, seq));
+                }
+            }
+            drop(guard);
             dropped += doomed.len();
         }
     }

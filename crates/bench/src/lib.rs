@@ -74,9 +74,14 @@ commands:
       random walk between 0 and 100. The same seed gives the same file, so
       another database can be given the data that tsdb-bench ingests
   tsdb-bench --db DIR [--hosts N] [--hours N] [--interval DURATION] [--seed N]
-        [--batch N] [--runs N] [--flush-points N]
+        [--batch N] [--runs N] [--flush-points N] [--ingest 0|1] [--query-threads N]
+        [--only NAME]
       ingest that workload (in batches of --batch lines, default 5000, parsed
-      and written; DIR should be empty), then time queries like TSBS's
+      and written; DIR should be empty; with --ingest 0, not at all: the
+      queries are timed on the data that DIR holds from an earlier run with
+      the same flags; --query-threads N limits the threads a query reads its
+      series on, default 0: one per core; --only NAME times only the queries
+      whose name has NAME in it), then time queries like TSBS's
       single-groupby (the max of a gauge of one host per minute, over 1 and
       12 hours), cpu-max-all (ten gauges, one host, per hour over 8 hours),
       double-groupby (the mean per host and hour over 12 hours, of one gauge
@@ -300,10 +305,14 @@ fn gen_pcap(a: &Args) -> Res<String> {
 
 /// Validated database location and options (checked before any work).
 fn db_options(a: &Args) -> Res<(&str, DbOptions)> {
+    // A flush at a number of points that was asked for comes when it says.
+    let flush = a.opt::<usize>("flush-points")?;
+    let defaults = DbOptions::default();
     let opts = DbOptions {
         kv: kv_options(a)?,
-        flush_points: a.num("flush-points", 100_000)?,
-        ..Default::default()
+        flush_points: flush.unwrap_or(defaults.flush_points),
+        chunk_points: flush.map_or(defaults.chunk_points, |_| 0),
+        ..defaults
     };
     Ok((a.req("db")?, opts))
 }

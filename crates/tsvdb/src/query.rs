@@ -3,11 +3,13 @@
 //! series and per time window (`GROUP BY time(every)`), plus top-N ranking — e.g. the
 //! heaviest flows of an ingested capture ([`top_flows`]).
 
+use crate::agg;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::lineproto::FieldValue;
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// The most rows that filling the empty windows of a query may make, unless
 /// [`crate::DbOptions::max_fill_rows`] says otherwise: a tiny window over a
@@ -212,9 +214,10 @@ impl Query {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
-    /// Canonical series key, e.g. `flows,proto=tcp,...`.
-    pub series: String,
-    pub tags: BTreeMap<String, String>,
+    /// Canonical series key, e.g. `flows,proto=tcp,...`. The rows of a
+    /// series share it, and its tags.
+    pub series: Arc<str>,
+    pub tags: Arc<BTreeMap<String, String>>,
     pub ts: i64,
     pub value: FieldValue,
 }
@@ -225,21 +228,8 @@ pub struct Row {
 /// 1, not 0). A sum that is infinite or NaN is the plain one.
 fn sum(values: &[f64]) -> f64 {
     let (mut total, mut error) = (0.0, 0.0);
-    for &x in values {
-        let t = total + x;
-        error += if total.abs() >= x.abs() {
-            (total - t) + x
-        } else {
-            (x - t) + total
-        };
-        total = t;
-    }
-    let compensated = total + error;
-    if compensated.is_nan() {
-        total
-    } else {
-        compensated
-    }
+    values.iter().for_each(|&x| agg::add(&mut total, &mut error, x));
+    agg::compensated(total, error)
 }
 
 fn reduce(agg: Agg, window: &[(i64, FieldValue)]) -> Result<FieldValue> {
@@ -267,7 +257,7 @@ fn reduce(agg: Agg, window: &[(i64, FieldValue)]) -> Result<FieldValue> {
 }
 
 /// A window's number (counted from the origin of the windows) and its value.
-type Window = (i128, FieldValue);
+pub(crate) type Window = (i128, FieldValue);
 
 fn not_numeric() -> Error {
     Error::Query("a fill with a number or a line needs a numeric result".into())
@@ -322,6 +312,54 @@ pub fn evaluate(points: &[(i64, FieldValue)], q: &Query) -> Result<Vec<(i64, Fie
     evaluate_within(points, q, MAX_FILL_ROWS)
 }
 
+/// Where the windows of a query are: window `w` starts at `origin + w * width`.
+#[derive(Clone, Copy)]
+pub(crate) struct Geometry {
+    origin: i128,
+    width: i128,
+}
+
+impl Geometry {
+    pub(crate) fn of(q: &Query) -> Geometry {
+        // Without a window, one window that starts at the start of the range.
+        let (origin, width) = match q.every {
+            None => (i128::from(q.start), i128::MAX),
+            Some(every) if q.align == Align::Start => (i128::from(q.start), i128::from(every)),
+            Some(every) => (0, i128::from(every)),
+        };
+        Geometry { origin, width }
+    }
+
+    /// The number of the window that `ts` is in.
+    pub(crate) fn window(&self, ts: i64) -> i128 {
+        let since = i128::from(ts) - self.origin;
+        // A division of 128 bits is slow, and this is done once per chunk.
+        match (u64::try_from(self.width), u64::try_from(since)) {
+            (Ok(width), Ok(since)) => i128::from(since / width),
+            (Ok(width), Err(_)) => since.div_euclid(i128::from(width)),
+            // A window of 2^64 or more holds all the timestamps that are
+            // not before the origin, and those before it are in the one before.
+            (Err(_), _) => since >> 127,
+        }
+    }
+
+    /// Where window `w` starts (saturating, for the last window of all).
+    pub(crate) fn start(&self, w: i128) -> i128 {
+        match u64::try_from(self.width) {
+            // The windows of a range of timestamps are at most 2^65 apart
+            // from the origin: no overflow, and no slow checked product.
+            Ok(width) => self.origin + w * i128::from(width),
+            Err(_) => self.origin.saturating_add(w.saturating_mul(self.width)),
+        }
+    }
+
+    /// The timestamp of a row for window `w`: its start, as near as a
+    /// timestamp can be.
+    fn stamp(&self, w: i128) -> i64 {
+        self.start(w).clamp(i64::MIN.into(), i64::MAX.into()) as i64
+    }
+}
+
 /// [`evaluate`], where a fill may make `budget` rows.
 pub(crate) fn evaluate_within(
     points: &[(i64, FieldValue)],
@@ -331,18 +369,21 @@ pub(crate) fn evaluate_within(
     let Some(agg) = q.agg else {
         return Ok(points.to_vec());
     };
-    // Without a window, one window that starts at the start of the range.
-    let (origin, width) = match q.every {
-        None => (i128::from(q.start), i128::MAX),
-        Some(every) if q.align == Align::Start => (i128::from(q.start), i128::from(every)),
-        Some(every) => (0, i128::from(every)),
-    };
-    let window = |ts: i64| (i128::from(ts) - origin).div_euclid(width);
-    let stamp = |w: i128| (origin + w * width).clamp(i64::MIN.into(), i64::MAX.into()) as i64;
+    let geometry = Geometry::of(q);
     let windows = points
-        .chunk_by(|a, b| window(a.0) == window(b.0))
-        .map(|w| Ok((window(w[0].0), reduce(agg, w)?)))
+        .chunk_by(|a, b| geometry.window(a.0) == geometry.window(b.0))
+        .map(|w| Ok((geometry.window(w[0].0), reduce(agg, w)?)))
         .collect::<Result<Vec<Window>>>()?;
+    fill_windows(windows, q, budget)
+}
+
+/// The rows for the windows of a series (those that have points, in order):
+/// stamped with their start, and with the windows between them made by the
+/// fill of `q`, if it has one, at most `budget` of them.
+pub(crate) fn fill_windows(windows: Vec<Window>, q: &Query, budget: usize) -> Result<Vec<(i64, FieldValue)>> {
+    let geometry = Geometry::of(q);
+    let window = |ts: i64| geometry.window(ts);
+    let stamp = |w: i128| geometry.stamp(w);
     let Some(fill) = q.fill else {
         return Ok(windows.into_iter().map(|(w, v)| (stamp(w), v)).collect());
     };
@@ -759,7 +800,7 @@ mod tests {
     fn top_n_orders_by_value() {
         let row = |s: &str, v: FieldValue| Row {
             series: s.into(),
-            tags: BTreeMap::new(),
+            tags: Arc::default(),
             ts: 0,
             value: v,
         };
@@ -769,7 +810,7 @@ mod tests {
             row("c", FieldValue::Str("x".into())),
             row("d", FieldValue::Int(5)),
         ];
-        let top: Vec<String> = top_n(rows, 3).into_iter().map(|r| r.series).collect();
+        let top: Vec<String> = top_n(rows, 3).into_iter().map(|r| r.series.to_string()).collect();
         assert_eq!(top, vec!["b", "d", "a"]);
     }
 }

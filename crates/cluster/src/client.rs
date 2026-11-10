@@ -561,7 +561,7 @@ fn run_query(
         None => rows,
     };
     let rows = rows.iter().map(|r| ResultRow {
-        series: r.series.clone(),
+        series: r.series.to_string(),
         ts: r.ts,
         value: r.value.to_string(),
     });

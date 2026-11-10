@@ -16,11 +16,13 @@
 //!   heaviest pcap flows). [`time`] reads durations and dates.
 //! - [`retain`] drops the partitions older than a time to live.
 
+pub(crate) mod agg;
 pub mod chunk;
 pub mod compact;
 pub mod db;
 pub mod error;
 pub mod lineproto;
+pub(crate) mod par;
 pub mod partition;
 pub mod query;
 pub mod retain;

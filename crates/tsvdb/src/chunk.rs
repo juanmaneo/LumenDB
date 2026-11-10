@@ -12,6 +12,7 @@
 //! Layout: `type u8 | n varint | t0 zigzag | n dod varints | values`.
 //! Decoding is bounds-checked: corrupt input yields an error, never a panic.
 
+use crate::agg::Slice;
 use crate::error::{Error, Result};
 use crate::lineproto::{FieldType, FieldValue};
 use flashkv::codec::Decoder;
@@ -106,6 +107,132 @@ pub fn normalize(mut points: Vec<(i64, FieldValue)>) -> Vec<(i64, FieldValue)> {
     out
 }
 
+/// A number of one of the three numeric types, as a column of it holds them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Num {
+    Float(f64),
+    Int(i64),
+    UInt(u64),
+}
+
+impl Num {
+    pub fn value(self) -> FieldValue {
+        match self {
+            Num::Float(x) => FieldValue::Float(x),
+            Num::Int(x) => FieldValue::Int(x),
+            Num::UInt(x) => FieldValue::UInt(x),
+        }
+    }
+
+    /// The type (1, 2 or 3, as stored) and the bits.
+    fn parts(self) -> (u8, u64) {
+        match self {
+            Num::Float(x) => (1, x.to_bits()),
+            Num::Int(x) => (2, x as u64),
+            Num::UInt(x) => (3, x),
+        }
+    }
+
+    fn from_parts(tag: u8, bits: u64) -> Option<Num> {
+        match tag {
+            1 => Some(Num::Float(f64::from_bits(bits))),
+            2 => Some(Num::Int(bits as i64)),
+            3 => Some(Num::UInt(bits)),
+            _ => None,
+        }
+    }
+}
+
+/// What a column of numbers says about a chunk of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Numbers {
+    /// The sum of the values as floats (compensated, see [`crate::agg::add`]).
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+    /// The values of the earliest and of the latest point.
+    pub first: Num,
+    pub last: Num,
+}
+
+/// What is known of a chunk without decoding it. It is stored under a key of
+/// its own, next to the chunk's, so that a query can find out from a few
+/// small entries which chunks it has to read, and answer from these alone
+/// for a chunk that lies inside one window of its aggregate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkStats {
+    pub count: u64,
+    /// The earliest and the latest timestamp.
+    pub min_ts: i64,
+    pub max_ts: i64,
+    /// For a column of numbers.
+    pub numbers: Option<Numbers>,
+}
+
+impl ChunkStats {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uvarint64(&mut out, self.count);
+        put_uvarint64(&mut out, zigzag(self.min_ts));
+        put_uvarint64(&mut out, zigzag(self.max_ts));
+        match self.numbers {
+            None => out.push(0),
+            Some(n) => {
+                let (tag, first) = n.first.parts();
+                out.push(tag);
+                for bits in [
+                    n.sum.to_bits(),
+                    n.min.to_bits(),
+                    n.max.to_bits(),
+                    first,
+                    n.last.parts().1,
+                ] {
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<ChunkStats> {
+        let mut d = Decoder::new(buf);
+        let count = d.varint();
+        let (min_ts, max_ts) = (unzigzag(d.varint()), unzigzag(d.varint()));
+        let tag = d.u8();
+        let numbers = (tag != 0).then(|| {
+            let mut next = || d.u64();
+            let (sum, min, max) = (next(), next(), next());
+            let (first, last) = (Num::from_parts(tag, next()), Num::from_parts(tag, next()));
+            first.zip(last).map(|(first, last)| Numbers {
+                sum: f64::from_bits(sum),
+                min: f64::from_bits(min),
+                max: f64::from_bits(max),
+                first,
+                last,
+            })
+        });
+        d.finish("chunk statistics")?;
+        if !d.is_done() | (count == 0) {
+            return Err(Error::Corrupt("chunk statistics".into()));
+        }
+        match numbers {
+            None => Ok(ChunkStats {
+                count,
+                min_ts,
+                max_ts,
+                numbers: None,
+            }),
+            Some(None) => Err(Error::Corrupt("chunk statistics: number type".into())),
+            Some(n) => Ok(ChunkStats {
+                count,
+                min_ts,
+                max_ts,
+                numbers: n,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chunk {
     ts: Vec<i64>,
@@ -120,23 +247,41 @@ fn unzigzag(v: u64) -> i64 {
     ((v >> 1) as i64) ^ -((v & 1) as i64)
 }
 
+/// Writes bits, most significant first, through a 64-bit accumulator.
 #[derive(Default)]
 struct BitWriter {
     buf: Vec<u8>,
-    bits: usize,
+    /// The bits not yet in `buf`, in the low `filled` bits.
+    acc: u64,
+    filled: u32,
 }
 
 impl BitWriter {
-    /// Appends the low `n` bits of `v`, most significant first.
+    /// Appends the low `n` bits of `v` (`n` is at most 64).
     fn put(&mut self, v: u64, n: u32) {
-        for i in (0..n).rev() {
-            if self.bits.is_multiple_of(8) {
-                self.buf.push(0);
-            }
-            let bit = ((v >> i) & 1) as u8;
-            *self.buf.last_mut().expect("pushed above") |= bit << (7 - self.bits % 8);
-            self.bits += 1;
+        let v = v & u64::MAX.checked_shr(64 - n).unwrap_or(0);
+        // The accumulator is never full: `filled` is below 64.
+        let room = 64 - self.filled;
+        if n < room {
+            self.acc = self.acc.checked_shl(n).unwrap_or(0) | v;
+            self.filled += n;
+        } else {
+            // `v` fills the accumulator, which goes to the buffer, and what
+            // is left of `v` starts the next one.
+            let rest = n - room;
+            let word = self.acc.checked_shl(room).unwrap_or(0) | (v >> rest);
+            self.buf.extend_from_slice(&word.to_be_bytes());
+            self.acc = v & (1u64 << rest).wrapping_sub(1);
+            self.filled = rest;
         }
+    }
+
+    /// The bytes, the last one padded with zero bits.
+    fn finish(mut self) -> Vec<u8> {
+        let bytes = self.filled.div_ceil(8) as usize;
+        let last = self.acc.checked_shl(64 - self.filled).unwrap_or(0);
+        self.buf.extend_from_slice(&last.to_be_bytes()[..bytes]);
+        self.buf
     }
 }
 
@@ -155,18 +300,34 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// The 8 bytes from byte `i` on (zeros past the end), as a number.
+    fn word(&self, i: usize) -> u64 {
+        match self.buf.get(i..i + 8) {
+            Some(w) => u64::from_be_bytes(w.try_into().expect("8 bytes")),
+            None => {
+                let mut w = [0u8; 8];
+                let rest = self.buf.get(i..).unwrap_or_default();
+                w[..rest.len()].copy_from_slice(rest);
+                u64::from_be_bytes(w)
+            }
+        }
+    }
+
     /// Next `n` bits (sticky failure: 0 once the input is exhausted).
     fn get(&mut self, n: u32) -> u64 {
         if self.bad | (self.pos + n as usize > self.buf.len() * 8) {
             self.bad = true;
             return 0;
         }
-        let mut v = 0u64;
-        for _ in 0..n {
-            let byte = self.buf[self.pos / 8];
-            v = (v << 1) | u64::from((byte >> (7 - self.pos % 8)) & 1);
-            self.pos += 1;
+        if n > 56 {
+            // A word holds at most 57 bits from any bit position.
+            let high = self.get(n - 32);
+            return (high << 32) | self.get(32);
         }
+        let v = (self.word(self.pos / 8) << (self.pos % 8))
+            .checked_shr(64 - n)
+            .unwrap_or(0);
+        self.pos += n as usize;
         v
     }
 }
@@ -196,7 +357,7 @@ fn encode_floats(vals: &[f64]) -> Vec<u8> {
             (lead, trail) = (l, t);
         }
     }
-    w.buf
+    w.finish()
 }
 
 fn decode_floats(buf: &[u8], n: usize) -> (Vec<f64>, bool) {
@@ -269,6 +430,18 @@ impl Chunk {
         &self.col
     }
 
+    /// What a query can know of the chunk without decoding it; `None` for
+    /// an empty chunk.
+    pub fn stats(&self) -> Option<ChunkStats> {
+        let (&min_ts, &max_ts) = self.ts.first().zip(self.ts.last())?;
+        Some(ChunkStats {
+            count: self.ts.len() as u64,
+            min_ts,
+            max_ts,
+            numbers: Slice::of(&self.col).map(|s| s.numbers()),
+        })
+    }
+
     pub fn points(&self) -> Vec<(i64, FieldValue)> {
         self.ts.iter().enumerate().map(|(i, &t)| (t, self.col.get(i))).collect()
     }
@@ -291,7 +464,7 @@ impl Chunk {
             Column::Bool(v) => {
                 let mut w = BitWriter::default();
                 v.iter().for_each(|&b| w.put(u64::from(b), 1));
-                put_len_prefixed(&mut out, &w.buf);
+                put_len_prefixed(&mut out, &w.finish());
             }
             Column::Str(v) => v.iter().for_each(|s| put_len_prefixed(&mut out, s.as_bytes())),
         }
@@ -455,11 +628,79 @@ mod tests {
     }
 
     #[test]
+    fn statistics_say_what_the_chunk_holds() {
+        let floats = [
+            (5, FieldValue::Float(2.0)),
+            (1, FieldValue::Float(-1.0)),
+            (9, FieldValue::Float(4.5)),
+        ];
+        let stats = Chunk::from_points(FieldType::Float, floats.to_vec())
+            .unwrap()
+            .stats()
+            .unwrap();
+        let numbers = stats.numbers.unwrap();
+        assert_eq!((stats.count, stats.min_ts, stats.max_ts), (3, 1, 9));
+        assert_eq!((numbers.sum, numbers.min, numbers.max), (5.5, -1.0, 4.5));
+        // The values of the earliest and of the latest point, which is not the order of writing.
+        assert_eq!((numbers.first, numbers.last), (Num::Float(-1.0), Num::Float(4.5)));
+        assert_eq!(numbers.first.value(), FieldValue::Float(-1.0));
+        let ints = [(1, FieldValue::Int(i64::MIN)), (2, FieldValue::Int(i64::MAX))];
+        let n = Chunk::from_points(FieldType::Int, ints.to_vec())
+            .unwrap()
+            .stats()
+            .unwrap()
+            .numbers
+            .unwrap();
+        assert_eq!((n.first, n.last), (Num::Int(i64::MIN), Num::Int(i64::MAX)));
+        assert_eq!((n.min, n.max), (i64::MIN as f64, i64::MAX as f64));
+        let uints = [(1, FieldValue::UInt(u64::MAX))];
+        let n = Chunk::from_points(FieldType::UInt, uints.to_vec())
+            .unwrap()
+            .stats()
+            .unwrap()
+            .numbers
+            .unwrap();
+        assert_eq!((n.first.value(), n.sum), (FieldValue::UInt(u64::MAX), u64::MAX as f64));
+        // Every type, as it is stored, and back; text and booleans have no numbers.
+        for values in samples() {
+            let ty = values[0].field_type();
+            let pts: Vec<(i64, FieldValue)> = (-3..).zip(values).collect();
+            let stats = Chunk::from_points(ty, pts).unwrap().stats().unwrap();
+            assert_eq!(stats.numbers.is_some(), !matches!(ty, FieldType::Bool | FieldType::Str));
+            assert_eq!(ChunkStats::decode(&stats.encode()).unwrap(), stats, "{ty:?}");
+        }
+        // A chunk with nothing in it has nothing to say.
+        assert_eq!(Chunk::from_points(FieldType::Float, Vec::new()).unwrap().stats(), None);
+    }
+
+    #[test]
+    fn corrupt_statistics_are_an_error() {
+        let stats = Chunk::from_points(FieldType::Float, vec![(1, FieldValue::Float(1.0))])
+            .unwrap()
+            .stats()
+            .unwrap();
+        let bytes = stats.encode();
+        for cut in 0..bytes.len() {
+            assert!(ChunkStats::decode(&bytes[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(ChunkStats::decode(&extra).is_err());
+        // No point; a number type that does not exist.
+        assert!(ChunkStats::decode(&[0, 0, 0, 0]).is_err());
+        let mut odd = bytes.clone();
+        odd[3] = 9;
+        assert!(ChunkStats::decode(&odd).is_err());
+        assert_eq!(ChunkStats::decode(&bytes).unwrap(), stats);
+    }
+
+    #[test]
     fn bit_io() {
         let mut w = BitWriter::default();
         w.put(0b101, 3);
         w.put(u64::MAX, 64);
-        let mut r = BitReader::new(&w.buf);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
         assert_eq!(r.get(3), 0b101);
         assert_eq!(r.get(64), u64::MAX);
         assert_eq!(r.get(8), 0);
@@ -472,6 +713,40 @@ mod tests {
         w.put(31, 5);
         w.put(63, 6);
         w.put(0, 33);
-        assert!(decode_floats(&w.buf, 1).1);
+        assert!(decode_floats(&w.finish(), 1).1);
+    }
+
+    /// The bit I/O against the obvious bit-by-bit version, for every width
+    /// and a spread of alignments.
+    #[test]
+    fn bit_io_matches_the_obvious_version() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..200 {
+            let fields: Vec<(u64, u32)> = (0..round % 40 + 1).map(|_| (next(), (next() % 65) as u32)).collect();
+            let mut w = BitWriter::default();
+            let mut bits = Vec::new();
+            for &(v, n) in &fields {
+                w.put(v, n);
+                bits.extend((0..n).rev().map(|i| (v >> i) & 1 == 1));
+            }
+            let bytes = w.finish();
+            let want: Vec<u8> = bits
+                .chunks(8)
+                .map(|c| c.iter().enumerate().fold(0, |b, (i, &x)| b | (u8::from(x) << (7 - i))))
+                .collect();
+            assert_eq!(bytes, want, "round {round}");
+            let mut r = BitReader::new(&bytes);
+            for &(v, n) in &fields {
+                let mask = if n == 64 { u64::MAX } else { (1 << n) - 1 };
+                assert_eq!(r.get(n), v & mask, "round {round} width {n}");
+            }
+            assert!(!r.bad);
+        }
     }
 }

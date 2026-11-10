@@ -21,13 +21,16 @@
 //! acknowledged writes.
 //!
 //! Key space: `C`+sid+field → column, `D`+col+bucket+seq → chunk,
+//! `E`+col+bucket+seq → statistics of that chunk (see [`ChunkStats`]),
 //! `F`+measurement+field → type, `Mseq` → sequence, `S`+series key → series,
-//! `W`+seq → WAL record.
+//! `V` → format of the database, `W`+seq → WAL record.
 
-use crate::chunk::{normalize, Chunk};
+use crate::agg::{self, Aggregator, Slice};
+use crate::chunk::{normalize, Chunk, ChunkStats};
 use crate::error::{Error, Result};
 use crate::lineproto::{self, FieldType, FieldValue, Point};
-use crate::partition::{encode_bucket, Partitioner};
+use crate::par;
+use crate::partition::{decode_bucket, encode_bucket, Partitioner};
 use crate::query::{self, Query, Row};
 use crate::tags::{Series, SeriesIndex};
 use crate::time::now_ns;
@@ -37,24 +40,41 @@ use flashkv::WriteBatch;
 use parking_lot::Mutex;
 use pcapfast::flow::proto_name;
 use pcapfast::{FlowKey, FlowStats, FlowTable, ParseStats};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// The most points that wait in memory for [`DbOptions::chunk_points`].
+pub const MAX_BUFFERED_POINTS: usize = 8 << 20;
 
 /// Points per `write_points` call when ingesting captures.
 pub const INGEST_BATCH: usize = 50_000;
 const META_SEQ: &[u8] = b"Mseq";
+/// Where the format of the database is: 2 has the statistics of the chunks.
+const FORMAT_KEY: &[u8] = b"V";
+const FORMAT: u8 = 2;
 
 #[derive(Clone)]
 pub struct DbOptions {
     pub kv: flashkv::DbOptions,
     pub partition: Partitioner,
-    /// Buffered points that trigger a flush to chunks.
+    /// Buffered points that trigger a flush to chunks...
     pub flush_points: usize,
+    /// ...but not before the columns that have points buffered hold this
+    /// many on average (at most [`MAX_BUFFERED_POINTS`] in all), so that the
+    /// chunks are not tiny: a flush writes a chunk per column and partition,
+    /// and every chunk is something to look at in each query and to merge.
+    /// 0 for a flush as soon as `flush_points` are buffered.
+    pub chunk_points: usize,
     /// Chunks of one column/partition that make compaction merge them.
     pub compact_min_chunks: usize,
     /// The most rows a query may make by filling empty windows.
     pub max_fill_rows: usize,
+    /// The most threads a query uses to read the columns of its series; 0
+    /// for as many as there are cores.
+    pub query_threads: usize,
 }
 
 impl Default for DbOptions {
@@ -63,8 +83,10 @@ impl Default for DbOptions {
             kv: flashkv::DbOptions::default(),
             partition: Partitioner::hourly(),
             flush_points: 100_000,
+            chunk_points: 512,
             compact_min_chunks: 4,
             max_fill_rows: query::MAX_FILL_ROWS,
+            query_threads: 0,
         }
     }
 }
@@ -95,7 +117,14 @@ pub(crate) struct State {
     seq: u64,
     poisoned: Option<String>,
     flushes: u64,
+    /// The statistics of the chunks of the columns that queries have read,
+    /// by column, then (partition, sequence number). Whoever writes or
+    /// deletes a chunk does so under the lock of the state, and updates this.
+    pub(crate) catalog: HashMap<u64, Arc<Catalog>>,
 }
+
+/// The statistics of the chunks of one column, by (partition, sequence number).
+pub(crate) type Catalog = BTreeMap<(i64, u64), ChunkStats>;
 
 fn corrupt(what: &str) -> Error {
     Error::Corrupt(format!("bad {what} entry"))
@@ -130,26 +159,96 @@ pub(crate) fn data_key(col: u64, bucket: i64, seq: u64) -> Vec<u8> {
     .concat()
 }
 
+/// The column, partition and sequence number that a `D` or `E` key is of.
+pub(crate) fn key_parts(key: &[u8]) -> Option<(u64, i64, u64)> {
+    let key: &[u8; 25] = key.try_into().ok()?;
+    let word = |at: usize| <[u8; 8]>::try_from(&key[at..at + 8]).expect("8 bytes");
+    Some((
+        u64::from_be_bytes(word(1)),
+        decode_bucket(word(9)),
+        u64::from_be_bytes(word(17)),
+    ))
+}
+
+/// The key of the statistics of the chunk that `data_key` is the key of.
+pub(crate) fn stats_key(data_key: &[u8]) -> Vec<u8> {
+    let mut key = data_key.to_vec();
+    key[0] = b'E';
+    key
+}
+
 /// Timestamped values of one column.
 type Points = Vec<(i64, FieldValue)>;
 
-fn in_range(q: &Query, p: &(i64, FieldValue)) -> bool {
-    (p.0 >= q.start) & (p.0 < q.end)
+/// Appends the rows of a series, which share its key and tags.
+fn push_rows(rows: &mut Vec<Row>, series: &Series, points: Points) {
+    rows.extend(points.into_iter().map(|(ts, value)| Row {
+        series: series.key.clone(),
+        tags: series.tags.clone(),
+        ts,
+        value,
+    }));
 }
 
-/// The newest point in the range of `q` among the chunks of one partition.
-fn newest_in_chunks(chunks: &[Vec<u8>], q: &Query) -> Result<Option<(i64, FieldValue)>> {
-    let mut points = Vec::new();
-    for chunk in chunks {
-        points.extend(Chunk::decode(chunk)?.points());
-    }
-    Ok(normalize(points).into_iter().rev().find(|p| in_range(q, p)))
+/// A chunk that a query may read: what is known of it, and where it is.
+struct Piece {
+    stats: ChunkStats,
+    source: Source,
+}
+
+enum Source {
+    /// The partition and the sequence number of the chunk, which is of a
+    /// column that is known.
+    Stored(i64, u64),
+    /// The write buffer, as a chunk.
+    Buffered(Chunk),
+}
+
+/// A column that a query reads, and the points of it that are only buffered.
+struct Target {
+    series: Arc<Series>,
+    col: u64,
+    ty: FieldType,
+    buffered: Points,
+    /// The statistics of the stored chunks of the column, at the time of the
+    /// query; those of the partitions in the range are the ones to look at.
+    stored: Arc<Catalog>,
+}
+
+/// The newest point of a chunk in the range of `q`.
+fn newest_in(chunk: &Chunk, q: &Query) -> Option<(i64, FieldValue)> {
+    let ts = chunk.timestamps();
+    // (A chunk that is looked at has a timestamp before the end.)
+    let last = ts.partition_point(|&t| t < q.end).wrapping_sub(1);
+    ts.get(last)
+        .filter(|&&t| t >= q.start)
+        .map(|&t| (t, chunk.column().get(last)))
+}
+
+fn in_range(q: &Query, p: &(i64, FieldValue)) -> bool {
+    (p.0 >= q.start) & (p.0 < q.end)
 }
 
 /// Length of the `D`+col+bucket prefix shared by the chunks of a partition.
 pub(crate) const PARTITION_PREFIX: usize = 17;
 
 impl State {
+    /// The statistics of the chunks of column `col`, read from the store
+    /// the first time they are wanted.
+    fn stats_of(&mut self, kv: &flashkv::Db, col: u64) -> Result<Arc<Catalog>> {
+        match self.catalog.entry(col) {
+            Entry::Occupied(known) => Ok(known.get().clone()),
+            Entry::Vacant(unknown) => {
+                let mut stats = Catalog::new();
+                for (key, value) in kv.scan_prefix(&[&b"E"[..], &col.to_be_bytes()].concat())? {
+                    let (_, bucket, seq) = key_parts(&key).ok_or_else(|| corrupt("chunk statistics key"))?;
+                    stats.insert((bucket, seq), ChunkStats::decode(&value)?);
+                }
+                Ok(unknown.insert(Arc::new(stats)).clone())
+            }
+        }
+    }
+
     pub(crate) fn healthy(&self) -> Result<()> {
         match &self.poisoned {
             Some(e) => Err(Error::Kv(flashkv::Error::Background(e.clone()))),
@@ -197,7 +296,7 @@ impl State {
             let (sid, new) = self.index.insert(&p.measurement, &p.tags);
             if new {
                 let s = self.index.series(sid).expect("just inserted");
-                batch.put(&series_kv_key(&s.key()), &s.encode());
+                batch.put(&series_kv_key(s.key()), &s.encode());
             }
             let schema = self.schema.entry(p.measurement.clone()).or_default();
             let cols = self.cols.entry(sid).or_default();
@@ -306,6 +405,16 @@ pub struct Db {
 impl Db {
     pub fn open(dir: &Path, opts: DbOptions) -> Result<Db> {
         let kv = flashkv::Db::open(dir, opts.kv.clone())?;
+        match kv.get(FORMAT_KEY)?.as_deref() {
+            Some([FORMAT]) => {}
+            Some(_) => return Err(corrupt("format")),
+            None if kv.iter(b"D", Some(b"E")).next().is_some() => {
+                return Err(Error::Corrupt(
+                    "the chunks have no statistics: the database was made by an older version".into(),
+                ))
+            }
+            None => kv.put(FORMAT_KEY, &[FORMAT])?,
+        }
         let mut entries = kv.scan(b"C", Some(b"D"))?;
         entries.extend(kv.scan(b"F", Some(b"X"))?);
         let mut st = State::default();
@@ -358,7 +467,8 @@ impl Db {
         self.commit(st, &batch)?;
         st.wal.push(wal_key);
         st.apply(staged);
-        if st.buffered >= self.opts.flush_points {
+        let wanted = self.opts.chunk_points.saturating_mul(st.buffer.len());
+        if st.buffered >= self.opts.flush_points.max(wanted.min(MAX_BUFFERED_POINTS)) {
             // The points are already durable: a failed flush only poisons
             // the database (reported by the next call), the write stands.
             let _ = self.flush_locked(st);
@@ -389,12 +499,17 @@ impl Db {
 
     fn flush_locked(&self, st: &mut State) -> Result<()> {
         let mut batch = WriteBatch::new();
+        let mut written = Vec::new();
         for (col, points) in std::mem::take(&mut st.buffer) {
             let ty = st.col_types[&col];
             for (bucket, part) in self.opts.partition.split(points) {
                 let chunk = Chunk::from_points(ty, part).expect("buffered values match their column type");
                 st.seq += 1;
-                batch.put(&data_key(col, bucket, st.seq), &chunk.encode());
+                let key = data_key(col, bucket, st.seq);
+                batch.put(&key, &chunk.encode());
+                let stats = chunk.stats().expect("a part has points");
+                batch.put(&stats_key(&key), &stats.encode());
+                written.push((col, (bucket, st.seq), stats));
             }
         }
         for k in st.wal.drain(..) {
@@ -402,102 +517,198 @@ impl Db {
         }
         batch.put(META_SEQ, &st.seq.to_le_bytes());
         self.commit(st, &batch)?;
+        for (col, key, stats) in written {
+            if let Some(catalog) = st.catalog.get_mut(&col) {
+                Arc::make_mut(catalog).insert(key, stats);
+            }
+        }
         st.buffered = 0;
         st.flushes += 1;
         Ok(())
     }
 
-    /// Series matching `q` with their points in `[q.start, q.end)`, sorted
-    /// and deduplicated (last write wins).
-    fn read_series(&self, q: &Query) -> Result<Vec<(Series, Points)>> {
-        let (targets, snapshot) = {
-            let st = self.state.lock();
-            st.healthy()?;
-            let targets: Vec<(Series, u64, Points)> = st
-                .index
-                .lookup(&q.measurement, &q.filters)
-                .into_iter()
-                .filter_map(|sid| {
-                    let col = *st.cols[&sid].get(&q.field)?;
-                    let series = st.index.series(sid).expect("indexed").clone();
-                    Some((series, col, st.buffer.get(&col).cloned().unwrap_or_default()))
-                })
-                .collect();
-            (targets, self.kv.snapshot())
-        };
-        let buckets = self.opts.partition.buckets(q.start, q.end);
-        let mut out = Vec::with_capacity(targets.len());
-        for (series, col, buffered) in targets {
-            let lo = data_key(col, *buckets.start(), 0);
-            let hi = data_key(col, buckets.end() + 1, 0);
-            let points = if q.latest {
-                self.newest_point(&snapshot, (&lo, &hi), buffered, q)?
-            } else {
-                let mut points = Vec::new();
-                for item in self.kv.iter_at(&snapshot, &lo, Some(&hi)) {
-                    let (_, v) = item?;
-                    points.extend(Chunk::decode(&v)?.points());
-                }
-                points.extend(buffered);
-                normalize(points).into_iter().filter(|p| in_range(q, p)).collect()
+    /// The columns that `q` reads, with a flashkv snapshot that goes with the
+    /// buffered points and the statistics copied here (taken together, under
+    /// the lock: whoever changes the chunks does it under the lock too).
+    fn targets(&self, q: &Query) -> Result<(Vec<Target>, flashkv::Snapshot)> {
+        let mut guard = self.state.lock();
+        let st = &mut *guard;
+        st.healthy()?;
+        let mut targets = Vec::new();
+        for sid in st.index.lookup(&q.measurement, &q.filters) {
+            let Some(&col) = st.cols[&sid].get(&q.field) else {
+                continue;
             };
-            out.push((series, points));
+            let stored = st.stats_of(&self.kv, col)?;
+            targets.push(Target {
+                series: st.index.series(sid).expect("indexed").clone(),
+                col,
+                ty: st.col_types[&col],
+                buffered: st.buffer.get(&col).cloned().unwrap_or_default(),
+                stored,
+            });
         }
-        Ok(out)
+        Ok((targets, self.kv.snapshot()))
     }
 
-    /// The newest point of one column in the range of `q`, as a list of at
-    /// most one point. It goes through the keys of the column's chunks but
-    /// decodes only those of the newest partition (and the one before it, if
-    /// the newest holds nothing in range), so a long history costs a key scan
-    /// and not a decode of every point.
-    fn newest_point(
+    /// The chunks of one column that may hold points in the range of `q`,
+    /// with their statistics, the buffered points last, as one more chunk.
+    fn pieces(&self, target: Target, q: &Query) -> Vec<Piece> {
+        let buckets = self.opts.partition.buckets(q.start, q.end);
+        let mut pieces: Vec<Piece> = target
+            .stored
+            .range((*buckets.start(), 0)..=(*buckets.end(), u64::MAX))
+            .filter(|(_, stats)| (stats.max_ts >= q.start) & (stats.min_ts < q.end))
+            .map(|(&(bucket, seq), stats)| Piece {
+                stats: stats.clone(),
+                source: Source::Stored(bucket, seq),
+            })
+            .collect();
+        let buffered = Chunk::from_points(target.ty, target.buffered).expect("buffered values match their column");
+        let in_range = |stats: &ChunkStats| (stats.max_ts >= q.start) & (stats.min_ts < q.end);
+        pieces.extend(buffered.stats().filter(in_range).map(|stats| Piece {
+            stats,
+            source: Source::Buffered(buffered),
+        }));
+        pieces
+    }
+
+    fn load(&self, snapshot: &flashkv::Snapshot, col: u64, piece: Piece) -> Result<Chunk> {
+        match piece.source {
+            Source::Buffered(chunk) => Ok(chunk),
+            Source::Stored(bucket, seq) => self.chunk_at(snapshot, &data_key(col, bucket, seq)),
+        }
+    }
+
+    /// The chunk stored under `key`, which is there if its statistics are.
+    pub(crate) fn chunk_at(&self, snapshot: &flashkv::Snapshot, key: &[u8]) -> Result<Chunk> {
+        let value = self.kv.get_at(key, snapshot)?;
+        Chunk::decode(&value.ok_or_else(|| corrupt("chunk (it has statistics)"))?)
+    }
+
+    /// The points of the pieces in the range of `q`, sorted, the last write
+    /// of a timestamp winning.
+    fn points_of(&self, snapshot: &flashkv::Snapshot, col: u64, pieces: Vec<Piece>, q: &Query) -> Result<Points> {
+        let mut points = Vec::new();
+        for piece in pieces {
+            points.extend(self.load(snapshot, col, piece)?.points());
+        }
+        Ok(normalize(points).into_iter().filter(|p| in_range(q, p)).collect())
+    }
+
+    /// The points of one column in `[q.start, q.end)` that `q` asks for, or
+    /// its aggregate windows: the rows, as (timestamp, value).
+    ///
+    /// When no two chunks have a timestamp in common, nothing has to be
+    /// sorted or dropped, and an aggregate or the latest point is made from
+    /// the statistics of the chunks that are in the range and in one window,
+    /// and from the points of the others only.
+    fn evaluate_target(
         &self,
         snapshot: &flashkv::Snapshot,
-        (lo, hi): (&[u8], &[u8]),
-        buffered: Points,
+        target: Target,
         q: &Query,
-    ) -> Result<Points> {
-        // The chunks of the last two partitions, oldest first, by partition.
-        let mut parts: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
-        for item in self.kv.iter_at(snapshot, lo, Some(hi)) {
-            let (k, v) = item?;
-            if parts.last().map(|p| &p.0[..]) != Some(&k[..PARTITION_PREFIX]) {
-                if parts.len() == 2 {
-                    parts.remove(0);
-                }
-                parts.push((k[..PARTITION_PREFIX].to_vec(), Vec::new()));
-            }
-            parts.last_mut().expect("a partition was just added").1.push(v);
+        budget: usize,
+    ) -> Result<Vec<(i64, FieldValue)>> {
+        if q.latest {
+            return self.newest(snapshot, target, q);
         }
-        let newest = parts
-            .iter()
-            .rev()
-            .find_map(|(_, chunks)| newest_in_chunks(chunks, q).transpose())
-            .transpose()?;
-        // The buffer is newer than every chunk, so it wins a tie.
-        let both = newest.into_iter().chain(buffered).collect();
-        Ok(normalize(both)
+        let col = target.col;
+        let mut pieces = self.pieces(target, q);
+        // Chunks come in the order they were written, which is time order
+        // when the points were written in time order.
+        let in_order = pieces.windows(2).all(|w| w[0].stats.max_ts < w[1].stats.min_ts);
+        let disjoint = in_order || agg::disjoint(pieces.iter().map(|p| (p.stats.min_ts, p.stats.max_ts)));
+        let numeric = pieces.iter().all(|p| p.stats.numbers.is_some());
+        if let Some(agg) = q.agg.filter(|_| disjoint & numeric) {
+            pieces.sort_by_key(|p| p.stats.min_ts);
+            let mut aggregator = Aggregator::new(q, agg);
+            for piece in pieces {
+                if aggregator.covers(&piece.stats) {
+                    aggregator.push_stats(&piece.stats);
+                    continue;
+                }
+                let chunk = self.load(snapshot, col, piece)?;
+                let values = Slice::of(chunk.column()).expect("the chunks are of numbers");
+                aggregator.push(chunk.timestamps(), values);
+            }
+            return query::fill_windows(aggregator.finish(), q, budget);
+        }
+        // The pieces are in the order they were written, which decides who
+        // wins a timestamp.
+        let points = self.points_of(snapshot, col, pieces, q)?;
+        query::evaluate_within(&points, q, budget)
+    }
+
+    /// The newest point of a column in the range of `q`, as a list of at most
+    /// one point. The chunks of a partition hold only timestamps of it, so
+    /// the newest point is in the newest partition that has one in the range,
+    /// and nothing older is looked at; and a chunk that lies in the range
+    /// has its newest point in its statistics. A chunk of the same partition
+    /// that was written later wins a tie, and the buffer wins over all.
+    fn newest(&self, snapshot: &flashkv::Snapshot, target: Target, q: &Query) -> Result<Points> {
+        let buckets = self.opts.partition.buckets(q.start, q.end);
+        let chunks = target.stored.range((*buckets.start(), 0)..=(*buckets.end(), u64::MAX));
+        let mut stored: Option<(i64, FieldValue)> = None;
+        let mut bucket = None;
+        for (&(b, seq), stats) in chunks.rev() {
+            if stored.is_some() & (bucket != Some(b)) {
+                break;
+            }
+            bucket = Some(b);
+            let inside = (stats.min_ts >= q.start) & (stats.max_ts < q.end);
+            let candidate = match stats.numbers.filter(|_| inside) {
+                Some(n) => Some((stats.max_ts, n.last.value())),
+                None if (stats.max_ts < q.start) | (stats.min_ts >= q.end) => None,
+                None => newest_in(&self.chunk_at(snapshot, &data_key(target.col, b, seq))?, q),
+            };
+            // Later chunks come first: a point of the same timestamp is theirs.
+            stored = match (stored, candidate) {
+                (Some(old), Some(new)) if new.0 > old.0 => Some(new),
+                (None, new) => new,
+                (old, _) => old,
+            };
+        }
+        // Of equal timestamps, the point that was written last is the newest.
+        let buffered = target
+            .buffered
             .into_iter()
-            .rev()
-            .find(|p| in_range(q, p))
-            .into_iter()
-            .collect())
+            .enumerate()
+            .filter(|(_, p)| in_range(q, p))
+            .max_by_key(|(i, p)| (p.0, *i))
+            .map(|(_, p)| p);
+        let newest = match (stored, buffered) {
+            (Some(old), Some(new)) if new.0 < old.0 => Some(old),
+            (old, new) => new.or(old),
+        };
+        Ok(newest.into_iter().collect())
     }
 
     /// Runs `q`: one row per point (raw) or per series and window (aggregate).
+    /// The columns of the series are read on several threads when that pays,
+    /// unless there is a fill, whose rows are counted over all the series.
     pub fn query(&self, q: &Query) -> Result<Vec<Row>> {
         q.validate()?;
+        let (targets, snapshot) = self.targets(q)?;
         let mut rows = Vec::new();
-        for (series, points) in self.read_series(q)? {
-            let budget = self.opts.max_fill_rows.saturating_sub(rows.len());
-            for (ts, value) in query::evaluate_within(&points, q, budget)? {
-                rows.push(Row {
-                    series: series.key(),
-                    tags: series.tags.clone(),
-                    ts,
-                    value,
-                });
+        let max = self.opts.max_fill_rows;
+        let evaluate = |target: Target, budget: usize| {
+            let series = target.series.clone();
+            self.evaluate_target(&snapshot, target, q, budget)
+                .map(|points| (series, points))
+        };
+        // With a fill, a series has what the others left of the budget; so
+        // the series go one at a time.
+        if q.fill.is_some() {
+            for target in targets {
+                let (series, points) = evaluate(target, max.saturating_sub(rows.len()))?;
+                push_rows(&mut rows, &series, points);
+            }
+        } else {
+            let threads = par::threads_for(self.opts.query_threads);
+            for outcome in par::map(threads, targets, |t| evaluate(t, max)) {
+                let (series, points) = outcome?;
+                push_rows(&mut rows, &series, points);
             }
         }
         Ok(rows)
@@ -564,10 +775,10 @@ impl Db {
         for m in self.measurements() {
             for f in self.fields(&m).into_keys() {
                 for row in self.query(&Query::new(&m, &f))? {
-                    let key = (row.series.clone(), row.ts);
+                    let key = (row.series.to_string(), row.ts);
                     let point = points.entry(key).or_insert_with(|| {
                         let mut p = Point::new(&m).at(row.ts);
-                        p.tags = row.tags.clone();
+                        p.tags = (*row.tags).clone();
                         p
                     });
                     point.fields.insert(f.clone(), row.value);
@@ -607,7 +818,8 @@ impl Db {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::query::{Agg, Fill};
+    use crate::chunk::{Num, Numbers};
+    use crate::query::{Agg, Align, Fill};
     use flashkv::env::{Env, FaultEnv, OsEnv};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -623,6 +835,7 @@ pub(crate) mod tests {
         o.kv.background = false;
         o.kv.sync = false;
         o.flush_points = 1_000_000;
+        o.chunk_points = 0;
         o
     }
 
@@ -706,7 +919,7 @@ pub(crate) mod tests {
             .fill(Fill::Value(0.0));
         let rows = db.query(&both.clone().range(0, 7 * s)).unwrap();
         assert_eq!(rows.len(), 14);
-        assert_eq!(rows.iter().filter(|r| r.series == "cpu,host=b").count(), 7);
+        assert_eq!(rows.iter().filter(|r| &*r.series == "cpu,host=b").count(), 7);
         // The budget is for the whole query: 8 rows for the first series leave 7.
         let e = db.query(&both).unwrap_err().to_string();
         assert!(e.contains("filling would make 8 rows, more than the 7 allowed"), "{e}");
@@ -843,7 +1056,7 @@ pub(crate) mod tests {
         // Buffer and chunks mix; a rewrite of ts 20 wins.
         db.write_points(&[cpu("a", 20, 9.0), cpu("a", 40, 4.0)]).unwrap();
         let rows = db.query(&q.clone().range(15, 41)).unwrap();
-        assert_eq!(rows[0].series, "cpu,host=a");
+        assert_eq!(&*rows[0].series, "cpu,host=a");
         assert_eq!(rows[0].tags["host"], "a");
         assert_eq!(
             rows.iter().map(|r| r.value.clone()).collect::<Vec<_>>(),
@@ -860,7 +1073,7 @@ pub(crate) mod tests {
         assert_eq!(mean.len(), 2);
         let top = db.top(&Query::new("cpu", "usage").agg(Agg::Max), 1).unwrap();
         assert_eq!(
-            (top[0].series.as_str(), top[0].value.clone()),
+            (&*top[0].series, top[0].value.clone()),
             ("cpu,host=a", FieldValue::Float(9.0))
         );
         assert!(db.query(&Query::new("cpu", "nope")).unwrap().is_empty());
@@ -998,11 +1211,383 @@ pub(crate) mod tests {
             assert!(Db::open(&dir2, opts()).is_err(), "{k:?}");
             std::fs::remove_dir_all(&dir2).unwrap();
         }
-        // A corrupt chunk fails the query that reads it.
-        raw_put(&dir, &data_key(0, 0, 999), b"\x09");
+        // A corrupt chunk fails the query that reads it: here a chunk of
+        // text (so that the statistics are no help) after the only point.
+        let key = data_key(0, 0, 999);
+        raw_put(&dir, &key, b"\x09");
+        let text = ChunkStats {
+            count: 1,
+            min_ts: 5,
+            max_ts: 5,
+            numbers: None,
+        };
+        raw_put(&dir, &stats_key(&key), &text.encode());
         let db = Db::open(&dir, opts()).unwrap();
         assert!(db.query(&Query::new("cpu", "usage")).is_err());
         assert!(db.query(&Query::new("cpu", "usage").latest()).is_err());
+        db.close().unwrap();
+        // A key of statistics that is not a key of a chunk is as bad.
+        raw_put(&dir, &[&b"E"[..], &0u64.to_be_bytes(), b"x"].concat(), b"");
+        let db = Db::open(&dir, opts()).unwrap();
+        let e = db.query(&Query::new("cpu", "usage")).unwrap_err().to_string();
+        assert!(e.contains("bad chunk statistics key entry"), "{e}");
+        db.close().unwrap();
+        let kv = flashkv::Db::open(&dir, opts().kv).unwrap();
+        kv.delete(&[&b"E"[..], &0u64.to_be_bytes(), b"x"].concat()).unwrap();
+        kv.close().unwrap();
+        // Statistics that are corrupt are as bad.
+        raw_put(&dir, &stats_key(&key), b"\x01");
+        let db = Db::open(&dir, opts()).unwrap();
+        assert!(db.query(&Query::new("cpu", "usage")).is_err());
+        db.close().unwrap();
+        // Statistics of a chunk that is not there.
+        let kv = flashkv::Db::open(&dir, opts().kv).unwrap();
+        kv.delete(&key).unwrap();
+        kv.put(&stats_key(&key), &text.encode()).unwrap();
+        kv.close().unwrap();
+        let db = Db::open(&dir, opts()).unwrap();
+        let e = db.query(&Query::new("cpu", "usage")).unwrap_err().to_string();
+        assert!(e.contains("chunk (it has statistics)"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn many_series_are_read_on_many_threads_with_the_same_result() {
+        let dir = tmpdir("threads");
+        let mut o = opts();
+        o.partition = Partitioner::new(100);
+        o.query_threads = 4;
+        let db = Db::open(&dir, o.clone()).unwrap();
+        for round in 0..6 {
+            let points: Vec<Point> = (0..40)
+                .flat_map(|h| (0..5).map(move |i| (h, round * 50 + i * 10)))
+                .map(|(h, ts)| cpu(&format!("h{h:02}"), ts, (h * 7 + ts) as f64))
+                .collect();
+            db.write_points(&points).unwrap();
+            if round < 4 {
+                db.flush().unwrap();
+            }
+        }
+        let queries = [
+            Query::new("cpu", "usage"),
+            Query::new("cpu", "usage").agg(Agg::Sum),
+            Query::new("cpu", "usage").agg(Agg::Max).every(60),
+            Query::new("cpu", "usage").range(30, 120).latest(),
+        ];
+        let threaded: Vec<_> = queries.iter().map(|q| db.query(q).unwrap()).collect();
+        assert_eq!(threaded[1].len(), 40);
+        assert_eq!(threaded[1][39].tags["host"], "h39");
+        db.close().unwrap();
+        o.query_threads = 1;
+        let db = Db::open(&dir, o).unwrap();
+        let serial: Vec<_> = queries.iter().map(|q| db.query(q).unwrap()).collect();
+        assert_eq!(threaded, serial);
+        // The first error is the one reported.
+        let e = db.query(&Query::new("cpu", "usage").agg(Agg::Sum).every(1).fill(Fill::Prev));
+        assert!(e.is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_flush_waits_for_chunks_of_a_useful_size() {
+        let dir = tmpdir("chunk-points");
+        let mut o = opts();
+        o.flush_points = 1;
+        o.chunk_points = 5;
+        let db = Db::open(&dir, o).unwrap();
+        // Two columns: the flush comes with the fifth point of each.
+        for ts in 0..4 {
+            db.write_points(&[cpu("a", ts, 1.0), cpu("b", ts, 1.0)]).unwrap();
+            assert_eq!(db.stats().flushes, 0, "{ts}");
+        }
+        db.write_points(&[cpu("a", 4, 1.0), cpu("b", 4, 1.0)]).unwrap();
+        assert_eq!(db.stats().flushes, 1);
+        assert_eq!(db.stats().buffered_points, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_aggregate_that_needs_a_chunk_that_cannot_be_read_fails() {
+        let dir = tmpdir("agg-unreadable");
+        let db = Db::open(&dir, opts()).unwrap();
+        db.write_points(&[cpu("a", 3, 1.0)]).unwrap();
+        db.flush().unwrap();
+        // By its statistics, a chunk of numbers from 10 to 20; but it is none.
+        let key = data_key(0, 0, 999);
+        db.kv.put(&key, b"\x09").unwrap();
+        let numbers = Numbers {
+            sum: 3.0,
+            min: 1.0,
+            max: 2.0,
+            first: Num::Float(1.0),
+            last: Num::Float(2.0),
+        };
+        let stats = ChunkStats {
+            count: 2,
+            min_ts: 10,
+            max_ts: 20,
+            numbers: Some(numbers),
+        };
+        db.kv.put(&stats_key(&key), &stats.encode()).unwrap();
+        // All of it is in the range: the statistics are enough.
+        let q = Query::new("cpu", "usage").agg(Agg::Sum);
+        assert_eq!(db.query(&q).unwrap()[0].value, FieldValue::Float(4.0));
+        // A range that cuts it needs its points.
+        assert!(db.query(&q.range(0, 15)).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keys_of_chunks_say_what_they_are_of() {
+        for (col, bucket, seq) in [(0, 0, 0), (7, -3, 99), (u64::MAX, i64::MIN, u64::MAX), (1, i64::MAX, 1)] {
+            let key = data_key(col, bucket, seq);
+            assert_eq!(key_parts(&key), Some((col, bucket, seq)));
+            assert_eq!(key_parts(&stats_key(&key)), Some((col, bucket, seq)));
+            assert_eq!(&stats_key(&key)[1..], &key[1..]);
+        }
+        assert_eq!(key_parts(b""), None);
+        assert_eq!(key_parts(&data_key(1, 2, 3)[1..]), None);
+        assert_eq!(key_parts(&[data_key(1, 2, 3), vec![0]].concat()), None);
+    }
+
+    /// Every column whose statistics queries have copied: they are what the
+    /// store says.
+    pub(crate) fn assert_catalog_matches_store(db: &Db) {
+        let st = db.state.lock();
+        for (col, copied) in &st.catalog {
+            let stored: Catalog = db
+                .kv
+                .scan_prefix(&[&b"E"[..], &col.to_be_bytes()].concat())
+                .unwrap()
+                .into_iter()
+                .map(|(k, v)| {
+                    let (_, bucket, seq) = key_parts(&k).unwrap();
+                    ((bucket, seq), ChunkStats::decode(&v).unwrap())
+                })
+                .collect();
+            assert_eq!(**copied, stored, "column {col}");
+        }
+    }
+
+    #[test]
+    fn the_statistics_that_queries_copied_follow_every_change() {
+        let dir = tmpdir("catalog");
+        let mut o = opts();
+        o.partition = Partitioner::new(10);
+        o.compact_min_chunks = 2;
+        let db = Db::open(&dir, o.clone()).unwrap();
+        let columns = |db: &Db| db.state.lock().catalog.len();
+        let batch = |db: &Db, from: i64| {
+            let points: Vec<Point> = (from..from + 30)
+                .flat_map(|t| [cpu("a", t, t as f64), cpu("b", t, -(t as f64))])
+                .collect();
+            db.write_points(&points).unwrap();
+            db.flush().unwrap();
+        };
+        batch(&db, 0);
+        assert_eq!(columns(&db), 0, "nothing has been read yet");
+        let only_a = Query::new("cpu", "usage").filter("host", "a").agg(Agg::Sum).every(10);
+        let before = db.query(&only_a).unwrap();
+        assert_eq!(columns(&db), 1, "only the column that was read");
+        assert_catalog_matches_store(&db);
+        // A flush adds to a column that was read, and not to the others.
+        batch(&db, 20);
+        assert_eq!(columns(&db), 1);
+        assert_catalog_matches_store(&db);
+        let all = Query::new("cpu", "usage").agg(Agg::Sum).every(10);
+        let rows = db.query(&all).unwrap();
+        assert_eq!(columns(&db), 2);
+        assert_catalog_matches_store(&db);
+        // Merging chunks, then dropping partitions.
+        assert!(db.compact().unwrap() > 0);
+        assert_catalog_matches_store(&db);
+        assert_eq!(db.query(&all).unwrap().len(), rows.len());
+        assert_eq!(db.query(&only_a).unwrap().len(), before.len() + 2);
+        assert!(db.drop_before(None, 25).unwrap() > 0);
+        assert_catalog_matches_store(&db);
+        let dropped = db.query(&all).unwrap();
+        assert_eq!(dropped.iter().map(|r| r.ts).min(), Some(20));
+        // After a restart the copies are made again, from the store.
+        db.close().unwrap();
+        let db = Db::open(&dir, o).unwrap();
+        assert_eq!(columns(&db), 0);
+        assert_eq!(db.query(&all).unwrap(), dropped);
+        assert_catalog_matches_store(&db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_format_of_the_database_is_checked() {
+        // A new database says which format it is; reopening it is fine.
+        let dir = tmpdir("format");
+        let db = Db::open(&dir, opts()).unwrap();
+        db.write_points(&[cpu("a", 1, 1.0)]).unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.kv.get(FORMAT_KEY).unwrap(), Some(vec![FORMAT]));
+        db.close().unwrap();
+        assert!(Db::open(&dir, opts()).is_ok());
+        // Another format is not understood.
+        raw_put(&dir, FORMAT_KEY, &[FORMAT + 1]);
+        let e = Db::open(&dir, opts()).err().unwrap().to_string();
+        assert!(e.contains("bad format entry"), "{e}");
+        // Chunks without a mark are those of a version that had no statistics.
+        let old = tmpdir("format-old");
+        raw_put(&old, &data_key(0, 0, 1), b"\x00");
+        let e = Db::open(&old, opts()).err().unwrap().to_string();
+        assert!(e.contains("made by an older version"), "{e}");
+        for d in [dir, old] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// The values that the points of a column were last written with.
+    type Truth = BTreeMap<(String, &'static str), BTreeMap<i64, FieldValue>>;
+
+    fn close(a: &FieldValue, b: &FieldValue) -> bool {
+        match (a, b) {
+            (FieldValue::Float(x), FieldValue::Float(y)) => (x - y).abs() <= 1e-9 * (1.0 + x.abs()),
+            _ => a == b,
+        }
+    }
+
+    /// Every aggregate, window, alignment, fill and range, from the database
+    /// and from the points it was written with.
+    fn check_aggregates(db: &Db, truth: &Truth, what: &str) {
+        let aggs = [
+            Agg::Sum,
+            Agg::Count,
+            Agg::Min,
+            Agg::Max,
+            Agg::Mean,
+            Agg::First,
+            Agg::Last,
+        ];
+        let ranges = [(i64::MIN, i64::MAX), (13, 777), (100, 200), (5, 1000), (5000, 6000)];
+        let windows = [None, Some(10), Some(30), Some(100), Some(250)];
+        for field in ["f", "i", "u"] {
+            for agg in aggs {
+                for every in windows {
+                    for align in [Align::Calendar, Align::Start] {
+                        for fill in [None, Some(Fill::Prev)] {
+                            let skip = every.is_none() & ((align == Align::Start) | fill.is_some());
+                            if skip {
+                                continue;
+                            }
+                            for &(start, end) in &ranges {
+                                let mut q = Query::new("cpu", field).range(start, end).agg(agg).align(align);
+                                q.every = every;
+                                q.fill = fill;
+                                let got = db.query(&q);
+                                let mut want = Vec::new();
+                                for ((host, f), points) in truth.iter().filter(|((_, f), _)| *f == field) {
+                                    assert_eq!(*f, field);
+                                    let points: Vec<_> =
+                                        points.range(start..end).map(|(&t, v)| (t, v.clone())).collect();
+                                    let rows = query::evaluate_within(&points, &q, query::MAX_FILL_ROWS).unwrap();
+                                    want.extend(rows.into_iter().map(|(t, v)| (host.clone(), t, v)));
+                                }
+                                let label = format!(
+                                    "{what}: {field} {agg:?} every {every:?} {align:?} {fill:?} [{start}, {end})"
+                                );
+                                let mut got: Vec<_> = got
+                                    .unwrap()
+                                    .into_iter()
+                                    .map(|r| (r.tags["host"].clone(), r.ts, r.value))
+                                    .collect();
+                                got.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+                                want.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+                                assert_eq!(got.len(), want.len(), "{label}");
+                                for (g, w) in got.iter().zip(&want) {
+                                    assert!(
+                                        (&g.0, g.1) == (&w.0, w.1) && close(&g.2, &w.2),
+                                        "{label}: {g:?} != {w:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // The latest point, too.
+            for &(start, end) in &ranges {
+                let q = Query::new("cpu", field).range(start, end).latest();
+                let mut want: Vec<(String, i64, FieldValue)> = truth
+                    .iter()
+                    .filter(|((_, f), _)| *f == field)
+                    .filter_map(|((host, _), points)| {
+                        let (t, v) = points.range(start..end).next_back()?;
+                        Some((host.clone(), *t, v.clone()))
+                    })
+                    .collect();
+                let mut got: Vec<_> = db
+                    .query(&q)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.tags["host"].clone(), r.ts, r.value))
+                    .collect();
+                got.sort_by(|a, b| a.0.cmp(&b.0));
+                want.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(got, want, "{what}: latest {field} [{start}, {end})");
+            }
+        }
+    }
+
+    /// Writes a point of `host` with a value of each type that `k` makes.
+    fn put(db: &Db, truth: &mut Truth, host: &str, ts: i64, k: u64) {
+        let values = [
+            ("f", FieldValue::Float(k as f64 * 0.5 - 20.0)),
+            ("i", FieldValue::Int(k as i64 - 30)),
+            ("u", FieldValue::UInt(k * 3)),
+        ];
+        let mut p = Point::new("cpu").tag("host", host).at(ts);
+        for (f, v) in values {
+            p = p.field(f, v.clone());
+            truth.entry((host.to_string(), f)).or_default().insert(ts, v);
+        }
+        db.write_points(&[p]).unwrap();
+    }
+
+    #[test]
+    fn aggregates_agree_with_the_points_they_are_made_of() {
+        let dir = tmpdir("agg-agree");
+        let mut o = opts();
+        o.partition = Partitioner::new(100);
+        o.compact_min_chunks = 2;
+        let db = Db::open(&dir, o.clone()).unwrap();
+        let mut truth = Truth::new();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        // Points as ingestion makes them: in time order, chunk after chunk,
+        // the last ones still in the buffer.
+        for round in 0..14 {
+            for host in ["a", "b"] {
+                for i in 0..5 {
+                    put(&db, &mut truth, host, round * 70 + i * 12 + next(5) as i64, next(100));
+                }
+            }
+            if round < 12 {
+                db.flush().unwrap();
+            }
+        }
+        check_aggregates(&db, &truth, "in order");
+        // Points that are rewritten, and new ones between old ones, in a chunk
+        // of their own: its range overlaps those of other chunks.
+        for ts in [15, 20, 25, 310, 311] {
+            put(&db, &mut truth, "a", ts, next(100));
+        }
+        db.flush().unwrap();
+        check_aggregates(&db, &truth, "overlapping");
+        // Compaction merges the chunks of a partition, with no overlap left.
+        db.compact().unwrap();
+        check_aggregates(&db, &truth, "compacted");
+        db.close().unwrap();
+        let db = Db::open(&dir, o).unwrap();
+        check_aggregates(&db, &truth, "reopened");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

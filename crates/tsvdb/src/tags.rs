@@ -7,18 +7,32 @@ use crate::lineproto::{escape, KEY_SPECIALS, MEASUREMENT_SPECIALS};
 use flashkv::codec::Decoder;
 use flashkv::varint::{put_len_prefixed, put_uvarint64};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Series {
     pub id: u64,
     pub measurement: String,
-    pub tags: BTreeMap<String, String>,
+    /// Shared with the rows of a query.
+    pub tags: Arc<BTreeMap<String, String>>,
+    /// The canonical key, e.g. `cpu,host=a,region=eu`.
+    pub key: Arc<str>,
 }
 
 impl Series {
+    pub fn new(id: u64, measurement: String, tags: BTreeMap<String, String>) -> Series {
+        let key = series_key(&measurement, &tags).into();
+        Series {
+            id,
+            measurement,
+            tags: Arc::new(tags),
+            key,
+        }
+    }
+
     /// Canonical series key, e.g. `cpu,host=a,region=eu`.
-    pub fn key(&self) -> String {
-        series_key(&self.measurement, &self.tags)
+    pub fn key(&self) -> &str {
+        &self.key
     }
 
     /// Persistent form (the id is stored by the caller, in the key).
@@ -27,7 +41,7 @@ impl Series {
         out.extend_from_slice(&self.id.to_le_bytes());
         put_len_prefixed(&mut out, self.measurement.as_bytes());
         put_uvarint64(&mut out, self.tags.len() as u64);
-        for (k, v) in &self.tags {
+        for (k, v) in &*self.tags {
             put_len_prefixed(&mut out, k.as_bytes());
             put_len_prefixed(&mut out, v.as_bytes());
         }
@@ -46,7 +60,7 @@ impl Series {
             tags.insert(k, v);
         }
         d.finish("series entry")?;
-        Ok(Series { id, measurement, tags })
+        Ok(Series::new(id, measurement, tags))
     }
 }
 
@@ -67,7 +81,7 @@ type Posting = (String, String, String);
 #[derive(Default, Debug)]
 pub struct SeriesIndex {
     by_key: HashMap<String, u64>,
-    series: HashMap<u64, Series>,
+    series: HashMap<u64, Arc<Series>>,
     by_measurement: BTreeMap<String, BTreeSet<u64>>,
     postings: HashMap<Posting, BTreeSet<u64>>,
     next_id: u64,
@@ -90,7 +104,7 @@ impl SeriesIndex {
         self.by_key.get(key).copied()
     }
 
-    pub fn series(&self, id: u64) -> Option<&Series> {
+    pub fn series(&self, id: u64) -> Option<&Arc<Series>> {
         self.series.get(&id)
     }
 
@@ -100,11 +114,7 @@ impl SeriesIndex {
             Some(id) => (id, false),
             None => {
                 let id = self.next_id;
-                self.restore(Series {
-                    id,
-                    measurement: measurement.to_string(),
-                    tags: tags.clone(),
-                });
+                self.restore(Series::new(id, measurement.to_string(), tags.clone()));
                 (id, true)
             }
         }
@@ -113,18 +123,18 @@ impl SeriesIndex {
     /// Adds a series with a known id (index rebuild at open).
     pub fn restore(&mut self, s: Series) {
         self.next_id = self.next_id.max(s.id + 1);
-        self.by_key.insert(s.key(), s.id);
+        self.by_key.insert(s.key().to_string(), s.id);
         self.by_measurement
             .entry(s.measurement.clone())
             .or_default()
             .insert(s.id);
-        for (k, v) in &s.tags {
+        for (k, v) in &*s.tags {
             self.postings
                 .entry((s.measurement.clone(), k.clone(), v.clone()))
                 .or_default()
                 .insert(s.id);
         }
-        self.series.insert(s.id, s);
+        self.series.insert(s.id, Arc::new(s));
     }
 
     /// Series of `measurement` matching every `tag = value` filter, by id.
@@ -193,11 +203,7 @@ mod tests {
 
     #[test]
     fn persistence_roundtrip() {
-        let s = Series {
-            id: 42,
-            measurement: "net work".into(),
-            tags: tags(&[("k,1", "v=2"), ("z", "")]),
-        };
+        let s = Series::new(42, "net work".into(), tags(&[("k,1", "v=2"), ("z", "")]));
         assert_eq!(s.key(), "net\\ work,k\\,1=v\\=2,z=");
         let back = Series::decode(&s.encode()).unwrap();
         assert_eq!(back, s);
