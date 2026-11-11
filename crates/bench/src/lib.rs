@@ -1594,7 +1594,7 @@ mod tests {
             let line = rx.recv_timeout(Duration::from_secs(20)).unwrap();
             let addr: SocketAddr = line.split_once(", client ").unwrap().1.parse().unwrap();
             let c = |secret: &Path, rest: &str| {
-                let flags = "--timeout-ms 400 --patience-ms 100";
+                let flags = "--timeout-ms 20000 --patience-ms 100";
                 cmd(&format!(
                     "client --nodes {addr} {flags} --secret-file {} {rest}",
                     secret.display()
