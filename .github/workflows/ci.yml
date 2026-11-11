@@ -26,7 +26,7 @@ jobs:
       # Nobody debugs a CI build: without debuginfo it compiles and caches less.
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, llvm-tools-preview
@@ -43,11 +43,11 @@ jobs:
       # Pinned: bump it on purpose, after running `cargo xtask kani` locally.
       KANI_VERSION: 0.68.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Cache the kani release bundle
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/kani
           key: kani-bundle-${{ runner.os }}-${{ env.KANI_VERSION }}
@@ -62,7 +62,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Keep in step with rust-version in Cargo.toml.
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
@@ -72,7 +72,7 @@ jobs:
     name: release build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace
@@ -83,7 +83,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
