@@ -110,6 +110,8 @@ pub struct Ctx {
     pub root: PathBuf,
     /// How long `publish` waits between crates, and before a retry.
     pub pause: Duration,
+    /// How it waits (`std::thread::sleep`; the tests record the pauses).
+    pub sleep: fn(Duration),
 }
 
 impl Ctx {
@@ -130,6 +132,7 @@ impl Ctx {
             git: var("XTASK_GIT").unwrap_or(String::from("git")),
             root: manifest_dir.parent().unwrap_or(Path::new(".")).to_path_buf(),
             pause: PUBLISH_PAUSE,
+            sleep: std::thread::sleep,
         }
     }
 
@@ -439,7 +442,7 @@ pub fn publish(ctx: &Ctx) -> Result<String, String> {
                 done.push_str(&format!("{name} {version}: published\n"));
                 if i + 1 < PUBLISH_ORDER.len() {
                     println!("xtask: {wait} s before the next crate");
-                    std::thread::sleep(ctx.pause);
+                    (ctx.sleep)(ctx.pause);
                 }
                 break;
             } else if errors.contains("already exists") {
@@ -448,7 +451,7 @@ pub fn publish(ctx: &Ctx) -> Result<String, String> {
             } else if errors.contains("status 429") && refused < PUBLISH_RETRIES {
                 refused += 1;
                 println!("xtask: crates.io refused {name} (rate limit): retry {refused}/{PUBLISH_RETRIES} in {wait} s");
-                std::thread::sleep(ctx.pause);
+                (ctx.sleep)(ctx.pause);
             } else if errors.contains("status 429") {
                 return Err(format!(
                     "{done}{name}: crates.io still refuses it (rate limit) after {PUBLISH_RETRIES} retries; \
@@ -485,7 +488,6 @@ pub(crate) mod tests {
     use super::*;
     use std::fs::{self, Permissions};
     use std::os::unix::fs::PermissionsExt;
-    use std::time::Instant;
 
     /// Tests write executable scripts and spawn processes: a fork in one
     /// thread while another holds a script open for writing makes exec fail
@@ -494,6 +496,22 @@ pub(crate) mod tests {
 
     pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The pauses `publish` asked for, in order: nothing sleeps for real, so
+    /// the tests check what was asked and never how long anything took.
+    static PAUSES: std::sync::Mutex<Vec<Duration>> = std::sync::Mutex::new(Vec::new());
+
+    fn record(pause: Duration) {
+        PAUSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pause);
+    }
+
+    /// The pauses recorded since the last call.
+    fn pauses() -> Vec<Duration> {
+        std::mem::take(&mut *PAUSES.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     pub(crate) fn tmp(name: &str) -> PathBuf {
@@ -524,7 +542,8 @@ pub(crate) mod tests {
             cargo,
             git: "git".into(),
             root: dir.to_path_buf(),
-            pause: Duration::ZERO,
+            pause: PUBLISH_PAUSE,
+            sleep: record,
         }
     }
 
@@ -619,7 +638,8 @@ pub(crate) mod tests {
             cargo,
             git: "git".into(),
             root: d.clone(),
-            pause: Duration::ZERO,
+            pause: PUBLISH_PAUSE,
+            sleep: record,
         };
         run(&args("kani"), &c).unwrap();
         let limits = fs::read_to_string(limits).unwrap();
@@ -1166,12 +1186,11 @@ Requests): too many new crates' >&2; exit 101;;"
     fn publish_goes_in_dependency_order() {
         let _serial = serial();
         let (d, c) = repo("pub", WRITTEN, "never");
-        // One crate per pause, and none after the last.
-        let pause = Duration::from_millis(30);
-        let c = Ctx { pause, ..c };
-        let started = Instant::now();
+        pauses();
         let out = run(&args("publish"), &c).unwrap();
-        assert!(started.elapsed() >= pause * (PUBLISH_ORDER.len() as u32 - 1));
+        // One pause after each crate but the last.
+        assert_eq!(pauses(), vec![PUBLISH_PAUSE; PUBLISH_ORDER.len() - 1]);
+        assert_eq!(PUBLISH_PAUSE, Duration::from_secs(60));
         let published: String = PUBLISH_ORDER
             .iter()
             .map(|n| format!("{n} 0.1.0: published\n"))
@@ -1193,16 +1212,12 @@ Requests): too many new crates' >&2; exit 101;;"
     #[test]
     fn publish_waits_out_the_rate_limit() {
         let _serial = serial();
-        let pause = Duration::from_millis(40);
         let (d, c) = repo("pub-wait", WRITTEN, "never");
-        let c = Ctx {
-            pause,
-            ..rules_cargo(c, &limited_twice("lumen-raft", &d))
-        };
-        let started = Instant::now();
+        let c = rules_cargo(c, &limited_twice("lumen-raft", &d));
+        pauses();
         let out = run(&args("publish"), &c).unwrap();
         // 6 pauses between the 7 crates, and one before each of the 2 retries.
-        assert!(started.elapsed() >= pause * 8);
+        assert_eq!(pauses(), vec![PUBLISH_PAUSE; 6 + 2]);
         assert_eq!(out.matches(": published\n").count(), PUBLISH_ORDER.len());
         let log = log(&d);
         assert_eq!(log.lines().count(), PUBLISH_ORDER.len() + 2);
@@ -1213,17 +1228,13 @@ Requests): too many new crates' >&2; exit 101;;"
     #[test]
     fn publish_gives_up_on_a_rate_limit_that_does_not_end() {
         let _serial = serial();
-        let pause = Duration::from_millis(20);
         let (d, c) = repo("pub-limit", WRITTEN, "never");
         let rules = [exists("lumen-cpu"), exists("lumen-flashkv"), limited("lumen-raft")].join("\n");
-        let c = Ctx {
-            pause,
-            ..rules_cargo(c, &rules)
-        };
-        let started = Instant::now();
+        let c = rules_cargo(c, &rules);
+        pauses();
         let e = run(&args("publish"), &c).unwrap_err();
         // One pause after pcapfast, and one before each retry of lumen-raft.
-        assert!(started.elapsed() >= pause * (1 + PUBLISH_RETRIES));
+        assert_eq!(pauses(), vec![PUBLISH_PAUSE; 1 + PUBLISH_RETRIES as usize]);
         assert_eq!(
             e,
             format!(
@@ -1242,15 +1253,11 @@ Requests): too many new crates' >&2; exit 101;;"
         let _serial = serial();
         let (d, c) = repo("pub-again", WRITTEN, "never");
         let rules: Vec<String> = PUBLISH_ORDER.iter().map(|n| exists(n)).collect();
-        // A pause that would be noticed: nothing published, so nothing to wait for.
-        let pause = Duration::from_secs(5);
-        let c = Ctx {
-            pause,
-            ..rules_cargo(c, &rules.join("\n"))
-        };
-        let started = Instant::now();
+        let c = rules_cargo(c, &rules.join("\n"));
+        pauses();
         let out = run(&args("publish"), &c).unwrap();
-        assert!(started.elapsed() < pause);
+        // Nothing was published, so there was nothing to wait for.
+        assert_eq!(pauses(), vec![]);
         assert_eq!(out.matches(": already on crates.io\n").count(), PUBLISH_ORDER.len());
         assert!(out.ends_with("push with `git push origin HEAD v0.1.0`\n"));
         fs::remove_dir_all(&d).unwrap();
@@ -1261,12 +1268,15 @@ Requests): too many new crates' >&2; exit 101;;"
         let _serial = serial();
         let (d, c) = repo("pub-fail", WRITTEN, "never");
         let rules = "publish\\ -p\\ tsvdb) echo 'error: no good' >&2; exit 101;;";
+        pauses();
         let e = run(&args("publish"), &rules_cargo(c, rules)).unwrap_err();
         assert_eq!(
             e,
             "lumen-cpu 0.1.0: published\nlumen-flashkv 0.1.0: published\npcapfast 0.1.0: published\n\
              lumen-raft 0.1.0: published\n`cargo publish -p tsvdb` failed"
         );
+        // It does not wait to try again what is not a rate limit.
+        assert_eq!(pauses().len(), 4);
         assert_eq!(log(&d).lines().count(), 5);
         fs::remove_dir_all(&d).unwrap();
     }
@@ -1327,7 +1337,8 @@ Requests): too many new crates' >&2; exit 101;;"
             git: "/nonexistent/git".into(),
             cargo: c.cargo.clone(),
             root: c.root.clone(),
-            pause: Duration::ZERO,
+            pause: PUBLISH_PAUSE,
+            sleep: record,
         };
         let nogit = Ctx {
             root: c.root.clone(),
