@@ -491,6 +491,15 @@ mod tests {
         })
     }
 
+    /// Waits until `follower` has heard from the leader `leader_id`: the
+    /// leader commits with a quorum, so having applied an entry says nothing
+    /// of the other follower, which may not have been told who leads yet.
+    fn wait_for_leader_hint(follower: &Member, leader_id: NodeId) {
+        wait_until("the follower to know the leader", || {
+            (follower.node().leader() == Some(leader_id)).then_some(())
+        });
+    }
+
     fn number(n: u64) -> Vec<u8> {
         n.to_le_bytes().to_vec()
     }
@@ -534,6 +543,7 @@ mod tests {
         assert_eq!(leader.with_app(|c| c.sum), 5);
         let follower = servers.iter().find(|s| s.node().id() != leader.node().id()).unwrap();
         let leader_id = leader.node().id();
+        wait_for_leader_hint(follower, leader_id);
         assert_eq!(follower.read_barrier(LONG), Err(Error::NotLeader(Some(leader_id))));
         // A barrier nobody can confirm times out, and leaves nothing behind.
         let alone = cluster(3, 0, 0);
@@ -576,6 +586,7 @@ mod tests {
         let old_id = old.node().id();
         let target = servers.iter().find(|s| s.node().id() != old_id).unwrap();
         let target_id = target.node().id();
+        wait_for_leader_hint(target, old_id);
         // Refused: the leader itself, a server that is not one, a follower.
         assert_eq!(
             old.transfer_leadership(old_id, LONG),

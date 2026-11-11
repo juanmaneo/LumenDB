@@ -1086,11 +1086,13 @@ mod tests {
     fn a_connection_that_is_idle_after_the_handshake_does_not_time_out() {
         let (c, s) = tcp_pair();
         let (mut client, mut server) = thread::scope(|scope| {
-            let accepted = scope.spawn(|| AuthStream::accept(s, &secret(), "test", Duration::from_millis(300)));
+            let accepted = scope.spawn(|| AuthStream::accept(s, &secret(), "test", Duration::from_millis(1000)));
             let client = AuthStream::connect(c, &secret(), "test").unwrap();
             (client, accepted.join().unwrap().unwrap())
         });
-        thread::sleep(Duration::from_millis(500));
+        // Idle for longer than the handshake timeout. The timeout is generous
+        // so a loaded machine still finishes the handshake inside it.
+        thread::sleep(Duration::from_millis(1300));
         client.write_all(b"late").unwrap();
         let mut got = [0u8; 4];
         server.read_exact(&mut got).unwrap();
