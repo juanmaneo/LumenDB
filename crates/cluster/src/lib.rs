@@ -814,14 +814,20 @@ mod tests {
         c.write("cpu,host=a usage=1 10\ncpu,host=a usage=2 20\n");
         same_everywhere(&c, &usage("a"), 2);
         let victim = c.up().find(|n| !n.is_leader()).unwrap().id();
-        let first = c.node(victim).stats();
+        let first = wait_until("the first entry applied", || {
+            let s = c.node(victim).stats();
+            (s.applied_entries == 1).then_some(s)
+        });
         assert_eq!(first.applied_entries, 1);
         c.stop(victim);
         c.write("cpu,host=a usage=3 30");
         c.restart(victim);
         same_everywhere(&c, &usage("a"), 3);
         // The note said it had the first entry: only the new one was applied.
-        let after = c.node(victim).stats();
+        let after = wait_until("the restarted node caught up", || {
+            let s = c.node(victim).stats();
+            (s.applied_entries == 1 && s.applied_index > first.applied_index).then_some(s)
+        });
         assert_eq!(after.applied_entries, 1, "{after:?}");
         assert!(after.applied_index > first.applied_index);
         // A node that lost its note replays the log, with the same result.
