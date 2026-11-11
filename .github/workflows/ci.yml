@@ -1,11 +1,22 @@
 name: CI
 
+# A release pushes a commit and its tag together: the tag alone would run
+# everything a second time, so only branches trigger a run.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# A newer push to the same branch supersedes the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+
+# The test steps run through annotate-failures.sh: a failing test is listed as
+# an annotation on the run, not only in the log.
 
 jobs:
   dev-check:
@@ -23,7 +34,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: cargo xtask dev-check
-        run: cargo xtask dev-check
+        run: sh .github/scripts/annotate-failures.sh cargo xtask dev-check
 
   kani:
     name: kani proofs
@@ -55,7 +66,7 @@ jobs:
       # Keep in step with rust-version in Cargo.toml.
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --no-fail-fast
+      - run: sh .github/scripts/annotate-failures.sh cargo test --workspace --no-fail-fast
 
   release:
     name: release build
@@ -79,6 +90,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # (every failing test is listed, not only those of the first binary)
-      - run: cargo test --workspace --no-fail-fast
+      - run: sh .github/scripts/annotate-failures.sh cargo test --workspace --no-fail-fast
       - name: CRC32C speed on this runner
         run: cargo run --release -p lumen-bench -- crc-bench --size 512 --size 4096 --size 65536 --size 1048576 --mb 1024
